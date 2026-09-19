@@ -85,7 +85,7 @@ fn run(args: Args) -> Result<(), String> {
                 thread::sleep(delay);
             }
             let request_started = Instant::now();
-            let mut response = send_with_bounded_retry(&client, channel, run_started, budget)?;
+            let response = send_with_bounded_retry(&client, channel, run_started, budget)?;
             let status = response.status();
             let retry_after = response
                 .headers()
