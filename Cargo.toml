@@ -1,0 +1,22 @@
+[package]
+name = "veylurk-probe"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+description = "Bounded Twitch community-sample transport probe"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

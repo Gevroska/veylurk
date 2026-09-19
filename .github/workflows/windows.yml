@@ -1,0 +1,32 @@
+name: Windows prototype
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Build release prototype
+        run: cargo build --release --locked
+      - name: Upload Windows prototype
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylurk-probe-windows-x64
+          path: target/release/veylurk-probe.exe
+          if-no-files-found: error
