@@ -5,7 +5,8 @@ param(
     [string[]]$Channel,
     [int]$Samples = 3,
     [int]$IntervalSeconds = 15,
-    [int]$TimeoutSeconds = 120
+    [int]$TimeoutSeconds = 120,
+    [string]$FailureScreenshot
 )
 
 $resolvedExecutable = (Resolve-Path -LiteralPath $Executable).Path
@@ -14,6 +15,9 @@ foreach ($item in $Channel) { $arguments.Add("--channel"); $arguments.Add($item)
 $arguments.Add("--samples"); $arguments.Add([string]$Samples)
 $arguments.Add("--interval"); $arguments.Add([string]$IntervalSeconds)
 $arguments.Add("--timeout"); $arguments.Add([string]$TimeoutSeconds)
+if (-not [string]::IsNullOrWhiteSpace($FailureScreenshot)) {
+    $arguments.Add("--failure-screenshot"); $arguments.Add($FailureScreenshot)
+}
 
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $resolvedExecutable

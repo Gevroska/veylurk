@@ -30,6 +30,8 @@ veylurk-browser-probe --channel parolesdhonneur_ --samples 3 --interval 15 --tim
 
 The browser probe prints aggregate counts, overlap, cumulative discovery, and one-way fingerprints. Usernames stay in memory. Its three-tab cap is an experiment boundary and provides no evidence for dozens-channel scale. The preflight runtime budget is checked between operations; an in-flight browser protocol operation has a separate 25-second I/O cap.
 
+For local failure diagnosis, `--failure-screenshot <path.png>` optionally saves the current public browser page when DOM collection fails. The screenshot is never uploaded, but it can contain public page or chat text and should be handled accordingly. The measurement wrapper accepts the same path through `-FailureScreenshot`.
+
 The dedicated temporary browser profile can write ordinary browser cache and session files while the probe runs. The probe deletes that profile on normal cleanup on a best-effort basis and never uses the user's existing browser profile.
 
 ## Build and test
