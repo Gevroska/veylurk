@@ -10,7 +10,7 @@ Twitch's normal logged-out web interface exposed changing samples of chat-connec
 
 This leaves the browser UI path feasible for experimentation while the preferred lightweight standalone transport is currently blocked. It does not establish a safe collection cadence or a complete population model.
 
-The Stage 3 probe launches installed Brave Browser with a new temporary profile, creates up to three ordinary popout-chat tabs, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. Browser automation is limited to loopback. It does not use the user's browser profile, inspect browser network requests, copy cookies or tokens, alter Brave Shields, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run.
+The Stage 3 probe launches installed Brave Browser with a new temporary profile, creates up to three ordinary popout-chat tabs, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. If Twitch's exact known "Cookies and Advertising Choices" banner appears with its Accept, Customize, and Reject controls, the probe chooses Reject before continuing. Browser automation is limited to loopback. It does not use the user's browser profile, inspect browser network requests, copy cookies or tokens, alter Brave Shields, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run.
 
 ## Probe behavior
 

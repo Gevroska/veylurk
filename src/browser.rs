@@ -650,6 +650,24 @@ fn dom_adapter_script(channel: &str) -> String {
       const deadline = Date.now() + 20000;
       const viewerInput = () => document.querySelector('input[aria-label="Search Chat Viewers"]');
       const rowSelector = 'button[data-test-selector="chat-viewers-list__button"][data-username]';
+      const challengePresent = () => /access denied|verify you are human|unusual traffic/i.test(document.title)
+        || Boolean(document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]'));
+      const exactText = element => String(element?.textContent || '').replace(/\s+/g, ' ').trim();
+      const cookieConsent = () => {{
+        const title = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,[role="heading"]')]
+          .find(element => exactText(element) === 'Cookies and Advertising Choices');
+        if (!title) return null;
+        let scope = title.parentElement;
+        for (let depth = 0; scope && scope !== document.body && depth < 6; depth += 1, scope = scope.parentElement) {{
+          const buttons = [...scope.querySelectorAll('button')];
+          const accept = buttons.find(button => exactText(button) === 'Accept');
+          const customize = buttons.find(button => exactText(button) === 'Customize');
+          const reject = buttons.find(button => exactText(button) === 'Reject');
+          if (accept && customize && reject) return {{ reject }};
+        }}
+        return null;
+      }};
+      let cookieConsentRejected = false;
       const diagnosticResult = (status, reason, usernames = [], extra = {{}}) => ({{
         channel:(location.pathname.match(/^\/popout\/([^/]+)\/chat/i) || [,''])[1].toLowerCase(),
         origin:location.origin,
@@ -679,17 +697,33 @@ fn dom_adapter_script(channel: &str) -> String {
         return !viewerInput();
       }};
       while (document.readyState !== 'complete' && Date.now() < deadline) await sleep(100);
+      while (Date.now() < deadline) {{
+        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
+        const consent = cookieConsent();
+        if (!consent) break;
+        if (consent && !cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
+        await sleep(100);
+      }}
       if (!await closeViewerPanel()) return diagnosticResult('ui_changed', 'stale_panel_close_failed');
       while (Date.now() < deadline) {{
-        const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
-        const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
-        if (challengeTitle || challengeElement) return diagnosticResult('challenge', 'challenge_indicator');
+        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
+        const consent = cookieConsent();
+        if (consent) {{
+          if (!cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
+          await sleep(100); continue;
+        }}
         const button = document.querySelector('button[data-test-selector="chat-viewer-list"]');
         if (button) {{ button.click(); break; }}
         await sleep(200);
       }}
       let input = null;
       while (Date.now() < deadline) {{
+        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
+        const consent = cookieConsent();
+        if (consent) {{
+          if (!cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
+          await sleep(100); continue;
+        }}
         input = viewerInput();
         if (input) break;
         await sleep(150);
@@ -697,10 +731,14 @@ fn dom_adapter_script(channel: &str) -> String {
       if (!input) return diagnosticResult('unavailable', document.querySelector('button[data-test-selector="chat-viewer-list"]') ? 'panel_input_timeout' : 'viewer_toggle_missing');
       let panelReopens = 0;
       let reopenedInputObserved = false;
-      while (!document.querySelector(rowSelector) && Date.now() < deadline) {{
-        const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
-        const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
-        if (challengeTitle || challengeElement) return diagnosticResult('challenge', 'challenge_indicator');
+      while (Date.now() < deadline) {{
+        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
+        const consent = cookieConsent();
+        if (consent) {{
+          if (!cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
+          await sleep(100); continue;
+        }}
+        if (document.querySelector(rowSelector)) break;
         const inputVisible = Boolean(viewerInput());
         if (!inputVisible && panelReopens === 0) {{
           const button = document.querySelector('button[data-test-selector="chat-viewer-list"]');
@@ -901,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_dom_adapter_executes_against_minimal_panel_fixture() {
+    fn generated_dom_adapter_rejects_delayed_consent_and_recovers_panel() {
         let node_version = Command::new("node")
             .arg("--version")
             .output()
@@ -915,6 +953,8 @@ mod tests {
 let panelOpen = false;
 let rowsReady = false;
 let panelOpens = 0;
+let consentVisible = false;
+let rejectClicks = 0;
 const close = {{ click() {{ panelOpen = false; }} }};
 const pane = {{ querySelector() {{ return close; }} }};
 const input = {{ closest() {{ return pane; }} }};
@@ -923,7 +963,7 @@ const toggle = {{
     panelOpens += 1;
     if (panelOpens === 1) {{
       panelOpen = true;
-      setTimeout(() => {{ panelOpen = false; }}, 25);
+      setTimeout(() => {{ consentVisible = true; panelOpen = false; }}, 25);
     }} else {{
       setTimeout(() => {{ panelOpen = true; }}, 250);
       setTimeout(() => {{ rowsReady = true; }}, 450);
@@ -932,6 +972,11 @@ const toggle = {{
   getAttribute(name) {{ return name === 'aria-label' ? 'Viewers' : null; }},
   textContent: 'Viewers'
 }};
+const accept = {{ textContent: 'Accept' }};
+const customize = {{ textContent: 'Customize' }};
+const reject = {{ textContent: 'Reject', click() {{ rejectClicks += 1; consentVisible = false; }} }};
+const consentScope = {{ parentElement: null, querySelectorAll(selector) {{ return selector === 'button' ? [accept, customize, reject] : []; }} }};
+const consentTitle = {{ tagName: 'P', textContent: 'Cookies and Advertising Choices', parentElement: consentScope }};
 const row = {{ dataset: {{ username: 'Alice_1' }} }};
 const roleList = {{ scrollHeight: 100, clientHeight: 100, scrollTop: 0, parentElement: null }};
 global.location = {{ origin: 'https://www.twitch.tv', protocol: 'https:', hostname: 'www.twitch.tv', pathname: '/popout/test_channel/chat' }};
@@ -944,6 +989,7 @@ global.document = {{
     return null;
   }},
   querySelectorAll(selector) {{
+    if (selector === 'h1,h2,h3,h4,h5,h6,p,span,div,[role="heading"]') return consentVisible ? [consentTitle] : [];
     if (selector === 'button') return [toggle];
     if (selector === '[aria-labelledby^="chat-viewers-list-header-"]') return panelOpen ? [roleList] : [];
     if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen && rowsReady ? [row] : [];
@@ -951,7 +997,8 @@ global.document = {{
   }}
 }};
 roleList.parentElement = document.body;
-Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON.stringify({{ value, panelOpens }}))).catch(error => {{ console.error(error); process.exit(1); }});
+consentScope.parentElement = document.body;
+Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON.stringify({{ value, panelOpens, rejectClicks }}))).catch(error => {{ console.error(error); process.exit(1); }});
 "#
         );
         let output = Command::new(node).arg("-e").arg(fixture).output().unwrap();
@@ -962,6 +1009,7 @@ Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON
         );
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result.get("panelOpens").and_then(Value::as_u64), Some(2));
+        assert_eq!(result.get("rejectClicks").and_then(Value::as_u64), Some(1));
         let sample: DomSample = serde_json::from_value(result["value"].clone()).unwrap();
         let sample = sample.validate("test_channel").unwrap();
         assert_eq!(sample.usernames, ["alice_1"]);
