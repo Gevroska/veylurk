@@ -523,7 +523,19 @@ fn dom_adapter_script(channel: &str) -> String {
       const expected = {channel};
       const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
       const deadline = Date.now() + 20000;
+      const viewerInput = () => document.querySelector('input[aria-label="Search Chat Viewers"]');
+      const closeViewerPanel = async () => {{
+        const input = viewerInput();
+        if (!input) return true;
+        const close = input.closest('.chat-viewers__pane')?.querySelector('button[aria-label="Close"][data-a-target="chat-viewer-list"]');
+        const back = [...document.querySelectorAll('button')].find(el => /^go back to chat$/i.test(el.getAttribute('aria-label') || el.textContent.trim()));
+        if (close) close.click(); else if (back) back.click(); else document.querySelector('button[data-test-selector="chat-viewer-list"]')?.click();
+        const closeDeadline = Date.now() + 2000;
+        while (viewerInput() && Date.now() < closeDeadline) await sleep(50);
+        return !viewerInput();
+      }};
       while (document.readyState !== 'complete' && Date.now() < deadline) await sleep(100);
+      if (!await closeViewerPanel()) return {{channel: expected, origin:location.origin, status:'ui_changed', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
       while (Date.now() < deadline) {{
         const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
         const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
@@ -534,15 +546,23 @@ fn dom_adapter_script(channel: &str) -> String {
       }}
       let input = null;
       while (Date.now() < deadline) {{
-        input = document.querySelector('input[aria-label="Search Chat Viewers"]');
+        input = viewerInput();
         if (input) break;
         await sleep(150);
       }}
       if (!input) return {{channel: expected, origin:location.origin, status:'unavailable', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
+      const rowSelector = 'button[data-test-selector="chat-viewers-list__button"][data-username]';
+      while (!document.querySelector(rowSelector) && Date.now() < deadline) {{
+        const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
+        const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
+        if (challengeTitle || challengeElement) return {{channel: expected, origin:location.origin, status:'challenge', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
+        await sleep(150);
+      }}
+      if (!document.querySelector(rowSelector)) return {{channel: expected, origin:location.origin, status:'unavailable', usernames:[], role_lists:document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length, scroll_rounds:0, reached_end:false}};
       const found = new Set(); let rounds = 0; let unchanged = 0; let reachedEnd = false;
       while (rounds < 40 && unchanged < 3 && Date.now() < deadline) {{
         const before = found.size;
-        document.querySelectorAll('button[data-test-selector="chat-viewers-list__button"][data-username]').forEach(el => found.add(el.dataset.username));
+        document.querySelectorAll(rowSelector).forEach(el => found.add(el.dataset.username));
         const lists = [...document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]')];
         const scrollables = [...new Set(lists.map(list => (() => {{ let n=list; while(n && n !== document.body) {{ if(n.scrollHeight > n.clientHeight + 2) return n; n=n.parentElement; }} return list; }})()))];
         for (const scroller of scrollables) {{
@@ -551,13 +571,13 @@ fn dom_adapter_script(channel: &str) -> String {
         reachedEnd = scrollables.length > 0 && scrollables.every(scroller => scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2);
         unchanged = found.size === before ? unchanged + 1 : 0; rounds += 1; await sleep(100);
       }}
-      document.querySelectorAll('button[data-test-selector="chat-viewers-list__button"][data-username]').forEach(el => found.add(el.dataset.username));
+      document.querySelectorAll(rowSelector).forEach(el => found.add(el.dataset.username));
       const validLocation = location.protocol === 'https:' && location.hostname === 'www.twitch.tv';
       const actual = (location.pathname.match(/^\/popout\/([^/]+)\/chat/i) || [,''])[1].toLowerCase();
       if (!validLocation) return {{channel: actual, origin:location.origin, status:'wrong_origin', usernames:[], role_lists:0, scroll_rounds:rounds, reached_end:false}};
-      const back = [...document.querySelectorAll('button')].find(el => /^go back to chat$/i.test(el.getAttribute('aria-label') || el.textContent.trim()));
-      if (back) back.click(); else document.querySelector('button[data-test-selector="chat-viewer-list"]')?.click();
-      return {{channel: actual, origin:location.origin, status:'ok', usernames:[...found], role_lists:document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length, scroll_rounds:rounds, reached_end:reachedEnd}};
+      const roleLists = document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length;
+      if (!await closeViewerPanel()) return {{channel: actual, origin:location.origin, status:'ui_changed', usernames:[], role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd}};
+      return {{channel: actual, origin:location.origin, status:'ok', usernames:[...found], role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd}};
     }})()"#
     )
 }
