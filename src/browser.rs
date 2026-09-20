@@ -93,6 +93,18 @@ impl DomSample {
                 )))
             }
             "ok" => {}
+            "ui_changed" => {
+                return Err(BrowserProbeError::UiChanged(format!(
+                    "reason={}; ready_state={}; lang={:?}; toggle={}; input={}; role_lists={}; rendered_rows={}",
+                    self.reason,
+                    self.ready_state,
+                    self.document_lang,
+                    self.viewer_toggle_present,
+                    self.viewer_input_present,
+                    self.role_lists,
+                    self.rendered_row_count
+                )))
+            }
             value => {
                 return Err(BrowserProbeError::UiChanged(format!(
                     "unknown DOM adapter status {value:?}"
@@ -365,11 +377,9 @@ impl BrowserSession {
                     )));
                 }
                 if let Some(exception) = response.pointer("/result/exceptionDetails") {
-                    let text = exception
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("JavaScript exception");
-                    return Err(BrowserProbeError::UiChanged(text.to_owned()));
+                    return Err(BrowserProbeError::UiChanged(bounded_exception_diagnostic(
+                        exception,
+                    )));
                 }
                 return response
                     .pointer("/result/result/value")
@@ -474,6 +484,34 @@ fn is_transient_navigation_error(message: &str) -> bool {
         || message.contains("evaluation returned no value")
 }
 
+fn bounded_exception_diagnostic(exception: &Value) -> String {
+    let class_name = exception
+        .pointer("/exception/className")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "Error"
+                    | "TypeError"
+                    | "RangeError"
+                    | "ReferenceError"
+                    | "SyntaxError"
+                    | "DOMException"
+            )
+        })
+        .unwrap_or("JavaScriptError");
+    let line = exception.get("lineNumber").and_then(Value::as_u64);
+    let column = exception.get("columnNumber").and_then(Value::as_u64);
+    match (line, column) {
+        (Some(line), Some(column)) => format!(
+            "{class_name} at adapter line {} column {}",
+            line + 1,
+            column + 1
+        ),
+        _ => class_name.to_owned(),
+    }
+}
+
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         #[cfg(windows)]
@@ -559,7 +597,7 @@ fn dom_adapter_script(channel: &str) -> String {
         rendered_row_count:document.querySelectorAll(rowSelector).length,
         login_prompt_present:Boolean(document.querySelector('button[data-a-target="login-button"], a[data-a-target="login-button"]')),
         ...extra,
-      }}));
+      }});
       const closeViewerPanel = async () => {{
         const input = viewerInput();
         if (!input) return true;
@@ -761,5 +799,77 @@ mod tests {
             "Execution context was destroyed"
         ));
         assert!(!is_transient_navigation_error("permission denied"));
+    }
+
+    #[test]
+    fn exception_diagnostic_is_bounded_and_omits_page_text() {
+        let exception = json!({
+            "text": "Uncaught",
+            "lineNumber": 41,
+            "columnNumber": 7,
+            "exception": {
+                "className": "TypeError",
+                "description": "TypeError: secret-user secret chat body token"
+            }
+        });
+        assert_eq!(
+            bounded_exception_diagnostic(&exception),
+            "TypeError at adapter line 42 column 8"
+        );
+    }
+
+    #[test]
+    fn generated_dom_adapter_executes_against_minimal_panel_fixture() {
+        let node_version = Command::new("node")
+            .arg("--version")
+            .output()
+            .expect("Node.js is required to test the generated DOM adapter");
+        assert!(node_version.status.success(), "Node.js did not start");
+        let node = "node";
+        let expression = dom_adapter_script("test_channel");
+        let expression_json = serde_json::to_string(&expression).unwrap();
+        let fixture = format!(
+            r#"
+let panelOpen = false;
+const close = {{ click() {{ panelOpen = false; }} }};
+const pane = {{ querySelector() {{ return close; }} }};
+const input = {{ closest() {{ return pane; }} }};
+const toggle = {{
+  click() {{ panelOpen = true; }},
+  getAttribute(name) {{ return name === 'aria-label' ? 'Viewers' : null; }},
+  textContent: 'Viewers'
+}};
+const row = {{ dataset: {{ username: 'Alice_1' }} }};
+const roleList = {{ scrollHeight: 100, clientHeight: 100, scrollTop: 0, parentElement: null }};
+global.location = {{ origin: 'https://www.twitch.tv', protocol: 'https:', hostname: 'www.twitch.tv', pathname: '/popout/test_channel/chat' }};
+global.document = {{
+  readyState: 'complete', title: '', documentElement: {{ lang: 'en-US' }}, body: {{}},
+  querySelector(selector) {{
+    if (selector === 'input[aria-label="Search Chat Viewers"]') return panelOpen ? input : null;
+    if (selector === 'button[data-test-selector="chat-viewer-list"]') return toggle;
+    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen ? row : null;
+    return null;
+  }},
+  querySelectorAll(selector) {{
+    if (selector === 'button') return [toggle];
+    if (selector === '[aria-labelledby^="chat-viewers-list-header-"]') return panelOpen ? [roleList] : [];
+    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen ? [row] : [];
+    return [];
+  }}
+}};
+roleList.parentElement = document.body;
+Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON.stringify(value))).catch(error => {{ console.error(error); process.exit(1); }});
+"#
+        );
+        let output = Command::new(node).arg("-e").arg(fixture).output().unwrap();
+        assert!(
+            output.status.success(),
+            "generated adapter failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sample: DomSample = serde_json::from_slice(&output.stdout).unwrap();
+        let sample = sample.validate("test_channel").unwrap();
+        assert_eq!(sample.usernames, ["alice_1"]);
+        assert_eq!(sample.reason, "sample_complete");
     }
 }

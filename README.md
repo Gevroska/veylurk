@@ -34,6 +34,8 @@ The dedicated temporary browser profile can write ordinary browser cache and ses
 
 ## Build and test
 
+Node.js is required only for the generated browser-adapter tests; the application does not require Node.js at runtime.
+
 ```text
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
