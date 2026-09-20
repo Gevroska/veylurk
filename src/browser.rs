@@ -48,10 +48,18 @@ pub struct DomSample {
     pub channel: String,
     pub origin: String,
     pub status: String,
+    pub reason: String,
     pub usernames: Vec<String>,
     pub role_lists: usize,
     pub scroll_rounds: usize,
     pub reached_end: bool,
+    pub ready_state: String,
+    pub document_lang: String,
+    pub known_error_title_present: bool,
+    pub viewer_toggle_present: bool,
+    pub viewer_input_present: bool,
+    pub rendered_row_count: usize,
+    pub login_prompt_present: bool,
 }
 
 impl DomSample {
@@ -71,9 +79,18 @@ impl DomSample {
         match self.status.as_str() {
             "challenge" => return Err(BrowserProbeError::Challenge),
             "unavailable" => {
-                return Err(BrowserProbeError::Unavailable(
-                    "viewer list was not offered by the ordinary UI".into(),
-                ))
+                return Err(BrowserProbeError::Unavailable(format!(
+                    "reason={}; ready_state={}; lang={:?}; known_error_title={}; toggle={}; input={}; role_lists={}; rendered_rows={}; login_prompt={}",
+                    self.reason,
+                    self.ready_state,
+                    self.document_lang,
+                    self.known_error_title_present,
+                    self.viewer_toggle_present,
+                    self.viewer_input_present,
+                    self.role_lists,
+                    self.rendered_row_count,
+                    self.login_prompt_present
+                )))
             }
             "ok" => {}
             value => {
@@ -524,6 +541,25 @@ fn dom_adapter_script(channel: &str) -> String {
       const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
       const deadline = Date.now() + 20000;
       const viewerInput = () => document.querySelector('input[aria-label="Search Chat Viewers"]');
+      const rowSelector = 'button[data-test-selector="chat-viewers-list__button"][data-username]';
+      const diagnosticResult = (status, reason, usernames = [], extra = {{}}) => ({{
+        channel:(location.pathname.match(/^\/popout\/([^/]+)\/chat/i) || [,''])[1].toLowerCase(),
+        origin:location.origin,
+        status,
+        reason,
+        usernames,
+        role_lists:document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length,
+        scroll_rounds:0,
+        reached_end:false,
+        ready_state:document.readyState,
+        document_lang:String(document.documentElement?.lang || '').slice(0, 24),
+        known_error_title_present:/access denied|verify you are human|unusual traffic/i.test(document.title),
+        viewer_toggle_present:Boolean(document.querySelector('button[data-test-selector="chat-viewer-list"]')),
+        viewer_input_present:Boolean(viewerInput()),
+        rendered_row_count:document.querySelectorAll(rowSelector).length,
+        login_prompt_present:Boolean(document.querySelector('button[data-a-target="login-button"], a[data-a-target="login-button"]')),
+        ...extra,
+      }}));
       const closeViewerPanel = async () => {{
         const input = viewerInput();
         if (!input) return true;
@@ -535,11 +571,11 @@ fn dom_adapter_script(channel: &str) -> String {
         return !viewerInput();
       }};
       while (document.readyState !== 'complete' && Date.now() < deadline) await sleep(100);
-      if (!await closeViewerPanel()) return {{channel: expected, origin:location.origin, status:'ui_changed', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
+      if (!await closeViewerPanel()) return diagnosticResult('ui_changed', 'stale_panel_close_failed');
       while (Date.now() < deadline) {{
         const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
         const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
-        if (challengeTitle || challengeElement) return {{channel: expected, origin:location.origin, status:'challenge', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
+        if (challengeTitle || challengeElement) return diagnosticResult('challenge', 'challenge_indicator');
         const button = document.querySelector('button[data-test-selector="chat-viewer-list"]');
         if (button) {{ button.click(); break; }}
         await sleep(200);
@@ -550,15 +586,14 @@ fn dom_adapter_script(channel: &str) -> String {
         if (input) break;
         await sleep(150);
       }}
-      if (!input) return {{channel: expected, origin:location.origin, status:'unavailable', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
-      const rowSelector = 'button[data-test-selector="chat-viewers-list__button"][data-username]';
+      if (!input) return diagnosticResult('unavailable', document.querySelector('button[data-test-selector="chat-viewer-list"]') ? 'panel_input_timeout' : 'viewer_toggle_missing');
       while (!document.querySelector(rowSelector) && Date.now() < deadline) {{
         const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
         const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
-        if (challengeTitle || challengeElement) return {{channel: expected, origin:location.origin, status:'challenge', usernames:[], role_lists:0, scroll_rounds:0, reached_end:false}};
+        if (challengeTitle || challengeElement) return diagnosticResult('challenge', 'challenge_indicator');
         await sleep(150);
       }}
-      if (!document.querySelector(rowSelector)) return {{channel: expected, origin:location.origin, status:'unavailable', usernames:[], role_lists:document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length, scroll_rounds:0, reached_end:false}};
+      if (!document.querySelector(rowSelector)) return diagnosticResult('unavailable', 'viewer_rows_timeout');
       const found = new Set(); let rounds = 0; let unchanged = 0; let reachedEnd = false;
       while (rounds < 40 && unchanged < 3 && Date.now() < deadline) {{
         const before = found.size;
@@ -574,10 +609,11 @@ fn dom_adapter_script(channel: &str) -> String {
       document.querySelectorAll(rowSelector).forEach(el => found.add(el.dataset.username));
       const validLocation = location.protocol === 'https:' && location.hostname === 'www.twitch.tv';
       const actual = (location.pathname.match(/^\/popout\/([^/]+)\/chat/i) || [,''])[1].toLowerCase();
-      if (!validLocation) return {{channel: actual, origin:location.origin, status:'wrong_origin', usernames:[], role_lists:0, scroll_rounds:rounds, reached_end:false}};
+      if (!validLocation) return diagnosticResult('wrong_origin', 'unexpected_origin', [], {{scroll_rounds:rounds}});
       const roleLists = document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length;
-      if (!await closeViewerPanel()) return {{channel: actual, origin:location.origin, status:'ui_changed', usernames:[], role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd}};
-      return {{channel: actual, origin:location.origin, status:'ok', usernames:[...found], role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd}};
+      const renderedRows = document.querySelectorAll(rowSelector).length;
+      if (!await closeViewerPanel()) return diagnosticResult('ui_changed', 'sample_panel_close_failed', [], {{role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd, rendered_row_count:renderedRows}});
+      return diagnosticResult('ok', 'sample_complete', [...found], {{role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd, rendered_row_count:renderedRows}});
     }})()"#
     )
 }
@@ -600,10 +636,18 @@ mod tests {
             channel: "Test".into(),
             origin: "https://www.twitch.tv".into(),
             status: "ok".into(),
+            reason: "sample_complete".into(),
             usernames: vec!["Alice".into(), "alice".into(), "Bob_2".into()],
             role_lists: 1,
             scroll_rounds: 2,
             reached_end: true,
+            ready_state: "complete".into(),
+            document_lang: "en".into(),
+            known_error_title_present: false,
+            viewer_toggle_present: true,
+            viewer_input_present: false,
+            rendered_row_count: 3,
+            login_prompt_present: false,
         }
         .validate("test")
         .unwrap();
@@ -613,10 +657,18 @@ mod tests {
                 channel: "other".into(),
                 origin: "https://www.twitch.tv".into(),
                 status: "ok".into(),
+                reason: "sample_complete".into(),
                 usernames: vec!["a".into()],
                 role_lists: 1,
                 scroll_rounds: 1,
-                reached_end: true
+                reached_end: true,
+                ready_state: "complete".into(),
+                document_lang: "en".into(),
+                known_error_title_present: false,
+                viewer_toggle_present: true,
+                viewer_input_present: false,
+                rendered_row_count: 1,
+                login_prompt_present: false,
             }
             .validate("test"),
             Err(BrowserProbeError::ChannelMismatch { .. })
@@ -628,10 +680,18 @@ mod tests {
             channel: "x".into(),
             origin: "https://www.twitch.tv".into(),
             status: "challenge".into(),
+            reason: "challenge_indicator".into(),
             usernames: vec![],
             role_lists: 0,
             scroll_rounds: 0,
             reached_end: false,
+            ready_state: "complete".into(),
+            document_lang: "en".into(),
+            known_error_title_present: true,
+            viewer_toggle_present: false,
+            viewer_input_present: false,
+            rendered_row_count: 0,
+            login_prompt_present: false,
         };
         assert!(matches!(
             challenge.validate("x"),
@@ -641,10 +701,18 @@ mod tests {
             channel: "x".into(),
             origin: "https://www.twitch.tv".into(),
             status: "ok".into(),
+            reason: "sample_complete".into(),
             usernames: vec![],
             role_lists: 1,
             scroll_rounds: 3,
             reached_end: true,
+            ready_state: "complete".into(),
+            document_lang: "en".into(),
+            known_error_title_present: false,
+            viewer_toggle_present: true,
+            viewer_input_present: false,
+            rendered_row_count: 0,
+            login_prompt_present: false,
         };
         assert!(matches!(
             empty.validate("x"),
@@ -658,10 +726,18 @@ mod tests {
             channel: "x".into(),
             origin: "https://example.com".into(),
             status: "ok".into(),
+            reason: "sample_complete".into(),
             usernames: vec!["alice".into()],
             role_lists: 1,
             scroll_rounds: 1,
             reached_end: true,
+            ready_state: "complete".into(),
+            document_lang: "en".into(),
+            known_error_title_present: false,
+            viewer_toggle_present: true,
+            viewer_input_present: false,
+            rendered_row_count: 1,
+            login_prompt_present: false,
         };
         assert!(matches!(
             wrong_origin.validate("x"),
