@@ -526,7 +526,10 @@ mod tests {
             scroll_rounds: 0,
             reached_end: false,
         };
-        assert_eq!(challenge.validate("x"), Err(BrowserProbeError::Challenge));
+        assert!(matches!(
+            challenge.validate("x"),
+            Err(BrowserProbeError::Challenge)
+        ));
         let empty = DomSample {
             channel: "x".into(),
             origin: "https://www.twitch.tv".into(),
