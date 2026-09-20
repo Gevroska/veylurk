@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
@@ -24,6 +25,8 @@ use windows_sys::Win32::{
 };
 
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FAILURE_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SCREENSHOT_CDP_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BrowserProbeError {
@@ -460,6 +463,73 @@ impl BrowserSession {
         let sample: DomSample = serde_json::from_value(result)
             .map_err(|e| BrowserProbeError::UiChanged(e.to_string()))?;
         sample.validate(channel)
+    }
+
+    pub fn capture_failure_screenshot(
+        &mut self,
+        target: &BrowserTarget,
+        path: &Path,
+    ) -> Result<(), BrowserProbeError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "id": id,
+            "sessionId": &target.session_id,
+            "method": "Page.captureScreenshot",
+            "params": {
+                "format": "png",
+                "fromSurface": true,
+                "captureBeyondViewport": false
+            }
+        });
+        self.socket
+            .send(Message::Text(request.to_string().into()))
+            .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
+        let encoded = loop {
+            let message = self
+                .socket
+                .read()
+                .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
+            if message.len() > MAX_SCREENSHOT_CDP_MESSAGE_BYTES {
+                return Err(BrowserProbeError::Protocol(
+                    "CDP screenshot response exceeded 12 MiB".into(),
+                ));
+            }
+            if let Message::Text(text) = message {
+                let response: Value = serde_json::from_str(&text)
+                    .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
+                if response.get("id").and_then(Value::as_u64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = response.get("error") {
+                    return Err(BrowserProbeError::Protocol(error.to_string()));
+                }
+                break response
+                    .pointer("/result/data")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        BrowserProbeError::Protocol("screenshot response omitted PNG data".into())
+                    })?
+                    .to_owned();
+            }
+        };
+        let maximum_encoded_len = MAX_FAILURE_SCREENSHOT_BYTES.div_ceil(3) * 4;
+        if encoded.len() > maximum_encoded_len {
+            return Err(BrowserProbeError::Protocol(
+                "decoded screenshot would exceed 8 MiB".into(),
+            ));
+        }
+        let png = BASE64_STANDARD.decode(encoded).map_err(|_| {
+            BrowserProbeError::Protocol("screenshot data was not valid base64".into())
+        })?;
+        if png.len() > MAX_FAILURE_SCREENSHOT_BYTES || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(BrowserProbeError::Protocol(
+                "screenshot was not a bounded PNG".into(),
+            ));
+        }
+        fs::write(path, png).map_err(|error| {
+            BrowserProbeError::Protocol(format!("could not write failure screenshot: {error}"))
+        })
     }
 
     pub fn close_channel(&mut self, target: BrowserTarget) {

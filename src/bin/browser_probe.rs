@@ -36,6 +36,10 @@ struct Args {
     /// Explicit Brave Browser executable.
     #[arg(long)]
     browser_path: Option<PathBuf>,
+
+    /// Save the current public page as a local PNG if DOM collection fails.
+    #[arg(long, value_name = "PNG_PATH")]
+    failure_screenshot: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -87,9 +91,22 @@ fn run(args: Args) -> Result<(), String> {
                     "global timeout leaves insufficient room for another bounded UI sample after {success_count} success(es)"
                 ));
             }
-            let sample = session.collect(target).map_err(|error| format!(
-                "{error}; browser automation stopped without challenge handling or fallback transport"
-            ))?;
+            let sample = match session.collect(target) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    if let Some(path) = args.failure_screenshot.as_deref() {
+                        match session.capture_failure_screenshot(target, path) {
+                            Ok(()) => eprintln!("failure screenshot saved to {}", path.display()),
+                            Err(capture_error) => {
+                                eprintln!("failure screenshot unavailable: {capture_error}")
+                            }
+                        }
+                    }
+                    return Err(format!(
+                        "{error}; browser automation stopped without challenge handling or fallback transport"
+                    ));
+                }
+            };
             let current: HashSet<_> = sample.usernames.into_iter().collect();
             let previous_overlap = previous[index].as_ref().map(|set| overlap(set, &current));
             cumulative[index].extend(current.iter().cloned());
@@ -160,5 +177,14 @@ mod tests {
         assert!(Args::try_parse_from(["probe", "--channel", "x", "--interval", "14"]).is_err());
         assert!(Args::try_parse_from(["probe"]).is_err());
         assert!(Args::try_parse_from(["probe", "--channel", "x", "--samples", "5"]).is_err());
+        let args = Args::try_parse_from([
+            "probe",
+            "--channel",
+            "x",
+            "--failure-screenshot",
+            "failure.png",
+        ])
+        .unwrap();
+        assert_eq!(args.failure_screenshot, Some(PathBuf::from("failure.png")));
     }
 }
