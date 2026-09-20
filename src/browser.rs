@@ -625,10 +625,22 @@ fn dom_adapter_script(channel: &str) -> String {
         await sleep(150);
       }}
       if (!input) return diagnosticResult('unavailable', document.querySelector('button[data-test-selector="chat-viewer-list"]') ? 'panel_input_timeout' : 'viewer_toggle_missing');
+      let panelReopens = 0;
+      let reopenedInputObserved = false;
       while (!document.querySelector(rowSelector) && Date.now() < deadline) {{
         const challengeTitle = /access denied|verify you are human|unusual traffic/i.test(document.title);
         const challengeElement = document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]');
         if (challengeTitle || challengeElement) return diagnosticResult('challenge', 'challenge_indicator');
+        const inputVisible = Boolean(viewerInput());
+        if (!inputVisible && panelReopens === 0) {{
+          const button = document.querySelector('button[data-test-selector="chat-viewer-list"]');
+          if (!button) return diagnosticResult('unavailable', 'viewer_toggle_missing_after_panel_disappeared');
+          button.click(); panelReopens += 1;
+        }} else if (inputVisible && panelReopens === 1) {{
+          reopenedInputObserved = true;
+        }} else if (!inputVisible && reopenedInputObserved) {{
+          return diagnosticResult('unavailable', 'panel_disappeared_after_reopen');
+        }}
         await sleep(150);
       }}
       if (!document.querySelector(rowSelector)) return diagnosticResult('unavailable', 'viewer_rows_timeout');
@@ -831,11 +843,22 @@ mod tests {
         let fixture = format!(
             r#"
 let panelOpen = false;
+let rowsReady = false;
+let panelOpens = 0;
 const close = {{ click() {{ panelOpen = false; }} }};
 const pane = {{ querySelector() {{ return close; }} }};
 const input = {{ closest() {{ return pane; }} }};
 const toggle = {{
-  click() {{ panelOpen = true; }},
+  click() {{
+    panelOpens += 1;
+    if (panelOpens === 1) {{
+      panelOpen = true;
+      setTimeout(() => {{ panelOpen = false; }}, 25);
+    }} else {{
+      setTimeout(() => {{ panelOpen = true; }}, 250);
+      setTimeout(() => {{ rowsReady = true; }}, 450);
+    }}
+  }},
   getAttribute(name) {{ return name === 'aria-label' ? 'Viewers' : null; }},
   textContent: 'Viewers'
 }};
@@ -847,18 +870,18 @@ global.document = {{
   querySelector(selector) {{
     if (selector === 'input[aria-label="Search Chat Viewers"]') return panelOpen ? input : null;
     if (selector === 'button[data-test-selector="chat-viewer-list"]') return toggle;
-    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen ? row : null;
+    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen && rowsReady ? row : null;
     return null;
   }},
   querySelectorAll(selector) {{
     if (selector === 'button') return [toggle];
     if (selector === '[aria-labelledby^="chat-viewers-list-header-"]') return panelOpen ? [roleList] : [];
-    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen ? [row] : [];
+    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen && rowsReady ? [row] : [];
     return [];
   }}
 }};
 roleList.parentElement = document.body;
-Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON.stringify(value))).catch(error => {{ console.error(error); process.exit(1); }});
+Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON.stringify({{ value, panelOpens }}))).catch(error => {{ console.error(error); process.exit(1); }});
 "#
         );
         let output = Command::new(node).arg("-e").arg(fixture).output().unwrap();
@@ -867,9 +890,12 @@ Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON
             "generated adapter failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let sample: DomSample = serde_json::from_slice(&output.stdout).unwrap();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result.get("panelOpens").and_then(Value::as_u64), Some(2));
+        let sample: DomSample = serde_json::from_value(result["value"].clone()).unwrap();
         let sample = sample.validate("test_channel").unwrap();
         assert_eq!(sample.usernames, ["alice_1"]);
         assert_eq!(sample.reason, "sample_complete");
+        assert_eq!(sample.rendered_row_count, 1);
     }
 }
