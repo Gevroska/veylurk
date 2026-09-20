@@ -10,7 +10,7 @@ Twitch's normal logged-out web interface exposed changing samples of chat-connec
 
 This leaves the browser UI path feasible for experimentation while the preferred lightweight standalone transport is currently blocked. It does not establish a safe collection cadence or a complete population model.
 
-The Stage 3 probe launches installed Microsoft Edge or Google Chrome with a new temporary profile, creates up to three ordinary popout-chat tabs, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. Browser automation is limited to loopback. It does not use the user's browser profile, inspect browser network requests, copy cookies or tokens, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run.
+The Stage 3 probe launches installed Brave Browser with a new temporary profile, creates up to three ordinary popout-chat tabs, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. Browser automation is limited to loopback. It does not use the user's browser profile, inspect browser network requests, copy cookies or tokens, alter Brave Shields, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run.
 
 ## Probe behavior
 
@@ -30,11 +30,13 @@ veylurk-browser-probe --channel parolesdhonneur_ --samples 3 --interval 15 --tim
 
 The browser probe prints aggregate counts, overlap, cumulative discovery, and one-way fingerprints. Usernames stay in memory. Its three-tab cap is an experiment boundary and provides no evidence for dozens-channel scale. The preflight runtime budget is checked between operations; an in-flight browser protocol operation has a separate 25-second I/O cap.
 
+The dedicated temporary browser profile can write ordinary browser cache and session files while the probe runs. The probe deletes that profile on normal cleanup on a best-effort basis and never uses the user's existing browser profile.
+
 ## Build and test
 
 ```text
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 ```

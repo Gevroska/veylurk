@@ -13,10 +13,10 @@ use veylurk_probe::overlap;
 #[command(
     name = "veylurk-browser-probe",
     about = "Bounded ordinary-UI feasibility probe for Twitch chat-connected samples",
-    long_about = "Launches a clean dedicated Edge or Chrome profile, opens Twitch's ordinary popout chat, and reads only rendered viewer-panel DOM through local browser automation. It never copies a user profile, credentials, cookies, integrity tokens, or private network responses. Account names remain in memory and only aggregate JSON lines are printed."
+    long_about = "Launches a clean dedicated Brave profile, opens Twitch's ordinary popout chat, and reads only rendered viewer-panel DOM through local browser automation. It never copies a user profile, credentials, cookies, integrity tokens, or private network responses. Account names remain in memory and only aggregate JSON lines are printed."
 )]
 struct Args {
-    /// Twitch channel login. Repeat for at most three sequential channels.
+    /// Twitch channel login. Repeat for up to three concurrent tabs sampled round-robin.
     #[arg(short, long, required = true, action = clap::ArgAction::Append)]
     channel: Vec<String>,
 
@@ -33,7 +33,7 @@ struct Args {
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(30..=3600))]
     timeout: u64,
 
-    /// Explicit Microsoft Edge or Google Chrome executable.
+    /// Explicit Brave Browser executable.
     #[arg(long)]
     browser_path: Option<PathBuf>,
 }

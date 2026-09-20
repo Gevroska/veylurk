@@ -84,14 +84,14 @@ try {
         observed_process_count = $observed.Count
         peak_simultaneous_working_set_bytes = $peakSimultaneousWorkingSet
         peak_simultaneous_private_bytes = $peakSimultaneousPrivateBytes
-        sum_peak_working_set_bytes = [long](($observed.Values | Measure-Object peak_working_set_bytes -Sum).Sum)
-        sum_peak_private_bytes = [long](($observed.Values | Measure-Object peak_private_bytes -Sum).Sum)
-        sum_latest_cpu_ms = [double](($observed.Values | Measure-Object latest_cpu_ms -Sum).Sum)
+        sum_peak_working_set_bytes = [long](($observed.Values | ForEach-Object { [long]$_['peak_working_set_bytes'] } | Measure-Object -Sum).Sum)
+        sum_peak_private_bytes = [long](($observed.Values | ForEach-Object { [long]$_['peak_private_bytes'] } | Measure-Object -Sum).Sum)
+        sum_latest_cpu_ms = [double](($observed.Values | ForEach-Object { [double]$_['latest_cpu_ms'] } | Measure-Object -Sum).Sum)
         processes = @($observed.Values)
         surviving_observed_processes_after_exit = $survivingProcesses
         stdout = $stdout
         stderr = $stderr
-        limitation = "Polling every 200 ms may miss short-lived descendants and makes CPU a lower bound. Simultaneous peaks include the probe and browser tree but exclude this measurement script and CIM polling overhead. Sums of individual peaks were not necessarily simultaneous."
+        limitation = "Polling uses a 200 ms minimum delay plus CIM sampling overhead, so it may miss short-lived descendants and makes CPU a lower bound. Simultaneous peaks include the probe and browser tree but exclude this measurement script and CIM polling overhead. Sums of individual peaks were not necessarily simultaneous."
     } | ConvertTo-Json -Depth 5
     exit $process.ExitCode
 }

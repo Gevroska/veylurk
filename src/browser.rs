@@ -27,7 +27,7 @@ const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BrowserProbeError {
-    #[error("no supported browser was found (Microsoft Edge or Google Chrome)")]
+    #[error("Brave Browser was not found")]
     BrowserNotFound,
     #[error("browser launch failed: {0}")]
     Launch(String),
@@ -132,19 +132,26 @@ pub fn normalize_channels(input: &[String]) -> Result<Vec<String>, String> {
 
 pub fn find_browser(explicit: Option<&Path>) -> Result<PathBuf, BrowserProbeError> {
     if let Some(path) = explicit {
-        return path.is_file().then(|| path.to_path_buf()).ok_or_else(|| {
-            BrowserProbeError::Launch(format!("browser does not exist: {}", path.display()))
-        });
+        let is_brave = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("brave.exe"));
+        return (path.is_file() && is_brave)
+            .then(|| path.to_path_buf())
+            .ok_or_else(|| {
+                BrowserProbeError::Launch(format!(
+                    "path is not a Brave Browser executable: {}",
+                    path.display()
+                ))
+            });
     }
     let candidates = [
+        std::env::var_os("PROGRAMFILES")
+            .map(|p| PathBuf::from(p).join("BraveSoftware/Brave-Browser/Application/brave.exe")),
         std::env::var_os("PROGRAMFILES(X86)")
-            .map(|p| PathBuf::from(p).join("Microsoft/Edge/Application/msedge.exe")),
-        std::env::var_os("PROGRAMFILES")
-            .map(|p| PathBuf::from(p).join("Microsoft/Edge/Application/msedge.exe")),
-        std::env::var_os("PROGRAMFILES")
-            .map(|p| PathBuf::from(p).join("Google/Chrome/Application/chrome.exe")),
+            .map(|p| PathBuf::from(p).join("BraveSoftware/Brave-Browser/Application/brave.exe")),
         std::env::var_os("LOCALAPPDATA")
-            .map(|p| PathBuf::from(p).join("Google/Chrome/Application/chrome.exe")),
+            .map(|p| PathBuf::from(p).join("BraveSoftware/Brave-Browser/Application/brave.exe")),
     ];
     candidates
         .into_iter()
@@ -302,6 +309,95 @@ impl BrowserSession {
         }
     }
 
+    fn evaluate(
+        &mut self,
+        session_id: &str,
+        expression: &str,
+        await_promise: bool,
+    ) -> Result<Value, BrowserProbeError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({"id": id, "sessionId": session_id, "method":"Runtime.evaluate", "params": {"expression": expression, "awaitPromise": await_promise, "returnByValue": true}});
+        self.socket
+            .send(Message::Text(request.to_string().into()))
+            .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
+        loop {
+            let message = self
+                .socket
+                .read()
+                .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
+            if message.len() > MAX_CDP_MESSAGE_BYTES {
+                return Err(BrowserProbeError::Protocol(
+                    "CDP message exceeded 4 MiB".into(),
+                ));
+            }
+            if let Message::Text(text) = message {
+                let response: Value = serde_json::from_str(&text)
+                    .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
+                if response.get("id").and_then(Value::as_u64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = response.get("error") {
+                    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown CDP error");
+                    return Err(BrowserProbeError::Protocol(format!(
+                        "Runtime.evaluate error {code}: {message}"
+                    )));
+                }
+                if let Some(exception) = response.pointer("/result/exceptionDetails") {
+                    let text = exception
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("JavaScript exception");
+                    return Err(BrowserProbeError::UiChanged(text.to_owned()));
+                }
+                return response
+                    .pointer("/result/result/value")
+                    .cloned()
+                    .ok_or_else(|| {
+                        BrowserProbeError::Protocol("evaluation returned no value".into())
+                    });
+            }
+        }
+    }
+
+    fn wait_until_channel_ready(
+        &mut self,
+        session_id: &str,
+        channel: &str,
+    ) -> Result<(), BrowserProbeError> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let expected_path = format!("/popout/{channel}/chat");
+        let mut last_transient = None;
+        while Instant::now() < deadline {
+            let state = self.evaluate(
+                session_id,
+                "({origin:location.origin,path:location.pathname.toLowerCase(),ready:document.readyState})",
+                false,
+            );
+            match state {
+                Ok(value) if page_state_is_ready(&value, &expected_path) => {
+                    return Ok(());
+                }
+                Ok(_) => last_transient = Some("page identity or ready state did not match".into()),
+                Err(BrowserProbeError::Protocol(message))
+                    if is_transient_navigation_error(&message) =>
+                {
+                    last_transient = Some(message)
+                }
+                Err(error) => return Err(error),
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        Err(BrowserProbeError::UiChanged(format!(
+            "channel page did not become ready at {expected_path:?}: {}",
+            last_transient.unwrap_or_else(|| "no page state received".into())
+        )))
+    }
+
     pub fn open_channel(&mut self, channel: &str) -> Result<BrowserTarget, BrowserProbeError> {
         let url = format!("https://www.twitch.tv/popout/{channel}/chat?popout=");
         let created = self.command("Target.createTarget", json!({"url": url}))?;
@@ -319,6 +415,10 @@ impl BrowserSession {
             .and_then(Value::as_str)
             .ok_or_else(|| BrowserProbeError::Protocol("missing sessionId".into()))?
             .to_owned();
+        if let Err(error) = self.wait_until_channel_ready(&session_id, channel) {
+            let _ = self.command("Target.closeTarget", json!({"targetId": &target_id}));
+            return Err(error);
+        }
         Ok(BrowserTarget {
             target_id,
             session_id,
@@ -329,37 +429,7 @@ impl BrowserSession {
     pub fn collect(&mut self, target: &BrowserTarget) -> Result<DomSample, BrowserProbeError> {
         let channel = &target.channel;
         let expression = dom_adapter_script(channel);
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({"id": id, "sessionId": &target.session_id, "method":"Runtime.evaluate", "params": {"expression": expression, "awaitPromise": true, "returnByValue": true}});
-        self.socket
-            .send(Message::Text(request.to_string().into()))
-            .map_err(|e| BrowserProbeError::Protocol(e.to_string()))?;
-        let value = loop {
-            let message = self
-                .socket
-                .read()
-                .map_err(|e| BrowserProbeError::Protocol(e.to_string()))?;
-            if message.len() > MAX_CDP_MESSAGE_BYTES {
-                return Err(BrowserProbeError::Protocol(
-                    "CDP message exceeded 4 MiB".into(),
-                ));
-            }
-            if let Message::Text(text) = message {
-                let value: Value = serde_json::from_str(&text)
-                    .map_err(|e| BrowserProbeError::Protocol(e.to_string()))?;
-                if value.get("id").and_then(Value::as_u64) == Some(id) {
-                    break value;
-                }
-            }
-        };
-        if let Some(exception) = value.pointer("/result/exceptionDetails") {
-            return Err(BrowserProbeError::UiChanged(exception.to_string()));
-        }
-        let result = value
-            .pointer("/result/result/value")
-            .cloned()
-            .ok_or_else(|| BrowserProbeError::Protocol("evaluation returned no value".into()))?;
+        let result = self.evaluate(&target.session_id, &expression, true)?;
         let sample: DomSample = serde_json::from_value(result)
             .map_err(|e| BrowserProbeError::UiChanged(e.to_string()))?;
         sample.validate(channel)
@@ -368,6 +438,23 @@ impl BrowserSession {
     pub fn close_channel(&mut self, target: BrowserTarget) {
         let _ = self.command("Target.closeTarget", json!({"targetId": target.target_id}));
     }
+}
+
+fn page_state_is_ready(value: &Value, expected_path: &str) -> bool {
+    value.get("origin").and_then(Value::as_str) == Some("https://www.twitch.tv")
+        && value.get("path").and_then(Value::as_str) == Some(expected_path)
+        && matches!(
+            value.get("ready").and_then(Value::as_str),
+            Some("interactive" | "complete")
+        )
+}
+
+fn is_transient_navigation_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("execution context")
+        || message.contains("cannot find context")
+        || message.contains("target navigated")
+        || message.contains("evaluation returned no value")
 }
 
 impl Drop for BrowserSession {
@@ -562,5 +649,21 @@ mod tests {
         ));
         let incomplete = r#"{"channel":"x","origin":"https://www.twitch.tv","status":"ok","usernames":["alice"]}"#;
         assert!(serde_json::from_str::<DomSample>(incomplete).is_err());
+    }
+
+    #[test]
+    fn page_readiness_requires_exact_twitch_identity() {
+        let ready =
+            json!({"origin":"https://www.twitch.tv","path":"/popout/test/chat","ready":"complete"});
+        assert!(page_state_is_ready(&ready, "/popout/test/chat"));
+        assert!(!page_state_is_ready(
+            &json!({"origin":"https://example.com","path":"/popout/test/chat","ready":"complete"}),
+            "/popout/test/chat"
+        ));
+        assert!(!page_state_is_ready(&ready, "/popout/other/chat"));
+        assert!(is_transient_navigation_error(
+            "Execution context was destroyed"
+        ));
+        assert!(!is_transient_navigation_error("permission denied"));
     }
 }
