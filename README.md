@@ -10,7 +10,7 @@ Twitch's normal logged-out web interface exposed changing samples of chat-connec
 
 This leaves the browser UI path feasible for experimentation while the preferred lightweight standalone transport is currently blocked. It does not establish a safe collection cadence or a complete population model.
 
-The Stage 3 probe supervises a pinned Playwright helper and its matched Chromium build. It creates up to three ordinary popout-chat pages in a fresh context, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. If Twitch's exact known "Cookies and Advertising Choices" banner appears with its Accept, Customize, and Reject controls, the probe chooses Reject before continuing. It does not use the user's browser profile, inspect browser network requests, copy cookies or tokens, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run. This migration has not established that Twitch will expose rows in a real run.
+The Stage 3 probe supervises a pinned Playwright helper and its matched Chromium build. It creates up to three ordinary popout-chat pages in a fresh context, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. If Twitch's exact known "Cookies and Advertising Choices" banner appears with its Accept, Customize, and Reject controls, the probe chooses Reject before continuing. It observes only the page's own matching viewer-list response in memory to identify an integrity, authentication, or rate-limit denial and stops promptly; it does not replay requests or retain response content. It does not use the user's browser profile, copy cookies or tokens, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run. This migration has not established that Twitch will expose rows in a real run.
 
 ## Probe behavior
 
@@ -45,7 +45,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-GitHub Actions runs these checks and the offline HTML helper fixture on Windows, preserves the Stage 2 artifact, and packages the Stage 3 executable with Node.js, Playwright, matching Chromium, and third-party notices. `scripts/measure-browser-probe.ps1` samples the Rust and browser process tree, reports simultaneous memory peaks and aggregate CPU, and checks observed process identities for survivors after exit. Polling can miss short-lived processes.
+GitHub Actions runs these checks plus offline HTML and native-response helper fixtures on Windows, preserves the Stage 2 artifact, and packages the Stage 3 executable with Node.js, Playwright, matching Chromium, and third-party notices. `scripts/measure-browser-probe.ps1` samples the Rust and browser process tree, reports simultaneous memory peaks and aggregate CPU, and checks observed process identities for survivors after exit. Polling can miss short-lived processes.
 
 Veylurk can only describe an account as **observed in a Twitch chat-connected sample**. It cannot establish video watch time, exact arrival or departure, anonymous viewers, or complete coverage.
 

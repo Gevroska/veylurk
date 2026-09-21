@@ -28,6 +28,10 @@ pub enum BrowserProbeError {
     Launch(String),
     #[error("browser challenge detected; stopped without attempting to solve it")]
     Challenge,
+    #[error(
+        "Twitch denied the native chat-connected account list with an integrity check; stopped"
+    )]
+    NativeIntegrityDenied,
     #[error("Twitch chat UI is unavailable: {0}")]
     Unavailable(String),
     #[error("Twitch UI changed or did not become ready: {0}")]
@@ -251,6 +255,7 @@ impl ErrorClass {
 #[serde(rename_all = "snake_case")]
 enum FailureCode {
     Challenge,
+    NativeIntegrityDenied,
     Unavailable,
     UiChanged,
     Protocol,
@@ -272,6 +277,9 @@ enum FailureReason {
     UnexpectedOrigin,
     UnexpectedChannel,
     BrowserOperationFailed,
+    NativeIntegrityDenied,
+    NativeAuthDenied,
+    NativeRateLimited,
 }
 
 impl FailureReason {
@@ -291,6 +299,9 @@ impl FailureReason {
             Self::UnexpectedOrigin => "unexpected_origin",
             Self::UnexpectedChannel => "unexpected_channel",
             Self::BrowserOperationFailed => "browser_operation_failed",
+            Self::NativeIntegrityDenied => "native_integrity_denied",
+            Self::NativeAuthDenied => "native_auth_denied",
+            Self::NativeRateLimited => "native_rate_limited",
         }
     }
 }
@@ -374,6 +385,7 @@ fn classify_failure(failure: HelperFailure) -> BrowserProbeError {
     }
     match failure.code {
         FailureCode::Challenge => BrowserProbeError::Challenge,
+        FailureCode::NativeIntegrityDenied => BrowserProbeError::NativeIntegrityDenied,
         FailureCode::Unavailable => BrowserProbeError::Unavailable(detail),
         FailureCode::UiChanged => BrowserProbeError::UiChanged(detail),
         FailureCode::Protocol => BrowserProbeError::Protocol(detail),
@@ -632,6 +644,11 @@ mod tests {
         let error = classify_failure(decode_reply(safe_code, 1).unwrap().error.unwrap());
         assert!(error.to_string().contains("phase=navigation"));
         assert!(error.to_string().contains("net::ERR_BLOCKED_BY_CLIENT"));
+        let native_denial = br#"{"v":1,"id":1,"ok":false,"error":{"code":"native_integrity_denied","reason":"native_integrity_denied","phase":"rows","error_class":"OtherError","network_code":null,"page_error_class":null,"page_error_count":0}}"#;
+        assert_eq!(
+            classify_failure(decode_reply(native_denial, 1).unwrap().error.unwrap()),
+            BrowserProbeError::NativeIntegrityDenied
+        );
         let mut oversized = Cursor::new(vec![b'x'; MAX_REPLY_BYTES + 2]);
         assert!(matches!(
             read_bounded_line(&mut oversized),

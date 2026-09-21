@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 import { createInterface } from 'node:readline';
 import { writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { observeNativeListResponses } from './native-response.mjs';
 
 const VERSION = 1;
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -54,11 +55,12 @@ async function snapshot(page) {
   }), { row: ROW_SELECTOR, role: ROLE_SELECTOR, input: INPUT_SELECTOR, toggle: TOGGLE_SELECTOR });
 }
 
-async function stopOnChallenge(page) {
+async function stopOnChallenge(page, nativeObserver) {
   const state = await snapshot(page);
   if (state.known_error_title_present || state.challenge_element_present) {
     throw new PanelFailure('challenge', 'challenge_indicator');
   }
+  if (nativeObserver?.failure) throw new PanelFailure(nativeObserver.failure.code, nativeObserver.failure.reason);
   return state;
 }
 
@@ -94,15 +96,15 @@ async function closePanel(page) {
   }
 }
 
-export async function collectPanel(page) {
+export async function collectPanel(page, nativeObserver = null) {
   const deadline = Date.now() + 20_000;
   let consentRejected = false;
-  await stopOnChallenge(page);
+  await stopOnChallenge(page, nativeObserver);
   if (!await closePanel(page)) throw new PanelFailure('ui_changed', 'stale_panel_close_failed');
 
   let opened = false;
   while (Date.now() < deadline) {
-    await stopOnChallenge(page);
+    await stopOnChallenge(page, nativeObserver);
     if (!consentRejected && await rejectKnownConsent(page)) {
       consentRejected = true;
       await sleep(100);
@@ -121,7 +123,7 @@ export async function collectPanel(page) {
   let reopened = false;
   let reopenedInputObserved = false;
   while (Date.now() < deadline) {
-    const state = await stopOnChallenge(page);
+    const state = await stopOnChallenge(page, nativeObserver);
     if (!consentRejected && await rejectKnownConsent(page)) {
       consentRejected = true;
       await sleep(100);
@@ -140,7 +142,7 @@ export async function collectPanel(page) {
     }
     await sleep(150);
   }
-  const firstRows = await stopOnChallenge(page);
+  const firstRows = await stopOnChallenge(page, nativeObserver);
   if (firstRows.rendered_row_count === 0) {
     throw new PanelFailure('unavailable', inputObserved ? 'viewer_rows_timeout' : 'panel_input_timeout');
   }
@@ -150,7 +152,7 @@ export async function collectPanel(page) {
   let unchanged = 0;
   let reachedEnd = false;
   while (scrollRounds < 40 && unchanged < 3 && Date.now() < deadline) {
-    await stopOnChallenge(page);
+    await stopOnChallenge(page, nativeObserver);
     const before = found.size;
     for (const login of await page.locator(ROW_SELECTOR).evaluateAll(rows => rows.map(row => row.getAttribute('data-username')))) {
       if (!LOGIN_REGEX.test(login || '')) throw new PanelFailure('ui_changed', 'invalid_username');
@@ -178,7 +180,7 @@ export async function collectPanel(page) {
     if (!LOGIN_REGEX.test(login || '')) throw new PanelFailure('ui_changed', 'invalid_username');
     found.add(login);
   }
-  const state = await stopOnChallenge(page);
+  const state = await stopOnChallenge(page, nativeObserver);
   if (found.size === 0) throw new PanelFailure('unavailable', 'viewer_rows_timeout');
   if (!await closePanel(page)) throw new PanelFailure('ui_changed', 'sample_panel_close_failed');
   return {
@@ -203,8 +205,9 @@ const allowedReasons = new Set([
   'stale_panel_close_failed', 'panel_disappeared_after_reopen', 'viewer_rows_timeout',
   'panel_input_timeout', 'invalid_username', 'sample_panel_close_failed',
   'unexpected_origin', 'unexpected_channel', 'browser_operation_failed',
+  'native_integrity_denied', 'native_auth_denied', 'native_rate_limited',
 ]);
-const allowedCodes = new Set(['challenge', 'unavailable', 'ui_changed', 'protocol', 'browser_launch']);
+const allowedCodes = new Set(['challenge', 'unavailable', 'ui_changed', 'protocol', 'browser_launch', 'native_integrity_denied']);
 
 async function captureFailure(page, filePath) {
   if (!filePath || typeof filePath !== 'string') return;
@@ -230,6 +233,7 @@ async function serve() {
   let context;
   const pages = new Map();
   const pageErrors = new Map();
+  const nativeObservers = new Map();
   let lastId = 0;
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   try {
@@ -275,6 +279,7 @@ async function serve() {
           await Promise.all(request.channels.map(async channel => {
             const page = await context.newPage();
             pages.set(channel, page);
+            nativeObservers.set(channel, observeNativeListResponses(page, channel));
             const errors = { count: 0, lastClass: null };
             pageErrors.set(channel, errors);
             page.on('pageerror', error => {
@@ -300,18 +305,20 @@ async function serve() {
         const url = new URL(page.url());
         if (url.origin !== 'https://www.twitch.tv') throw new PanelFailure('ui_changed', 'unexpected_origin');
         if (url.pathname.toLowerCase() !== `/popout/${request.channel.toLowerCase()}/chat`) throw new PanelFailure('ui_changed', 'unexpected_channel');
-        const sample = await collectPanel(page);
+        const sample = await collectPanel(page, nativeObservers.get(request.channel));
+        await stopOnChallenge(page, nativeObservers.get(request.channel));
         const finalUrl = new URL(page.url());
         if (finalUrl.origin !== 'https://www.twitch.tv') throw new PanelFailure('ui_changed', 'unexpected_origin');
         if (finalUrl.pathname.toLowerCase() !== `/popout/${request.channel.toLowerCase()}/chat`) throw new PanelFailure('ui_changed', 'unexpected_channel');
         reply({ v: VERSION, id, ok: true, sample: { ...sample, channel: request.channel, origin: finalUrl.origin } });
       } catch (error) {
         await captureFailure(page, request.failure_screenshot);
-        const phase = ['viewer_rows_timeout', 'invalid_username', 'panel_disappeared_after_reopen'].includes(error?.reason) ? 'rows' : 'panel';
+        const phase = ['viewer_rows_timeout', 'invalid_username', 'panel_disappeared_after_reopen', 'native_integrity_denied', 'native_auth_denied', 'native_rate_limited'].includes(error?.reason) ? 'rows' : 'panel';
         reply({ v: VERSION, id, ok: false, error: sanitizeFailure(error, phase, pageErrors.get(request.channel)) });
       }
     }
   } finally {
+    for (const observer of nativeObservers.values()) observer.stop();
     try { await context?.close({ timeout: 3_000 }); } catch {}
     try { await browser?.close({ timeout: 3_000 }); } catch {}
   }

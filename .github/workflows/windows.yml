@@ -37,6 +37,8 @@ jobs:
           $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-staging'
           node browser-helper/test-helper.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Offline helper fixture failed' }
+          node --test browser-helper/test-native-response.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Native response classifier tests failed' }
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -57,6 +59,8 @@ jobs:
           $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'stage3-bundle\browsers'
           .\stage3-bundle\node.exe .\stage3-bundle\browser-helper\test-helper.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Packaged offline helper fixture failed' }
+          .\stage3-bundle\node.exe --test .\stage3-bundle\browser-helper\test-native-response.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged native response classifier tests failed' }
       - name: Upload Windows prototype
         uses: actions/upload-artifact@v4
         with:

@@ -19,7 +19,9 @@ $requiredFiles = @(
     $nodeLicense,
     (Join-Path $repoRoot 'LICENSE'),
     (Join-Path $helperRoot 'helper.mjs'),
+    (Join-Path $helperRoot 'native-response.mjs'),
     (Join-Path $helperRoot 'test-helper.mjs'),
+    (Join-Path $helperRoot 'test-native-response.mjs'),
     (Join-Path $helperRoot 'package.json'),
     (Join-Path $helperRoot 'package-lock.json'),
     $playwrightLicense,
@@ -55,7 +57,9 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'target\release\veylurk-browser-prob
 Copy-Item -LiteralPath $nodePath -Destination $outputRoot
 Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination $outputRoot
 Copy-Item -LiteralPath (Join-Path $helperRoot 'helper.mjs') -Destination $outHelper
+Copy-Item -LiteralPath (Join-Path $helperRoot 'native-response.mjs') -Destination $outHelper
 Copy-Item -LiteralPath (Join-Path $helperRoot 'test-helper.mjs') -Destination $outHelper
+Copy-Item -LiteralPath (Join-Path $helperRoot 'test-native-response.mjs') -Destination $outHelper
 Copy-Item -LiteralPath (Join-Path $helperRoot 'fixtures') -Destination $outHelper -Recurse
 Copy-Item -LiteralPath (Join-Path $helperRoot 'package.json') -Destination $outHelper
 Copy-Item -LiteralPath (Join-Path $helperRoot 'package-lock.json') -Destination $outHelper
