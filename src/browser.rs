@@ -214,27 +214,35 @@ impl FailurePhase {
 
 #[derive(Debug, Deserialize)]
 enum ErrorClass {
-    TypeError,
-    ReferenceError,
-    SyntaxError,
-    RangeError,
-    SecurityError,
-    NetworkError,
-    TimeoutError,
-    OtherError,
+    #[serde(rename = "TypeError")]
+    Type,
+    #[serde(rename = "ReferenceError")]
+    Reference,
+    #[serde(rename = "SyntaxError")]
+    Syntax,
+    #[serde(rename = "RangeError")]
+    Range,
+    #[serde(rename = "SecurityError")]
+    Security,
+    #[serde(rename = "NetworkError")]
+    Network,
+    #[serde(rename = "TimeoutError")]
+    Timeout,
+    #[serde(rename = "OtherError")]
+    Other,
 }
 
 impl ErrorClass {
     fn label(&self) -> &'static str {
         match self {
-            Self::TypeError => "TypeError",
-            Self::ReferenceError => "ReferenceError",
-            Self::SyntaxError => "SyntaxError",
-            Self::RangeError => "RangeError",
-            Self::SecurityError => "SecurityError",
-            Self::NetworkError => "NetworkError",
-            Self::TimeoutError => "TimeoutError",
-            Self::OtherError => "OtherError",
+            Self::Type => "TypeError",
+            Self::Reference => "ReferenceError",
+            Self::Syntax => "SyntaxError",
+            Self::Range => "RangeError",
+            Self::Security => "SecurityError",
+            Self::Network => "NetworkError",
+            Self::Timeout => "TimeoutError",
+            Self::Other => "OtherError",
         }
     }
 }
