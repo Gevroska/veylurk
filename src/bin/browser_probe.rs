@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
-use veylurk_probe::browser::{find_browser, normalize_channels, BrowserSession};
+use veylurk_probe::browser::{find_node_and_helper, normalize_channels, BrowserSession};
 use veylurk_probe::overlap;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "veylurk-browser-probe",
     about = "Bounded ordinary-UI feasibility probe for Twitch chat-connected samples",
-    long_about = "Launches a clean dedicated Brave profile, opens Twitch's ordinary popout chat, and reads only rendered viewer-panel DOM through local browser automation. It never copies a user profile, credentials, cookies, integrity tokens, or private network responses. Account names remain in memory and only aggregate JSON lines are printed."
+    long_about = "Supervises a local Playwright helper using its matched Chromium build and a fresh browser context. It reads only rendered viewer-panel DOM and never copies a user profile, credentials, cookies, integrity tokens, or private network responses. Account names remain in memory and only aggregate JSON lines are printed."
 )]
 struct Args {
     /// Twitch channel login. Repeat for up to three concurrent tabs sampled round-robin.
@@ -33,9 +33,13 @@ struct Args {
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(30..=3600))]
     timeout: u64,
 
-    /// Explicit Brave Browser executable.
+    /// Explicit Node.js executable (defaults to bundled node.exe, then PATH).
     #[arg(long)]
-    browser_path: Option<PathBuf>,
+    node_path: Option<PathBuf>,
+
+    /// Explicit browser helper script (defaults to browser-helper/helper.mjs next to the probe).
+    #[arg(long)]
+    helper_path: Option<PathBuf>,
 
     /// Save the current public page as a local PNG if DOM collection fails.
     #[arg(long, value_name = "PNG_PATH")]
@@ -70,43 +74,28 @@ fn main() -> ExitCode {
 
 fn run(args: Args) -> Result<(), String> {
     let channels = normalize_channels(&args.channel)?;
-    let browser = find_browser(args.browser_path.as_deref()).map_err(|e| e.to_string())?;
+    let (node, helper) =
+        find_node_and_helper(args.node_path.as_deref(), args.helper_path.as_deref())
+            .map_err(|error| error.to_string())?;
     let started = Instant::now();
     let budget = Duration::from_secs(args.timeout);
     let mut session =
-        BrowserSession::launch(&browser, Duration::from_secs(10)).map_err(|e| e.to_string())?;
+        BrowserSession::launch(&node, &helper, &channels).map_err(|error| error.to_string())?;
     let mut success_count = 0usize;
-    let targets: Vec<_> = channels
-        .iter()
-        .map(|channel| session.open_channel(channel).map_err(|e| e.to_string()))
-        .collect::<Result<_, _>>()?;
     let mut previous: Vec<Option<HashSet<String>>> = vec![None; channels.len()];
     let mut cumulative: Vec<HashSet<String>> = vec![HashSet::new(); channels.len()];
 
     for sample_number in 1..=args.samples {
         let round_started = Instant::now();
-        for (index, (channel, target)) in channels.iter().zip(&targets).enumerate() {
-            if started.elapsed().saturating_add(Duration::from_secs(22)) >= budget {
+        for (index, channel) in channels.iter().enumerate() {
+            if started.elapsed().saturating_add(Duration::from_secs(25)) >= budget {
                 return Err(format!(
                     "global timeout leaves insufficient room for another bounded UI sample after {success_count} success(es)"
                 ));
             }
-            let sample = match session.collect(target) {
-                Ok(sample) => sample,
-                Err(error) => {
-                    if let Some(path) = args.failure_screenshot.as_deref() {
-                        match session.capture_failure_screenshot(target, path) {
-                            Ok(()) => eprintln!("failure screenshot saved to {}", path.display()),
-                            Err(capture_error) => {
-                                eprintln!("failure screenshot unavailable: {capture_error}")
-                            }
-                        }
-                    }
-                    return Err(format!(
-                        "{error}; browser automation stopped without challenge handling or fallback transport"
-                    ));
-                }
-            };
+            let sample = session.collect(channel, args.failure_screenshot.as_deref()).map_err(|error| format!(
+                "{error}; browser automation stopped without challenge handling or fallback transport"
+            ))?;
             let current: HashSet<_> = sample.usernames.into_iter().collect();
             let previous_overlap = previous[index].as_ref().map(|set| overlap(set, &current));
             cumulative[index].extend(current.iter().cloned());
@@ -159,9 +148,7 @@ fn run(args: Args) -> Result<(), String> {
             thread::sleep(delay);
         }
     }
-    for target in targets {
-        session.close_channel(target);
-    }
+    session.shutdown();
     if success_count == 0 {
         return Err("no successful rendered DOM samples".into());
     }
