@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en-US">
+<head><meta charset="utf-8"><title>Offline panel fixture</title></head>
+<body>
+  <section id="cookie-banner">
+    <p>Cookies and Advertising Choices</p>
+    <button>Accept</button><button>Customize</button><button id="reject">Reject</button>
+  </section>
+  <button data-test-selector="chat-viewer-list">Users in Chat</button>
+  <div id="panel-host"></div>
+  <script>
+    let opens = 0;
+    const delayedConsent = location.search.includes('delayed-consent');
+    document.getElementById('reject').onclick = () => document.getElementById('cookie-banner').remove();
+    if (delayedConsent) document.getElementById('cookie-banner').remove();
+    document.querySelector('[data-test-selector="chat-viewer-list"]').onclick = () => {
+      opens += 1;
+      const host = document.getElementById('panel-host');
+      host.innerHTML = '<section class="chat-viewers__pane"><button aria-label="Close" data-a-target="chat-viewer-list">Close</button><input aria-label="Search Chat Viewers"><div aria-labelledby="chat-viewers-list-header-viewers" id="role-list"></div></section>';
+      host.querySelector('[aria-label="Close"]').onclick = () => { host.innerHTML = ''; };
+      const thisOpen = opens;
+      if (delayedConsent && thisOpen === 1) {
+        setTimeout(() => {
+          host.innerHTML = '';
+          const banner = document.createElement('section');
+          banner.id = 'cookie-banner';
+          banner.innerHTML = '<p>Cookies and Advertising Choices</p><button>Accept</button><button>Customize</button><button id="reject">Reject</button>';
+          document.body.prepend(banner);
+          banner.querySelector('#reject').onclick = () => banner.remove();
+        }, 350);
+      }
+      setTimeout(() => {
+        const role = document.getElementById('role-list');
+        if (role) role.innerHTML = '<button data-test-selector="chat-viewers-list__button" data-username="' + (thisOpen === 1 ? 'Alice_1' : 'Bob_2') + '">row</button>';
+      }, delayedConsent && thisOpen === 1 ? 800 : 250);
+    };
+  </script>
+</body>
+</html>

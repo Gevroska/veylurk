@@ -13,9 +13,30 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.13.1'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install pinned browser helper dependencies
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+          npm ci --prefix browser-helper --omit=dev
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+      - name: Install matched Chromium for bundle
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-staging'
+          node browser-helper/node_modules/playwright/cli.js install chromium --no-shell
+          if ($LASTEXITCODE -ne 0) { throw 'Chromium installation failed' }
+      - name: Test browser helper against offline fixture
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-staging'
+          node browser-helper/test-helper.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Offline helper fixture failed' }
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -24,6 +45,18 @@ jobs:
         run: cargo test --locked
       - name: Build release prototype
         run: cargo build --release --locked
+      - name: Package self-contained Stage 3 probe
+        shell: pwsh
+        run: |
+          .\scripts\package-windows.ps1 -BrowserDirectory (Join-Path $PWD 'browser-staging') -OutputDirectory (Join-Path $PWD 'stage3-bundle')
+      - name: Smoke-check packaged Stage 3 probe without Twitch
+        shell: pwsh
+        run: |
+          .\stage3-bundle\veylurk-browser-probe.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged probe help check failed' }
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'stage3-bundle\browsers'
+          .\stage3-bundle\node.exe .\stage3-bundle\browser-helper\test-helper.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged offline helper fixture failed' }
       - name: Upload Windows prototype
         uses: actions/upload-artifact@v4
         with:
@@ -34,8 +67,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: veylurk-browser-probe-windows-x64
-          path: target/release/veylurk-browser-probe.exe
+          path: stage3-bundle/
           if-no-files-found: error
+          include-hidden-files: true
       - name: Upload resolved lockfile
         if: always()
         uses: actions/upload-artifact@v4

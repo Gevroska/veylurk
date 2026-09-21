@@ -1,38 +1,30 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashSet};
-use std::fs;
-use std::net::TcpStream;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
-    System::{
-        JobObjects::CreateJobObjectW,
-        JobObjects::{
-            AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-            TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        },
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     },
 };
 
-const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_FAILURE_SCREENSHOT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SCREENSHOT_CDP_MESSAGE_BYTES: usize = 12 * 1024 * 1024;
+const PROTOCOL_VERSION: u8 = 1;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_REPLY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BrowserProbeError {
-    #[error("Brave Browser was not found")]
-    BrowserNotFound,
-    #[error("browser launch failed: {0}")]
+    #[error("Node.js or the browser helper could not start: {0}")]
     Launch(String),
     #[error("browser challenge detected; stopped without attempting to solve it")]
     Challenge,
@@ -40,13 +32,14 @@ pub enum BrowserProbeError {
     Unavailable(String),
     #[error("Twitch UI changed or did not become ready: {0}")]
     UiChanged(String),
-    #[error("browser protocol failed: {0}")]
+    #[error("browser helper protocol failed: {0}")]
     Protocol(String),
     #[error("page channel {actual:?} did not match requested channel {requested:?}")]
     ChannelMismatch { requested: String, actual: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomSample {
     pub channel: String,
     pub origin: String,
@@ -74,45 +67,26 @@ impl DomSample {
             });
         }
         if self.origin != "https://www.twitch.tv" {
-            return Err(BrowserProbeError::UiChanged(format!(
-                "unexpected page origin {:?}",
-                self.origin
-            )));
+            return Err(BrowserProbeError::UiChanged(
+                "unexpected page origin".into(),
+            ));
         }
-        match self.status.as_str() {
-            "challenge" => return Err(BrowserProbeError::Challenge),
-            "unavailable" => {
-                return Err(BrowserProbeError::Unavailable(format!(
-                    "reason={}; ready_state={}; lang={:?}; known_error_title={}; toggle={}; input={}; role_lists={}; rendered_rows={}; login_prompt={}",
-                    self.reason,
-                    self.ready_state,
-                    self.document_lang,
-                    self.known_error_title_present,
-                    self.viewer_toggle_present,
-                    self.viewer_input_present,
-                    self.role_lists,
-                    self.rendered_row_count,
-                    self.login_prompt_present
-                )))
-            }
-            "ok" => {}
-            "ui_changed" => {
-                return Err(BrowserProbeError::UiChanged(format!(
-                    "reason={}; ready_state={}; lang={:?}; toggle={}; input={}; role_lists={}; rendered_rows={}",
-                    self.reason,
-                    self.ready_state,
-                    self.document_lang,
-                    self.viewer_toggle_present,
-                    self.viewer_input_present,
-                    self.role_lists,
-                    self.rendered_row_count
-                )))
-            }
-            value => {
-                return Err(BrowserProbeError::UiChanged(format!(
-                    "unknown DOM adapter status {value:?}"
-                )))
-            }
+        if self.status != "ok" || self.reason != "sample_complete" {
+            return Err(BrowserProbeError::UiChanged(
+                "browser helper returned an invalid sample status".into(),
+            ));
+        }
+        if self.document_lang.len() > 24
+            || !matches!(self.ready_state.as_str(), "interactive" | "complete")
+            || self.known_error_title_present
+            || !self.viewer_toggle_present
+            || self.role_lists == 0
+            || self.rendered_row_count == 0
+            || self.scroll_rounds > 40
+        {
+            return Err(BrowserProbeError::UiChanged(
+                "browser helper returned inconsistent DOM evidence".into(),
+            ));
         }
         let mut normalized = BTreeSet::new();
         for raw in self.usernames {
@@ -121,7 +95,7 @@ impl DomSample {
                 || login.len() > 25
                 || !login
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             {
                 return Err(BrowserProbeError::UiChanged(
                     "viewer button contained an invalid username".into(),
@@ -148,7 +122,7 @@ pub fn normalize_channels(input: &[String]) -> Result<Vec<String>, String> {
             || channel.len() > 25
             || !channel
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         {
             return Err(format!("invalid Twitch channel login: {raw:?}"));
         }
@@ -156,429 +130,418 @@ pub fn normalize_channels(input: &[String]) -> Result<Vec<String>, String> {
             result.push(channel);
         }
     }
-    if result.len() > 3 {
-        return Err("at most 3 distinct channels are allowed in this probe".into());
+    if result.is_empty() || result.len() > 3 {
+        return Err("between 1 and 3 distinct channels are required".into());
     }
     Ok(result)
 }
 
-pub fn find_browser(explicit: Option<&Path>) -> Result<PathBuf, BrowserProbeError> {
-    if let Some(path) = explicit {
-        let is_brave = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("brave.exe"));
-        return (path.is_file() && is_brave)
-            .then(|| path.to_path_buf())
-            .ok_or_else(|| {
-                BrowserProbeError::Launch(format!(
-                    "path is not a Brave Browser executable: {}",
-                    path.display()
-                ))
-            });
+pub fn find_node_and_helper(
+    node_override: Option<&Path>,
+    helper_override: Option<&Path>,
+) -> Result<(PathBuf, PathBuf), BrowserProbeError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        BrowserProbeError::Launch(format!("could not locate the probe executable: {error}"))
+    })?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| BrowserProbeError::Launch("probe executable has no parent folder".into()))?;
+    let bundled_node = directory.join("node.exe");
+    let node = match node_override {
+        Some(path) if path.is_file() => path.to_path_buf(),
+        Some(_) => {
+            return Err(BrowserProbeError::Launch(
+                "--node-path is not a file".into(),
+            ))
+        }
+        None if bundled_node.is_file() => bundled_node,
+        None => PathBuf::from("node"),
+    };
+    let helper = helper_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| directory.join("browser-helper").join("helper.mjs"));
+    if !helper.is_file() {
+        return Err(BrowserProbeError::Launch(format!(
+            "browser helper missing at {}; restore the complete Windows artifact",
+            helper.display()
+        )));
     }
-    let candidates = [
-        std::env::var_os("PROGRAMFILES")
-            .map(|p| PathBuf::from(p).join("BraveSoftware/Brave-Browser/Application/brave.exe")),
-        std::env::var_os("PROGRAMFILES(X86)")
-            .map(|p| PathBuf::from(p).join("BraveSoftware/Brave-Browser/Application/brave.exe")),
-        std::env::var_os("LOCALAPPDATA")
-            .map(|p| PathBuf::from(p).join("BraveSoftware/Brave-Browser/Application/brave.exe")),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|p| p.is_file())
-        .ok_or(BrowserProbeError::BrowserNotFound)
+    Ok((node, helper))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reply {
+    v: u8,
+    id: u64,
+    ok: bool,
+    ready: Option<bool>,
+    sample: Option<DomSample>,
+    error: Option<HelperFailure>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperFailure {
+    code: FailureCode,
+    reason: FailureReason,
+    phase: FailurePhase,
+    error_class: ErrorClass,
+    network_code: Option<String>,
+    page_error_class: Option<ErrorClass>,
+    page_error_count: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailurePhase {
+    Launch,
+    Navigation,
+    Panel,
+    Rows,
+}
+
+impl FailurePhase {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Launch => "launch",
+            Self::Navigation => "navigation",
+            Self::Panel => "panel",
+            Self::Rows => "rows",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+enum ErrorClass {
+    TypeError,
+    ReferenceError,
+    SyntaxError,
+    RangeError,
+    SecurityError,
+    NetworkError,
+    TimeoutError,
+    OtherError,
+}
+
+impl ErrorClass {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::TypeError => "TypeError",
+            Self::ReferenceError => "ReferenceError",
+            Self::SyntaxError => "SyntaxError",
+            Self::RangeError => "RangeError",
+            Self::SecurityError => "SecurityError",
+            Self::NetworkError => "NetworkError",
+            Self::TimeoutError => "TimeoutError",
+            Self::OtherError => "OtherError",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureCode {
+    Challenge,
+    Unavailable,
+    UiChanged,
+    Protocol,
+    BrowserLaunch,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureReason {
+    ChallengeIndicator,
+    ViewerToggleMissing,
+    ViewerToggleMissingAfterPanelDisappeared,
+    StalePanelCloseFailed,
+    PanelDisappearedAfterReopen,
+    ViewerRowsTimeout,
+    PanelInputTimeout,
+    InvalidUsername,
+    SamplePanelCloseFailed,
+    UnexpectedOrigin,
+    UnexpectedChannel,
+    BrowserOperationFailed,
+}
+
+impl FailureReason {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ChallengeIndicator => "challenge_indicator",
+            Self::ViewerToggleMissing => "viewer_toggle_missing",
+            Self::ViewerToggleMissingAfterPanelDisappeared => {
+                "viewer_toggle_missing_after_panel_disappeared"
+            }
+            Self::StalePanelCloseFailed => "stale_panel_close_failed",
+            Self::PanelDisappearedAfterReopen => "panel_disappeared_after_reopen",
+            Self::ViewerRowsTimeout => "viewer_rows_timeout",
+            Self::PanelInputTimeout => "panel_input_timeout",
+            Self::InvalidUsername => "invalid_username",
+            Self::SamplePanelCloseFailed => "sample_panel_close_failed",
+            Self::UnexpectedOrigin => "unexpected_origin",
+            Self::UnexpectedChannel => "unexpected_channel",
+            Self::BrowserOperationFailed => "browser_operation_failed",
+        }
+    }
+}
+
+fn read_bounded_line<R: Read>(reader: &mut R) -> Result<Vec<u8>, BrowserProbeError> {
+    let mut line = Vec::new();
+    let mut byte = [0];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(BrowserProbeError::Protocol(
+                    "browser helper closed its response stream".into(),
+                ))
+            }
+            Ok(_) if byte[0] == b'\n' => return Ok(line),
+            Ok(_) if line.len() >= MAX_REPLY_BYTES => {
+                return Err(BrowserProbeError::Protocol(
+                    "browser helper response exceeded 1 MiB".into(),
+                ))
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(_) => {
+                return Err(BrowserProbeError::Protocol(
+                    "could not read browser helper response".into(),
+                ))
+            }
+        }
+    }
+}
+
+fn decode_reply(line: &[u8], expected_id: u64) -> Result<Reply, BrowserProbeError> {
+    let reply: Reply = serde_json::from_slice(line).map_err(|_| {
+        BrowserProbeError::Protocol("browser helper sent invalid JSON/schema".into())
+    })?;
+    if reply.v != PROTOCOL_VERSION || reply.id != expected_id {
+        return Err(BrowserProbeError::Protocol(
+            "browser helper version or request ID mismatch".into(),
+        ));
+    }
+    if reply.ok && reply.error.is_some()
+        || !reply.ok && (reply.error.is_none() || reply.sample.is_some())
+    {
+        return Err(BrowserProbeError::Protocol(
+            "browser helper response fields were inconsistent".into(),
+        ));
+    }
+    if let Some(failure) = &reply.error {
+        if failure.page_error_count > 1000
+            || failure.network_code.as_ref().is_some_and(|code| {
+                !code.starts_with("net::ERR_")
+                    || code.len() <= 9
+                    || code.len() > 57
+                    || !code[9..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+            })
+        {
+            return Err(BrowserProbeError::Protocol(
+                "browser helper failure diagnostic was invalid".into(),
+            ));
+        }
+    }
+    Ok(reply)
+}
+
+fn classify_failure(failure: HelperFailure) -> BrowserProbeError {
+    let mut detail = format!(
+        "phase={} reason={} class={}",
+        failure.phase.label(),
+        failure.reason.label(),
+        failure.error_class.label()
+    );
+    if let Some(code) = failure.network_code {
+        detail.push_str(&format!(" network={code}"));
+    }
+    if failure.page_error_count > 0 {
+        detail.push_str(&format!(" page_errors={}", failure.page_error_count));
+        if let Some(class) = failure.page_error_class {
+            detail.push_str(&format!(" page_class={}", class.label()));
+        }
+    }
+    match failure.code {
+        FailureCode::Challenge => BrowserProbeError::Challenge,
+        FailureCode::Unavailable => BrowserProbeError::Unavailable(detail),
+        FailureCode::UiChanged => BrowserProbeError::UiChanged(detail),
+        FailureCode::Protocol => BrowserProbeError::Protocol(detail),
+        FailureCode::BrowserLaunch => BrowserProbeError::Launch(detail),
+    }
 }
 
 pub struct BrowserSession {
     child: Child,
-    profile: PathBuf,
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    stdin: ChildStdin,
+    replies: Receiver<Result<Vec<u8>, BrowserProbeError>>,
     next_id: u64,
     #[cfg(windows)]
     job: HANDLE,
 }
 
-pub struct BrowserTarget {
-    target_id: String,
-    session_id: String,
-    channel: String,
-}
-
 impl BrowserSession {
-    pub fn launch(browser: &Path, startup_timeout: Duration) -> Result<Self, BrowserProbeError> {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let profile = std::env::temp_dir().join(format!(
-            "veylurk-browser-probe-{}-{stamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&profile).map_err(|e| BrowserProbeError::Launch(e.to_string()))?;
-        let mut command = Command::new(browser);
-        command.args([
-            "--headless=new",
-            "--remote-debugging-port=0",
-            "--remote-debugging-address=127.0.0.1",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-        ]);
-        command.arg(format!("--user-data-dir={}", profile.display()));
-        command.arg("about:blank");
+    pub fn launch(
+        node: &Path,
+        helper: &Path,
+        channels: &[String],
+    ) -> Result<Self, BrowserProbeError> {
+        let mut command = Command::new(node);
         command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .arg(helper)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(parent) = helper.parent() {
+            command.current_dir(parent);
+            if std::env::var_os("PLAYWRIGHT_BROWSERS_PATH").is_none() {
+                if let Some(bundle_root) = parent.parent() {
+                    command.env("PLAYWRIGHT_BROWSERS_PATH", bundle_root.join("browsers"));
+                }
+            }
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|e| BrowserProbeError::Launch(e.to_string()))?;
+        let mut child = command.spawn().map_err(|error| {
+            BrowserProbeError::Launch(format!("could not start Node.js: {error}"))
+        })?;
+        let (stdin, stdout) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => (stdin, stdout),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BrowserProbeError::Protocol("missing helper pipe".into()));
+            }
+        };
         #[cfg(windows)]
         let job = match create_kill_on_close_job(&child) {
             Ok(job) => job,
             Err(error) => {
-                cleanup_failed_launch(&mut child, &profile);
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(error);
             }
         };
-        let deadline = Instant::now() + startup_timeout;
-        let active_port = profile.join("DevToolsActivePort");
-        let (port, path) = loop {
-            if Instant::now() >= deadline {
-                #[cfg(windows)]
-                unsafe {
-                    TerminateJobObject(job, 1);
-                    CloseHandle(job);
-                }
-                cleanup_failed_launch(&mut child, &profile);
-                return Err(BrowserProbeError::Launch(
-                    "DevTools endpoint timed out".into(),
-                ));
-            }
-            if let Ok(text) = fs::read_to_string(&active_port) {
-                let mut lines = text.lines();
-                if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
-                    break (port.to_owned(), path.to_owned());
+        let (sender, replies) = mpsc::sync_channel(2);
+        thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let line = read_bounded_line(&mut stdout);
+                let stop = line.is_err();
+                if sender.send(line).is_err() || stop {
+                    break;
                 }
             }
-            thread::sleep(Duration::from_millis(50));
-        };
-        let url = format!("ws://127.0.0.1:{port}{path}");
-        let (mut socket, _) = match connect(url.as_str()) {
-            Ok(result) => result,
-            Err(error) => {
-                #[cfg(windows)]
-                unsafe {
-                    TerminateJobObject(job, 1);
-                    CloseHandle(job);
-                }
-                cleanup_failed_launch(&mut child, &profile);
-                return Err(BrowserProbeError::Protocol(error.to_string()));
-            }
-        };
-        let timeout_result = match socket.get_mut() {
-            MaybeTlsStream::Plain(stream) => stream
-                .set_read_timeout(Some(Duration::from_secs(25)))
-                .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(25)))),
-            _ => Err(std::io::Error::other(
-                "unexpected TLS on loopback CDP socket",
-            )),
-        };
-        if let Err(error) = timeout_result {
-            #[cfg(windows)]
-            unsafe {
-                TerminateJobObject(job, 1);
-                CloseHandle(job);
-            }
-            cleanup_failed_launch(&mut child, &profile);
-            return Err(BrowserProbeError::Protocol(error.to_string()));
-        }
-        Ok(Self {
+        });
+        let mut session = Self {
             child,
-            profile,
-            socket,
+            stdin,
+            replies,
             next_id: 1,
             #[cfg(windows)]
             job,
-        })
-    }
-
-    fn command(&mut self, method: &str, params: Value) -> Result<Value, BrowserProbeError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let payload = json!({"id": id, "method": method, "params": params});
-        self.socket
-            .send(Message::Text(payload.to_string().into()))
-            .map_err(|e| BrowserProbeError::Protocol(e.to_string()))?;
-        loop {
-            let message = self
-                .socket
-                .read()
-                .map_err(|e| BrowserProbeError::Protocol(e.to_string()))?;
-            if message.len() > MAX_CDP_MESSAGE_BYTES {
-                return Err(BrowserProbeError::Protocol(
-                    "CDP message exceeded 4 MiB".into(),
-                ));
-            }
-            if let Message::Text(text) = message {
-                let value: Value = serde_json::from_str(&text)
-                    .map_err(|e| BrowserProbeError::Protocol(e.to_string()))?;
-                if value.get("id").and_then(Value::as_u64) == Some(id) {
-                    if let Some(error) = value.get("error") {
-                        return Err(BrowserProbeError::Protocol(error.to_string()));
-                    }
-                    return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-                }
-            }
-        }
-    }
-
-    fn evaluate(
-        &mut self,
-        session_id: &str,
-        expression: &str,
-        await_promise: bool,
-    ) -> Result<Value, BrowserProbeError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({"id": id, "sessionId": session_id, "method":"Runtime.evaluate", "params": {"expression": expression, "awaitPromise": await_promise, "returnByValue": true}});
-        self.socket
-            .send(Message::Text(request.to_string().into()))
-            .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
-        loop {
-            let message = self
-                .socket
-                .read()
-                .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
-            if message.len() > MAX_CDP_MESSAGE_BYTES {
-                return Err(BrowserProbeError::Protocol(
-                    "CDP message exceeded 4 MiB".into(),
-                ));
-            }
-            if let Message::Text(text) = message {
-                let response: Value = serde_json::from_str(&text)
-                    .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
-                if response.get("id").and_then(Value::as_u64) != Some(id) {
-                    continue;
-                }
-                if let Some(error) = response.get("error") {
-                    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-                    let message = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown CDP error");
-                    return Err(BrowserProbeError::Protocol(format!(
-                        "Runtime.evaluate error {code}: {message}"
-                    )));
-                }
-                if let Some(exception) = response.pointer("/result/exceptionDetails") {
-                    return Err(BrowserProbeError::UiChanged(bounded_exception_diagnostic(
-                        exception,
-                    )));
-                }
-                return response
-                    .pointer("/result/result/value")
-                    .cloned()
-                    .ok_or_else(|| {
-                        BrowserProbeError::Protocol("evaluation returned no value".into())
-                    });
-            }
-        }
-    }
-
-    fn wait_until_channel_ready(
-        &mut self,
-        session_id: &str,
-        channel: &str,
-    ) -> Result<(), BrowserProbeError> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let expected_path = format!("/popout/{channel}/chat");
-        let mut last_transient = None;
-        while Instant::now() < deadline {
-            let state = self.evaluate(
-                session_id,
-                "({origin:location.origin,path:location.pathname.toLowerCase(),ready:document.readyState})",
-                false,
-            );
-            match state {
-                Ok(value) if page_state_is_ready(&value, &expected_path) => {
-                    return Ok(());
-                }
-                Ok(_) => last_transient = Some("page identity or ready state did not match".into()),
-                Err(BrowserProbeError::Protocol(message))
-                    if is_transient_navigation_error(&message) =>
-                {
-                    last_transient = Some(message)
-                }
-                Err(error) => return Err(error),
-            }
-            thread::sleep(Duration::from_millis(200));
-        }
-        Err(BrowserProbeError::UiChanged(format!(
-            "channel page did not become ready at {expected_path:?}: {}",
-            last_transient.unwrap_or_else(|| "no page state received".into())
-        )))
-    }
-
-    pub fn open_channel(&mut self, channel: &str) -> Result<BrowserTarget, BrowserProbeError> {
-        let url = format!("https://www.twitch.tv/popout/{channel}/chat?popout=");
-        let created = self.command("Target.createTarget", json!({"url": url}))?;
-        let target_id = created
-            .get("targetId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BrowserProbeError::Protocol("missing targetId".into()))?
-            .to_owned();
-        let attached = self.command(
-            "Target.attachToTarget",
-            json!({"targetId": &target_id, "flatten": true}),
+        };
+        let ready = session.exchange(
+            "init",
+            json!({"channels": channels}),
+            Duration::from_secs(65),
         )?;
-        let session_id = attached
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| BrowserProbeError::Protocol("missing sessionId".into()))?
-            .to_owned();
-        if let Err(error) = self.wait_until_channel_ready(&session_id, channel) {
-            let _ = self.command("Target.closeTarget", json!({"targetId": &target_id}));
-            return Err(error);
+        if !ready.ok {
+            return Err(classify_failure(
+                ready.error.expect("checked response shape"),
+            ));
         }
-        Ok(BrowserTarget {
-            target_id,
-            session_id,
-            channel: channel.to_owned(),
-        })
+        if ready.ready != Some(true) || ready.sample.is_some() {
+            return Err(BrowserProbeError::Protocol(
+                "invalid helper init response".into(),
+            ));
+        }
+        Ok(session)
     }
 
-    pub fn collect(&mut self, target: &BrowserTarget) -> Result<DomSample, BrowserProbeError> {
-        let channel = &target.channel;
-        let expression = dom_adapter_script(channel);
-        let result = self.evaluate(&target.session_id, &expression, true)?;
-        let sample: DomSample = serde_json::from_value(result)
-            .map_err(|e| BrowserProbeError::UiChanged(e.to_string()))?;
-        sample.validate(channel)
-    }
-
-    pub fn capture_failure_screenshot(
+    fn exchange(
         &mut self,
-        target: &BrowserTarget,
-        path: &Path,
-    ) -> Result<(), BrowserProbeError> {
+        operation: &str,
+        fields: Value,
+        timeout: Duration,
+    ) -> Result<Reply, BrowserProbeError> {
         let id = self.next_id;
         self.next_id += 1;
-        let request = json!({
-            "id": id,
-            "sessionId": &target.session_id,
-            "method": "Page.captureScreenshot",
-            "params": {
-                "format": "png",
-                "fromSurface": true,
-                "captureBeyondViewport": false
-            }
-        });
-        self.socket
-            .send(Message::Text(request.to_string().into()))
-            .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
-        let encoded = loop {
-            let message = self
-                .socket
-                .read()
-                .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
-            if message.len() > MAX_SCREENSHOT_CDP_MESSAGE_BYTES {
+        let mut request = json!({"v": PROTOCOL_VERSION, "id": id, "op": operation});
+        if let (Some(object), Some(extra)) = (request.as_object_mut(), fields.as_object()) {
+            object.extend(extra.clone());
+        }
+        let mut encoded = serde_json::to_vec(&request).expect("protocol request serializes");
+        if encoded.len() > MAX_REQUEST_BYTES {
+            return Err(BrowserProbeError::Protocol(
+                "browser helper request exceeded 64 KiB".into(),
+            ));
+        }
+        encoded.push(b'\n');
+        self.stdin
+            .write_all(&encoded)
+            .and_then(|_| self.stdin.flush())
+            .map_err(|_| {
+                BrowserProbeError::Protocol("could not write browser helper request".into())
+            })?;
+        let line = match self.replies.recv_timeout(timeout) {
+            Ok(result) => result?,
+            Err(RecvTimeoutError::Timeout) => {
                 return Err(BrowserProbeError::Protocol(
-                    "CDP screenshot response exceeded 12 MiB".into(),
-                ));
+                    "browser helper response timed out".into(),
+                ))
             }
-            if let Message::Text(text) = message {
-                let response: Value = serde_json::from_str(&text)
-                    .map_err(|error| BrowserProbeError::Protocol(error.to_string()))?;
-                if response.get("id").and_then(Value::as_u64) != Some(id) {
-                    continue;
-                }
-                if let Some(error) = response.get("error") {
-                    return Err(BrowserProbeError::Protocol(error.to_string()));
-                }
-                break response
-                    .pointer("/result/data")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        BrowserProbeError::Protocol("screenshot response omitted PNG data".into())
-                    })?
-                    .to_owned();
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(BrowserProbeError::Protocol(
+                    "browser helper stopped responding".into(),
+                ))
             }
         };
-        let maximum_encoded_len = MAX_FAILURE_SCREENSHOT_BYTES.div_ceil(3) * 4;
-        if encoded.len() > maximum_encoded_len {
-            return Err(BrowserProbeError::Protocol(
-                "decoded screenshot would exceed 8 MiB".into(),
-            ));
-        }
-        let png = BASE64_STANDARD.decode(encoded).map_err(|_| {
-            BrowserProbeError::Protocol("screenshot data was not valid base64".into())
-        })?;
-        if png.len() > MAX_FAILURE_SCREENSHOT_BYTES || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err(BrowserProbeError::Protocol(
-                "screenshot was not a bounded PNG".into(),
-            ));
-        }
-        fs::write(path, png).map_err(|error| {
-            BrowserProbeError::Protocol(format!("could not write failure screenshot: {error}"))
-        })
+        decode_reply(&line, id)
     }
 
-    pub fn close_channel(&mut self, target: BrowserTarget) {
-        let _ = self.command("Target.closeTarget", json!({"targetId": target.target_id}));
+    pub fn collect(
+        &mut self,
+        channel: &str,
+        failure_screenshot: Option<&Path>,
+    ) -> Result<DomSample, BrowserProbeError> {
+        let reply = self.exchange(
+            "collect",
+            json!({"channel": channel, "failure_screenshot": failure_screenshot}),
+            Duration::from_secs(25),
+        )?;
+        if !reply.ok {
+            return Err(classify_failure(
+                reply.error.expect("checked response shape"),
+            ));
+        }
+        if reply.ready.is_some() {
+            return Err(BrowserProbeError::Protocol(
+                "invalid helper collect response".into(),
+            ));
+        }
+        reply
+            .sample
+            .ok_or_else(|| {
+                BrowserProbeError::Protocol("helper omitted a successful sample".into())
+            })?
+            .validate(channel)
     }
-}
 
-fn page_state_is_ready(value: &Value, expected_path: &str) -> bool {
-    value.get("origin").and_then(Value::as_str) == Some("https://www.twitch.tv")
-        && value.get("path").and_then(Value::as_str) == Some(expected_path)
-        && matches!(
-            value.get("ready").and_then(Value::as_str),
-            Some("interactive" | "complete")
-        )
-}
-
-fn is_transient_navigation_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("execution context")
-        || message.contains("cannot find context")
-        || message.contains("target navigated")
-        || message.contains("evaluation returned no value")
-}
-
-fn bounded_exception_diagnostic(exception: &Value) -> String {
-    let class_name = exception
-        .pointer("/exception/className")
-        .and_then(Value::as_str)
-        .filter(|value| {
-            matches!(
-                *value,
-                "Error"
-                    | "TypeError"
-                    | "RangeError"
-                    | "ReferenceError"
-                    | "SyntaxError"
-                    | "DOMException"
-            )
-        })
-        .unwrap_or("JavaScriptError");
-    let line = exception.get("lineNumber").and_then(Value::as_u64);
-    let column = exception.get("columnNumber").and_then(Value::as_u64);
-    match (line, column) {
-        (Some(line), Some(column)) => format!(
-            "{class_name} at adapter line {} column {}",
-            line + 1,
-            column + 1
-        ),
-        _ => class_name.to_owned(),
+    pub fn shutdown(&mut self) {
+        let _ = self.exchange("shutdown", json!({}), Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -591,23 +554,6 @@ impl Drop for BrowserSession {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        for _ in 0..10 {
-            if fs::remove_dir_all(&self.profile).is_ok() || !self.profile.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-fn cleanup_failed_launch(child: &mut Child, profile: &Path) {
-    let _ = child.kill();
-    let _ = child.wait();
-    for _ in 0..10 {
-        if fs::remove_dir_all(profile).is_ok() || !profile.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -634,151 +580,18 @@ fn create_kill_on_close_job(child: &Child) -> Result<HANDLE, BrowserProbeError> 
         {
             CloseHandle(job);
             return Err(BrowserProbeError::Launch(
-                "could not contain browser process tree in a Windows job".into(),
+                "could not contain browser helper process tree".into(),
             ));
         }
         Ok(job)
     }
 }
 
-fn dom_adapter_script(channel: &str) -> String {
-    let channel = serde_json::to_string(channel).expect("channel serializes");
-    format!(
-        r#"(async () => {{
-      const expected = {channel};
-      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-      const deadline = Date.now() + 20000;
-      const viewerInput = () => document.querySelector('input[aria-label="Search Chat Viewers"]');
-      const rowSelector = 'button[data-test-selector="chat-viewers-list__button"][data-username]';
-      const challengePresent = () => /access denied|verify you are human|unusual traffic/i.test(document.title)
-        || Boolean(document.querySelector('iframe[src*="captcha" i], iframe[src*="challenge" i], [data-a-target*="captcha" i], form[action*="challenge" i]'));
-      const exactText = element => String(element?.textContent || '').replace(/\s+/g, ' ').trim();
-      const cookieConsent = () => {{
-        const title = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,[role="heading"]')]
-          .find(element => exactText(element) === 'Cookies and Advertising Choices');
-        if (!title) return null;
-        let scope = title.parentElement;
-        for (let depth = 0; scope && scope !== document.body && depth < 6; depth += 1, scope = scope.parentElement) {{
-          const buttons = [...scope.querySelectorAll('button')];
-          const accept = buttons.find(button => exactText(button) === 'Accept');
-          const customize = buttons.find(button => exactText(button) === 'Customize');
-          const reject = buttons.find(button => exactText(button) === 'Reject');
-          if (accept && customize && reject) return {{ reject }};
-        }}
-        return null;
-      }};
-      let cookieConsentRejected = false;
-      const diagnosticResult = (status, reason, usernames = [], extra = {{}}) => ({{
-        channel:(location.pathname.match(/^\/popout\/([^/]+)\/chat/i) || [,''])[1].toLowerCase(),
-        origin:location.origin,
-        status,
-        reason,
-        usernames,
-        role_lists:document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length,
-        scroll_rounds:0,
-        reached_end:false,
-        ready_state:document.readyState,
-        document_lang:String(document.documentElement?.lang || '').slice(0, 24),
-        known_error_title_present:/access denied|verify you are human|unusual traffic/i.test(document.title),
-        viewer_toggle_present:Boolean(document.querySelector('button[data-test-selector="chat-viewer-list"]')),
-        viewer_input_present:Boolean(viewerInput()),
-        rendered_row_count:document.querySelectorAll(rowSelector).length,
-        login_prompt_present:Boolean(document.querySelector('button[data-a-target="login-button"], a[data-a-target="login-button"]')),
-        ...extra,
-      }});
-      const closeViewerPanel = async () => {{
-        const input = viewerInput();
-        if (!input) return true;
-        const close = input.closest('.chat-viewers__pane')?.querySelector('button[aria-label="Close"][data-a-target="chat-viewer-list"]');
-        const back = [...document.querySelectorAll('button')].find(el => /^go back to chat$/i.test(el.getAttribute('aria-label') || el.textContent.trim()));
-        if (close) close.click(); else if (back) back.click(); else document.querySelector('button[data-test-selector="chat-viewer-list"]')?.click();
-        const closeDeadline = Date.now() + 2000;
-        while (viewerInput() && Date.now() < closeDeadline) await sleep(50);
-        return !viewerInput();
-      }};
-      while (document.readyState !== 'complete' && Date.now() < deadline) await sleep(100);
-      while (Date.now() < deadline) {{
-        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
-        const consent = cookieConsent();
-        if (!consent) break;
-        if (consent && !cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
-        await sleep(100);
-      }}
-      if (!await closeViewerPanel()) return diagnosticResult('ui_changed', 'stale_panel_close_failed');
-      while (Date.now() < deadline) {{
-        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
-        const consent = cookieConsent();
-        if (consent) {{
-          if (!cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
-          await sleep(100); continue;
-        }}
-        const button = document.querySelector('button[data-test-selector="chat-viewer-list"]');
-        if (button) {{ button.click(); break; }}
-        await sleep(200);
-      }}
-      let input = null;
-      while (Date.now() < deadline) {{
-        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
-        const consent = cookieConsent();
-        if (consent) {{
-          if (!cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
-          await sleep(100); continue;
-        }}
-        input = viewerInput();
-        if (input) break;
-        await sleep(150);
-      }}
-      if (!input) return diagnosticResult('unavailable', document.querySelector('button[data-test-selector="chat-viewer-list"]') ? 'panel_input_timeout' : 'viewer_toggle_missing');
-      let panelReopens = 0;
-      let reopenedInputObserved = false;
-      while (Date.now() < deadline) {{
-        if (challengePresent()) return diagnosticResult('challenge', 'challenge_indicator');
-        const consent = cookieConsent();
-        if (consent) {{
-          if (!cookieConsentRejected) {{ consent.reject.click(); cookieConsentRejected = true; }}
-          await sleep(100); continue;
-        }}
-        if (document.querySelector(rowSelector)) break;
-        const inputVisible = Boolean(viewerInput());
-        if (!inputVisible && panelReopens === 0) {{
-          const button = document.querySelector('button[data-test-selector="chat-viewer-list"]');
-          if (!button) return diagnosticResult('unavailable', 'viewer_toggle_missing_after_panel_disappeared');
-          button.click(); panelReopens += 1;
-        }} else if (inputVisible && panelReopens === 1) {{
-          reopenedInputObserved = true;
-        }} else if (!inputVisible && reopenedInputObserved) {{
-          return diagnosticResult('unavailable', 'panel_disappeared_after_reopen');
-        }}
-        await sleep(150);
-      }}
-      if (!document.querySelector(rowSelector)) return diagnosticResult('unavailable', 'viewer_rows_timeout');
-      const found = new Set(); let rounds = 0; let unchanged = 0; let reachedEnd = false;
-      while (rounds < 40 && unchanged < 3 && Date.now() < deadline) {{
-        const before = found.size;
-        document.querySelectorAll(rowSelector).forEach(el => found.add(el.dataset.username));
-        const lists = [...document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]')];
-        const scrollables = [...new Set(lists.map(list => (() => {{ let n=list; while(n && n !== document.body) {{ if(n.scrollHeight > n.clientHeight + 2) return n; n=n.parentElement; }} return list; }})()))];
-        for (const scroller of scrollables) {{
-          const prior = scroller.scrollTop; scroller.scrollTop = Math.min(scroller.scrollTop + Math.max(scroller.clientHeight * .8, 300), scroller.scrollHeight);
-        }}
-        reachedEnd = scrollables.length > 0 && scrollables.every(scroller => scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2);
-        unchanged = found.size === before ? unchanged + 1 : 0; rounds += 1; await sleep(100);
-      }}
-      document.querySelectorAll(rowSelector).forEach(el => found.add(el.dataset.username));
-      const validLocation = location.protocol === 'https:' && location.hostname === 'www.twitch.tv';
-      const actual = (location.pathname.match(/^\/popout\/([^/]+)\/chat/i) || [,''])[1].toLowerCase();
-      if (!validLocation) return diagnosticResult('wrong_origin', 'unexpected_origin', [], {{scroll_rounds:rounds}});
-      const roleLists = document.querySelectorAll('[aria-labelledby^="chat-viewers-list-header-"]').length;
-      const renderedRows = document.querySelectorAll(rowSelector).length;
-      if (!await closeViewerPanel()) return diagnosticResult('ui_changed', 'sample_panel_close_failed', [], {{role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd, rendered_row_count:renderedRows}});
-      return diagnosticResult('ok', 'sample_complete', [...found], {{role_lists:roleLists, scroll_rounds:rounds, reached_end:reachedEnd, rendered_row_count:renderedRows}});
-    }})()"#
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
     #[test]
     fn channels_are_validated_deduplicated_and_bounded() {
         assert_eq!(
@@ -786,234 +599,85 @@ mod tests {
             ["ouaiseddy", "dofla"]
         );
         assert!(normalize_channels(&["bad/name".into()]).is_err());
+        assert!(normalize_channels(&[]).is_err());
         assert!(normalize_channels(&["a".into(), "b".into(), "c".into(), "d".into()]).is_err());
     }
+
     #[test]
-    fn sample_validation_deduplicates_and_scopes() {
-        let sample = DomSample {
-            channel: "Test".into(),
-            origin: "https://www.twitch.tv".into(),
-            status: "ok".into(),
-            reason: "sample_complete".into(),
-            usernames: vec!["Alice".into(), "alice".into(), "Bob_2".into()],
-            role_lists: 1,
-            scroll_rounds: 2,
-            reached_end: true,
-            ready_state: "complete".into(),
-            document_lang: "en".into(),
-            known_error_title_present: false,
-            viewer_toggle_present: true,
-            viewer_input_present: false,
-            rendered_row_count: 3,
-            login_prompt_present: false,
-        }
-        .validate("test")
-        .unwrap();
-        assert_eq!(sample.usernames, ["alice", "bob_2"]);
+    fn protocol_rejects_wrong_id_unknown_failure_and_oversized_line() {
+        let wrong_id = br#"{"v":1,"id":2,"ok":true,"ready":true}"#;
         assert!(matches!(
-            DomSample {
-                channel: "other".into(),
-                origin: "https://www.twitch.tv".into(),
-                status: "ok".into(),
-                reason: "sample_complete".into(),
-                usernames: vec!["a".into()],
-                role_lists: 1,
-                scroll_rounds: 1,
-                reached_end: true,
-                ready_state: "complete".into(),
-                document_lang: "en".into(),
-                known_error_title_present: false,
-                viewer_toggle_present: true,
-                viewer_input_present: false,
-                rendered_row_count: 1,
-                login_prompt_present: false,
-            }
-            .validate("test"),
+            decode_reply(wrong_id, 1),
+            Err(BrowserProbeError::Protocol(_))
+        ));
+        let unknown_failure = br#"{"v":1,"id":1,"ok":false,"error":{"code":"unknown","reason":"browser_operation_failed","phase":"panel","error_class":"OtherError","network_code":null,"page_error_class":null,"page_error_count":0}}"#;
+        assert!(matches!(
+            decode_reply(unknown_failure, 1),
+            Err(BrowserProbeError::Protocol(_))
+        ));
+        let unsafe_code = br#"{"v":1,"id":1,"ok":false,"error":{"code":"ui_changed","reason":"browser_operation_failed","phase":"navigation","error_class":"OtherError","network_code":"net::ERR_FAILED user data","page_error_class":null,"page_error_count":0}}"#;
+        assert!(matches!(
+            decode_reply(unsafe_code, 1),
+            Err(BrowserProbeError::Protocol(_))
+        ));
+        let safe_code = br#"{"v":1,"id":1,"ok":false,"error":{"code":"browser_launch","reason":"browser_operation_failed","phase":"navigation","error_class":"OtherError","network_code":"net::ERR_BLOCKED_BY_CLIENT","page_error_class":null,"page_error_count":0}}"#;
+        let error = classify_failure(decode_reply(safe_code, 1).unwrap().error.unwrap());
+        assert!(error.to_string().contains("phase=navigation"));
+        assert!(error.to_string().contains("net::ERR_BLOCKED_BY_CLIENT"));
+        let mut oversized = Cursor::new(vec![b'x'; MAX_REPLY_BYTES + 2]);
+        assert!(matches!(
+            read_bounded_line(&mut oversized),
+            Err(BrowserProbeError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn sample_requires_exact_identity_and_rendered_evidence() {
+        let sample = json!({
+            "channel":"test", "origin":"https://www.twitch.tv", "status":"ok", "reason":"sample_complete",
+            "usernames":["Alice", "alice", "Bob_2"], "role_lists":1, "scroll_rounds":2,
+            "reached_end":true, "ready_state":"complete", "document_lang":"en-US",
+            "known_error_title_present":false, "viewer_toggle_present":true,
+            "viewer_input_present":false, "rendered_row_count":3, "login_prompt_present":false
+        });
+        let validated = serde_json::from_value::<DomSample>(sample.clone())
+            .unwrap()
+            .validate("test")
+            .unwrap();
+        assert_eq!(validated.usernames, ["alice", "bob_2"]);
+        assert!(matches!(
+            serde_json::from_value::<DomSample>(sample.clone())
+                .unwrap()
+                .validate("other"),
             Err(BrowserProbeError::ChannelMismatch { .. })
         ));
-    }
-    #[test]
-    fn explicit_challenge_and_empty_panel_are_not_success() {
-        let challenge = DomSample {
-            channel: "x".into(),
-            origin: "https://www.twitch.tv".into(),
-            status: "challenge".into(),
-            reason: "challenge_indicator".into(),
-            usernames: vec![],
-            role_lists: 0,
-            scroll_rounds: 0,
-            reached_end: false,
-            ready_state: "complete".into(),
-            document_lang: "en".into(),
-            known_error_title_present: true,
-            viewer_toggle_present: false,
-            viewer_input_present: false,
-            rendered_row_count: 0,
-            login_prompt_present: false,
-        };
+        let mut wrong_origin = sample;
+        wrong_origin["origin"] = json!("https://example.com");
         assert!(matches!(
-            challenge.validate("x"),
-            Err(BrowserProbeError::Challenge)
-        ));
-        let empty = DomSample {
-            channel: "x".into(),
-            origin: "https://www.twitch.tv".into(),
-            status: "ok".into(),
-            reason: "sample_complete".into(),
-            usernames: vec![],
-            role_lists: 1,
-            scroll_rounds: 3,
-            reached_end: true,
-            ready_state: "complete".into(),
-            document_lang: "en".into(),
-            known_error_title_present: false,
-            viewer_toggle_present: true,
-            viewer_input_present: false,
-            rendered_row_count: 0,
-            login_prompt_present: false,
-        };
-        assert!(matches!(
-            empty.validate("x"),
-            Err(BrowserProbeError::Unavailable(_))
-        ));
-    }
-
-    #[test]
-    fn wrong_origin_and_missing_evidence_fields_fail_closed() {
-        let wrong_origin = DomSample {
-            channel: "x".into(),
-            origin: "https://example.com".into(),
-            status: "ok".into(),
-            reason: "sample_complete".into(),
-            usernames: vec!["alice".into()],
-            role_lists: 1,
-            scroll_rounds: 1,
-            reached_end: true,
-            ready_state: "complete".into(),
-            document_lang: "en".into(),
-            known_error_title_present: false,
-            viewer_toggle_present: true,
-            viewer_input_present: false,
-            rendered_row_count: 1,
-            login_prompt_present: false,
-        };
-        assert!(matches!(
-            wrong_origin.validate("x"),
+            serde_json::from_value::<DomSample>(wrong_origin)
+                .unwrap()
+                .validate("test"),
             Err(BrowserProbeError::UiChanged(_))
         ));
-        let incomplete = r#"{"channel":"x","origin":"https://www.twitch.tv","status":"ok","usernames":["alice"]}"#;
-        assert!(serde_json::from_str::<DomSample>(incomplete).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn page_readiness_requires_exact_twitch_identity() {
-        let ready =
-            json!({"origin":"https://www.twitch.tv","path":"/popout/test/chat","ready":"complete"});
-        assert!(page_state_is_ready(&ready, "/popout/test/chat"));
-        assert!(!page_state_is_ready(
-            &json!({"origin":"https://example.com","path":"/popout/test/chat","ready":"complete"}),
-            "/popout/test/chat"
-        ));
-        assert!(!page_state_is_ready(&ready, "/popout/other/chat"));
-        assert!(is_transient_navigation_error(
-            "Execution context was destroyed"
-        ));
-        assert!(!is_transient_navigation_error("permission denied"));
-    }
-
-    #[test]
-    fn exception_diagnostic_is_bounded_and_omits_page_text() {
-        let exception = json!({
-            "text": "Uncaught",
-            "lineNumber": 41,
-            "columnNumber": 7,
-            "exception": {
-                "className": "TypeError",
-                "description": "TypeError: secret-user secret chat body token"
-            }
-        });
+    fn node_helper_handshake_and_repeated_samples_use_bounded_protocol() {
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("browser-helper")
+            .join("fixtures")
+            .join("protocol-stub.mjs");
+        let mut session = BrowserSession::launch(Path::new("node"), &helper, &["test".into()])
+            .expect("Node.js is required for the Stage 3 protocol test");
         assert_eq!(
-            bounded_exception_diagnostic(&exception),
-            "TypeError at adapter line 42 column 8"
+            session.collect("test", None).unwrap().usernames,
+            ["alice_1"]
         );
-    }
-
-    #[test]
-    fn generated_dom_adapter_rejects_delayed_consent_and_recovers_panel() {
-        let node_version = Command::new("node")
-            .arg("--version")
-            .output()
-            .expect("Node.js is required to test the generated DOM adapter");
-        assert!(node_version.status.success(), "Node.js did not start");
-        let node = "node";
-        let expression = dom_adapter_script("test_channel");
-        let expression_json = serde_json::to_string(&expression).unwrap();
-        let fixture = format!(
-            r#"
-let panelOpen = false;
-let rowsReady = false;
-let panelOpens = 0;
-let consentVisible = false;
-let rejectClicks = 0;
-const close = {{ click() {{ panelOpen = false; }} }};
-const pane = {{ querySelector() {{ return close; }} }};
-const input = {{ closest() {{ return pane; }} }};
-const toggle = {{
-  click() {{
-    panelOpens += 1;
-    if (panelOpens === 1) {{
-      panelOpen = true;
-      setTimeout(() => {{ consentVisible = true; panelOpen = false; }}, 25);
-    }} else {{
-      setTimeout(() => {{ panelOpen = true; }}, 250);
-      setTimeout(() => {{ rowsReady = true; }}, 450);
-    }}
-  }},
-  getAttribute(name) {{ return name === 'aria-label' ? 'Viewers' : null; }},
-  textContent: 'Viewers'
-}};
-const accept = {{ textContent: 'Accept' }};
-const customize = {{ textContent: 'Customize' }};
-const reject = {{ textContent: 'Reject', click() {{ rejectClicks += 1; consentVisible = false; }} }};
-const consentScope = {{ parentElement: null, querySelectorAll(selector) {{ return selector === 'button' ? [accept, customize, reject] : []; }} }};
-const consentTitle = {{ tagName: 'P', textContent: 'Cookies and Advertising Choices', parentElement: consentScope }};
-const row = {{ dataset: {{ username: 'Alice_1' }} }};
-const roleList = {{ scrollHeight: 100, clientHeight: 100, scrollTop: 0, parentElement: null }};
-global.location = {{ origin: 'https://www.twitch.tv', protocol: 'https:', hostname: 'www.twitch.tv', pathname: '/popout/test_channel/chat' }};
-global.document = {{
-  readyState: 'complete', title: '', documentElement: {{ lang: 'en-US' }}, body: {{}},
-  querySelector(selector) {{
-    if (selector === 'input[aria-label="Search Chat Viewers"]') return panelOpen ? input : null;
-    if (selector === 'button[data-test-selector="chat-viewer-list"]') return toggle;
-    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen && rowsReady ? row : null;
-    return null;
-  }},
-  querySelectorAll(selector) {{
-    if (selector === 'h1,h2,h3,h4,h5,h6,p,span,div,[role="heading"]') return consentVisible ? [consentTitle] : [];
-    if (selector === 'button') return [toggle];
-    if (selector === '[aria-labelledby^="chat-viewers-list-header-"]') return panelOpen ? [roleList] : [];
-    if (selector === 'button[data-test-selector="chat-viewers-list__button"][data-username]') return panelOpen && rowsReady ? [row] : [];
-    return [];
-  }}
-}};
-roleList.parentElement = document.body;
-consentScope.parentElement = document.body;
-Promise.resolve(eval({expression_json})).then(value => process.stdout.write(JSON.stringify({{ value, panelOpens, rejectClicks }}))).catch(error => {{ console.error(error); process.exit(1); }});
-"#
+        assert_eq!(
+            session.collect("test", None).unwrap().usernames,
+            ["alice_1"]
         );
-        let output = Command::new(node).arg("-e").arg(fixture).output().unwrap();
-        assert!(
-            output.status.success(),
-            "generated adapter failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(result.get("panelOpens").and_then(Value::as_u64), Some(2));
-        assert_eq!(result.get("rejectClicks").and_then(Value::as_u64), Some(1));
-        let sample: DomSample = serde_json::from_value(result["value"].clone()).unwrap();
-        let sample = sample.validate("test_channel").unwrap();
-        assert_eq!(sample.usernames, ["alice_1"]);
-        assert_eq!(sample.reason, "sample_complete");
-        assert_eq!(sample.rendered_row_count, 1);
+        session.shutdown();
     }
 }
