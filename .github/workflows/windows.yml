@@ -25,6 +25,9 @@ jobs:
           node-version: '24.13.1'
       - name: Test embedded UI behavior without a browser
         run: node --test web/app.test.cjs
+      - name: Test Windows PowerShell launcher without Twitch
+        shell: powershell
+        run: .\scripts\Test-VeylurkLauncher.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -89,6 +92,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path app-package -ErrorAction Stop | Out-Null
           Copy-Item -LiteralPath target/release/veylurk.exe, README.md, LICENSE -Destination app-package -ErrorAction Stop
+          Copy-Item -LiteralPath scripts/Start-Veylurk.ps1, scripts/Setup-Twitch.ps1, scripts/Veylurk-Launcher.ps1 -Destination app-package -ErrorAction Stop
       - name: Publish standalone Windows application artifact
         uses: actions/upload-artifact@v4
         with:

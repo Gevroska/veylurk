@@ -6,13 +6,15 @@ The application runs continuously while its process is open. Collection needs no
 
 ## Run the application
 
-Download the `veylurk-windows-x64` artifact from a successful Windows workflow run and extract `veylurk.exe`. It contains the interface and needs no Node.js or browser runtime for collection.
+Download the `veylurk-windows-x64` artifact from a successful Windows workflow run and extract it into a stable folder. Keep the launcher scripts beside `veylurk.exe`. It contains the interface and needs no Node.js or browser runtime for collection.
 
 ```powershell
-.\veylurk.exe --database .\veylurk-data\observations.sqlite3 --port 8794 --channel examplechannel
+powershell.exe -NoProfile -File .\Start-Veylurk.ps1
 ```
 
-Open `http://127.0.0.1:8794`. Add channels in the interface, pause or resume collection for a channel, and search exact Twitch account or channel logins. Up to 50 channels can be tracked. Repeat `--channel` to seed several channels; otherwise saved configuration is reused. Choose a stable database location: a relative path is resolved from the directory in which you start the application. Press Ctrl+C to stop gracefully. For a bounded acceptance run, `--run-for-seconds` accepts 1–3600 seconds and requests the same graceful shutdown; omit it for continuous operation.
+Open `http://127.0.0.1:8794`. The launcher uses `data\observations.sqlite3` beside the executable, regardless of the current directory, and reuses saved channel configuration without seeding channels. Keep this console open; press Ctrl+C to stop gracefully. It reports an occupied port without stopping another process. Both launchers accept `-Port` for an alternative local port.
+
+Add channels in the interface, pause or resume collection for a channel, and search exact Twitch account or channel logins. Up to 50 channels can be tracked. For direct executable use, `--database` selects a database, repeatable `--channel` seeds channels, and optional `--run-for-seconds` accepts 1–3600 seconds before graceful shutdown. A direct executable launch without `--database` uses `veylurk-data/observations.sqlite3` relative to its working directory; use the launcher to keep the package's stable data location.
 
 The HTTP listener binds only to `127.0.0.1`. Changes require requests from the local application's own origin. There is no remote-access mode, account system, or CSV export. The browser receives embedded local assets without third-party scripts or a CDN.
 
@@ -38,22 +40,15 @@ Chat history works without Twitch application credentials. Live status and broad
 
 To enable this feature, register your own confidential application in the [Twitch developer console](https://dev.twitch.tv/docs/authentication/register-app/) and supply that application's client ID and secret to the Veylurk process. Twitch's registration requirements include a verified account and two-factor authentication. Veylurk does not register an application for you, include a shared client secret, or use credentials from Twitch's website.
 
-The current setup uses process environment variables; there is no credentials form or persistent secret vault. For an interactive PowerShell launch, enter the secret at a masked prompt rather than including it literally in command history:
+If you already have your own Twitch application, use its existing client ID and secret. Open the local setup window:
 
 ```powershell
-$env:VEYLURK_TWITCH_CLIENT_ID = Read-Host 'Your Twitch application client ID'
-$veylurkSecret = Read-Host 'Your Twitch application client secret' -AsSecureString
-$env:VEYLURK_TWITCH_CLIENT_SECRET = [System.Net.NetworkCredential]::new('', $veylurkSecret).Password
-try {
-    .\veylurk.exe --database .\veylurk-data\observations.sqlite3 --port 8794
-} finally {
-    Remove-Item Env:\VEYLURK_TWITCH_CLIENT_SECRET -ErrorAction SilentlyContinue
-    Remove-Item Env:\VEYLURK_TWITCH_CLIENT_ID -ErrorAction SilentlyContinue
-    $veylurkSecret = $null
-}
+powershell.exe -NoProfile -STA -File .\Setup-Twitch.ps1
 ```
 
-The account that launches Veylurk must have the variables in its own process environment. Do not place secrets in the repository, screenshots, logs, or support messages. Client secrets and access tokens are kept in process memory and are not saved in the history database or returned to the interface.
+The secret field is masked. **Remember** is unchecked by default: entered credentials are used only for that launch. Existing remembered credentials remain unchanged when unchecked; checking it replaces them. Remembering writes `data\twitch-credentials.dpapi`, encrypted using [Windows DPAPI for the current user](https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.protecteddata.protect). Deleting that specific file forgets saved credentials without deleting history.
+
+`Start-Veylurk.ps1` uses a complete inherited `VEYLURK_TWITCH_CLIENT_ID` / `VEYLURK_TWITCH_CLIENT_SECRET` pair if present, otherwise remembered credentials, otherwise chat-only collection. An incomplete inherited pair or unreadable saved file produces an error. The scripts set credentials only in the child application's environment, never global or user environment settings, command arguments, console output, or the SQLite history. They do not change or bypass PowerShell execution policy. Secrets remain in process memory while needed; do not put them in chat, screenshots, logs, or support messages.
 
 The worker uses the [client credentials grant](https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/#client-credentials-grant-flow), validates new tokens and active tokens hourly, and obtains a new app token when needed. App tokens do not have refresh tokens. It checks enabled channels in filtered batches at approximately 60-second intervals, independently from chat collection, and respects rate-limit waits. See [token validation](https://dev.twitch.tv/docs/authentication/validate-tokens/), [Get Streams](https://dev.twitch.tv/docs/api/reference/#get-streams), and [rate limits](https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits).
 
@@ -71,7 +66,7 @@ cargo build --release --locked --bin veylurk
 
 Node.js is used only for the interface's development tests. The Windows workflow runs these checks, builds release executables, and checks application startup, local APIs, embedded assets, and timed graceful shutdown using an empty temporary database without channels or metadata credentials. It also checks application and IRC-probe help, then uploads the standalone application and bounded probe artifacts. HTTP and WebSocket fixtures use local test servers; they do not need Twitch credentials. Build success and offline tests are distinct from live operation and human acceptance.
 
-A prior Rust IRC probe completed a live two-channel, 30-second run successfully, observing nonself accounts in both rooms with roughly 14.4 MB peak working set in that run. This validates the bounded transport in that environment; it is not a performance result for the continuous application, long histories, or dozens of channels.
+The Windows application completed two live, 120-second runs on two channels with clean exits. The first retained 691 observations; the restart loaded those same 691 records and reached 2,083. Account-to-channel and channel-to-account searches passed, and the real interface successfully paused and resumed collection. Peak working set was approximately 18.1 MB across those runs. This is bounded evidence for two channels in that environment, not a guarantee for long histories or dozens of channels.
 
 ## Bounded and historical probes
 

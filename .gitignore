@@ -2,3 +2,6 @@
 /.local-toolchain/
 *.exe
 *.pdb
+/data/
+/veylurk-data/
+twitch-credentials.dpapi
