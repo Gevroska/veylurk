@@ -167,23 +167,38 @@ async fn run_endpoint(
         }
         drop(events_rx);
         let outcome = worker.await;
-        let failed = matches!(&outcome, Ok(Err(_)) | Err(_));
-        let end_reason = reason.unwrap_or_else(|| match outcome {
-            Ok(Ok(())) => "connection_ended".into(),
-            Ok(Err(error)) => error.to_string(),
-            Err(_) => "collector_worker_failed".into(),
-        });
-        if let Err(error) = store.end_session(session, end_reason.clone()).await {
-            storage_failure = true;
-            let mut state = status.write().await;
-            state.state = "storage_error".into();
-            state.last_error = Some(error.to_string());
-        }
+        let worker_error = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("collector_worker_failed".into()),
+        };
+        let failed = worker_error.is_some();
+        let end_reason = session_end_reason(reason, worker_error);
+        let record_error = store.end_session(session, end_reason.clone()).await.err();
         {
             let mut state = status.write().await;
             state.active_session_id = None;
             state.connected_channels = 0;
-            if failed {
+            if storage_failure || record_error.is_some() {
+                let previous = if storage_failure {
+                    state.last_error.take()
+                } else {
+                    None
+                };
+                storage_failure = true;
+                state.state = "storage_error".into();
+                state.last_error = Some(
+                    [
+                        previous,
+                        record_error.map(|error| format!("Failed to record session end: {error}")),
+                        Some(end_reason),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                );
+            } else if failed {
                 state.last_error = Some(end_reason);
             }
         }
@@ -217,11 +232,41 @@ async fn run_endpoint(
     state.connected_channels = 0;
 }
 
+fn session_end_reason(reason: Option<String>, worker_error: Option<String>) -> String {
+    match (reason, worker_error) {
+        (Some(reason), Some(error)) => format!("{reason}; {error}"),
+        (Some(reason), None) => reason,
+        (None, Some(error)) => error,
+        (None, None) => "connection_ended".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn stop_reasons_preserve_concurrent_worker_failure_evidence() {
+        let error = irc::IrcError::Backpressure.to_string();
+        for reason in [
+            "shutdown",
+            "configuration_changed",
+            "storage_failure_collection_stopped",
+        ] {
+            assert_eq!(
+                session_end_reason(Some(reason.into()), Some(error.clone())),
+                format!("{reason}; {error}")
+            );
+        }
+        assert_eq!(
+            session_end_reason(Some("shutdown".into()), None),
+            "shutdown"
+        );
+        assert_eq!(session_end_reason(None, Some(error.clone())), error);
+        assert_eq!(session_end_reason(None, None), "connection_ended");
+    }
 
     #[tokio::test]
     async fn received_flood_is_batched_and_fully_drained_before_session_shutdown() {
