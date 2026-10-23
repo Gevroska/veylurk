@@ -31,6 +31,8 @@ pub enum IrcError {
     Transport,
     #[error("IRC registration, initial NAMES, or overall deadline expired")]
     Timeout,
+    #[error("observation delivery stalled; some received evidence may be missing")]
+    Backpressure,
 }
 
 fn login(value: &str) -> Option<String> {
@@ -43,6 +45,13 @@ fn login(value: &str) -> Option<String> {
 }
 
 pub fn normalize_channels(channels: &[String]) -> Result<Vec<String>, IrcError> {
+    normalize_channels_with_limit(channels, 3)
+}
+
+fn normalize_channels_with_limit(
+    channels: &[String],
+    maximum: usize,
+) -> Result<Vec<String>, IrcError> {
     let normalized: Result<Vec<_>, _> = channels
         .iter()
         .map(|channel| login(channel.trim()).ok_or(IrcError::Channels))
@@ -50,7 +59,7 @@ pub fn normalize_channels(channels: &[String]) -> Result<Vec<String>, IrcError> 
     let mut normalized = normalized?;
     normalized.sort();
     normalized.dedup();
-    if normalized.is_empty() || normalized.len() > 3 {
+    if normalized.is_empty() || normalized.len() > maximum {
         return Err(IrcError::Channels);
     }
     Ok(normalized)
@@ -215,6 +224,10 @@ pub struct Observation {
 
 impl Membership {
     pub fn new(guest: &str, channels: &[String]) -> Result<Self, IrcError> {
+        Self::with_limit(guest, channels, 3)
+    }
+
+    fn with_limit(guest: &str, channels: &[String], maximum: usize) -> Result<Self, IrcError> {
         let guest = login(guest)
             .filter(|guest| {
                 guest.strip_prefix("justinfan").is_some_and(|suffix| {
@@ -224,7 +237,7 @@ impl Membership {
             .ok_or(IrcError::Protocol)?;
         Ok(Self {
             guest,
-            rooms: normalize_channels(channels)?
+            rooms: normalize_channels_with_limit(channels, maximum)?
                 .into_iter()
                 .map(|channel| (channel, Room::default()))
                 .collect(),
@@ -415,6 +428,191 @@ impl Membership {
     }
 }
 
+/// Durable evidence messages for continuous collection, without an inferred population.
+#[derive(Debug)]
+pub enum StreamEvent {
+    Connected,
+    Observations(Vec<crate::store::NewObservation>),
+    RoomReady(String),
+    RoomUnavailable(String),
+}
+
+async fn deliver(
+    events: &tokio::sync::mpsc::Sender<StreamEvent>,
+    event: StreamEvent,
+) -> Result<(), IrcError> {
+    timeout(Duration::from_secs(5), events.send(event))
+        .await
+        .map_err(|_| IrcError::Backpressure)?
+        .map_err(|_| IrcError::Transport)
+}
+
+/// One connection, at most fifty rooms, paced joins and bounded delivery backpressure.
+pub async fn stream(
+    channels: Vec<String>,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), IrcError> {
+    stream_endpoint(channels, events, stop, "wss://irc-ws.chat.twitch.tv:443").await
+}
+
+pub(crate) async fn stream_endpoint(
+    channels: Vec<String>,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    stop: tokio::sync::watch::Receiver<bool>,
+    endpoint: &str,
+) -> Result<(), IrcError> {
+    stream_configured(channels, events, stop, endpoint, Duration::from_secs(30)).await
+}
+
+async fn stream_configured(
+    channels: Vec<String>,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    endpoint: &str,
+    room_timeout: Duration,
+) -> Result<(), IrcError> {
+    let channels = normalize_channels_with_limit(&channels, 50)?;
+    let guest = format!(
+        "justinfan{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| IrcError::Protocol)?
+            .as_nanos()
+            % 1_000_000_000_000
+    );
+    let mut state = Membership::with_limit(&guest, &channels, 50)?;
+    let config = WebSocketConfig::default()
+        .write_buffer_size(1024)
+        .max_write_buffer_size(16 * 1024)
+        .max_message_size(Some(MAX_BUFFER))
+        .max_frame_size(Some(MAX_BUFFER));
+    let connected = tokio::select! {
+        _=stop.changed()=>return Ok(()),
+        result=timeout(Duration::from_secs(10),tokio_tungstenite::connect_async_with_config(endpoint,Some(config),false))=>result,
+    };
+    let (mut socket, _) = connected
+        .map_err(|_| IrcError::Timeout)?
+        .map_err(|_| IrcError::Connect)?;
+    let mut joined = Vec::<String>::new();
+    let result=async {
+        for command in ["CAP REQ :twitch.tv/membership\r\n".to_owned(),"PASS SCHMOOPIIE\r\n".to_owned(),format!("NICK {guest}\r\n")] {
+            timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
+        }
+        let registration_deadline=Instant::now()+Duration::from_secs(15);
+        let mut next_join=Instant::now();
+        let mut registered=false;
+        let mut names_deadlines=BTreeMap::<String,Instant>::new();
+        let mut ready=HashSet::<String>::new();
+        let mut buffer=LineBuffer::default();
+        let mut last_received=Instant::now();
+        let mut heartbeat=tokio::time::interval(Duration::from_millis(100));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *stop.borrow() { return Ok(()); }
+            tokio::select! {
+                _=stop.changed()=>return Ok(()),
+                _=heartbeat.tick()=> {
+                    let now=Instant::now();
+                    if !registered && now>=registration_deadline { return Err(IrcError::Timeout); }
+                    if now.duration_since(last_received)>Duration::from_secs(360) { return Err(IrcError::Timeout); }
+                    let unavailable=names_deadlines.iter().filter(|(_,deadline)|now>=**deadline).map(|(channel,_)|channel.clone()).collect::<Vec<_>>();
+                    for channel in unavailable {
+                        names_deadlines.remove(&channel);
+                        deliver(&events,StreamEvent::RoomUnavailable(channel)).await?;
+                    }
+                    // Ten channels per six seconds remains below the documented 20/10s limit.
+                    if registered && joined.len()<channels.len() && now>=next_join {
+                        let end=(joined.len()+10).min(channels.len());
+                        let batch=&channels[joined.len()..end];
+                        let command=format!("JOIN {}\r\n",batch.iter().map(|c|format!("#{c}")).collect::<Vec<_>>().join(","));
+                        timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
+                        for channel in batch { names_deadlines.insert(channel.clone(),Instant::now()+room_timeout); joined.push(channel.clone()); }
+                        next_join=Instant::now()+Duration::from_secs(6);
+                    }
+                }
+                message=socket.next()=> {
+                    let message=message.ok_or(IrcError::Transport)?.map_err(|_|IrcError::Transport)?;
+                    last_received=Instant::now();
+                    let received_at=crate::store::now();
+                    match message {
+                        Message::Text(text)=> {
+                            for line in buffer.push(text.as_bytes())? {
+                                let incoming=parse(&line)?;
+                                let room_notice=incoming.command.eq_ignore_ascii_case("NOTICE")&&incoming.params.first().is_some_and(|p|p.starts_with('#'));
+                                let own_part=incoming.command.eq_ignore_ascii_case("PART")&&user(incoming.prefix)?==guest;
+                                if room_notice||own_part {
+                                    if room_notice&&!server(incoming.prefix) {return Err(IrcError::Protocol);}
+                                    let channel=login(incoming.params.first().and_then(|p|p.strip_prefix('#')).ok_or(IrcError::Protocol)?).ok_or(IrcError::Protocol)?;
+                                    if !joined.contains(&channel) {return Err(IrcError::Protocol);}
+                                    names_deadlines.remove(&channel);
+                                    deliver(&events,StreamEvent::RoomUnavailable(channel)).await?;
+                                    continue;
+                                }
+                                if let Some(reply)=state.line(&line)? {
+                                    timeout(Duration::from_secs(5),socket.send(Message::text(reply))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
+                                }
+                                if state.ready_to_join() {
+                                    let _=state.start_join()?;
+                                    registered=true;
+                                    deliver(&events,StreamEvent::Connected).await?;
+                                }
+                                let message=parse(&line)?;
+                                let mut observed=Vec::new();
+                                let stamp=received_at.clone();
+                                match message.command.to_ascii_uppercase().as_str() {
+                                    "353"=> {
+                                        let channel=login(message.params[2].trim_start_matches('#')).ok_or(IrcError::Protocol)?;
+                                        if !joined.contains(&channel) { return Err(IrcError::Protocol); }
+                                        for raw in message.params[3].split_whitespace() {
+                                            let account=login(raw.trim_start_matches(['@','+'])).ok_or(IrcError::Protocol)?;
+                                            if account!=guest { observed.push(crate::store::NewObservation{channel:channel.clone(),account:Some(account),kind:"names".into(),received_at:stamp.clone()}); }
+                                            if observed.len()>MAX_ACCOUNTS { return Err(IrcError::Limit); }
+                                        }
+                                    }
+                                    "366"=> {
+                                        let channel=login(message.params[1].trim_start_matches('#')).ok_or(IrcError::Protocol)?;
+                                        if !joined.contains(&channel) { return Err(IrcError::Protocol); }
+                                        names_deadlines.remove(&channel);
+                                        observed.push(crate::store::NewObservation{channel:channel.clone(),account:None,kind:"names_end".into(),received_at:stamp});
+                                        if ready.insert(channel.clone()) { deliver(&events,StreamEvent::RoomReady(channel)).await?; }
+                                    }
+                                    "JOIN"|"PART"=> {
+                                        let channel=login(message.params[0].trim_start_matches('#')).ok_or(IrcError::Protocol)?;
+                                        if !joined.contains(&channel) { return Err(IrcError::Protocol); }
+                                        let account=user(message.prefix)?;
+                                        if account!=guest { observed.push(crate::store::NewObservation{channel,account:Some(account),kind:message.command.to_ascii_lowercase(),received_at:stamp}); }
+                                    }
+                                    _=>{}
+                                }
+                                // The continuous path retains received evidence, not a guessed roster.
+                                for room in state.rooms.values_mut() { room.accounts.clear(); room.departed.clear(); room.joins=0; room.parts=0; }
+                                if !observed.is_empty() { deliver(&events,StreamEvent::Observations(observed)).await?; }
+                            }
+                        }
+                        Message::Ping(_)=> { timeout(Duration::from_secs(5),socket.flush()).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?; }
+                        Message::Pong(_)=>{}
+                        _=>return Err(IrcError::Transport),
+                    }
+                }
+            }
+        }
+    }.await;
+    if !joined.is_empty() {
+        let part = format!(
+            "PART {}\r\n",
+            joined
+                .iter()
+                .map(|c| format!("#{c}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let _ = timeout(Duration::from_secs(2), socket.send(Message::text(part))).await;
+    }
+    let _ = timeout(Duration::from_secs(2), socket.close(None)).await;
+    result
+}
+
 /// No account credentials or chat messages are sent. The password is the public IRC guest convention.
 pub async fn observe(
     channels: &[String],
@@ -573,6 +771,155 @@ async fn observe_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_delivery_stall_is_bounded_and_explicit() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(StreamEvent::Connected).await.unwrap();
+        assert_eq!(
+            deliver(&sender, StreamEvent::Connected).await,
+            Err(IrcError::Backpressure)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_room_does_not_disconnect_healthy_membership() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await;
+            let _ = socket.next().await;
+            let nick = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let guest = nick.strip_prefix("NICK ").unwrap().trim().to_owned();
+            socket.send(Message::text(format!(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 {guest} :Welcome\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("JOIN #healthy,#missing\r\n")
+            );
+            socket
+                .send(Message::text(format!(
+                    ":tmi.twitch.tv 366 {guest} #healthy :End\r\n"
+                )))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            socket
+                .send(Message::text(
+                    ":alice!alice@alice.tmi.twitch.tv JOIN #healthy\r\nPING :still-connected\r\n",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PONG :still-connected\r\n")
+            );
+            stop_tx.send(true).unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #healthy,#missing\r\n")
+            );
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move {
+            let mut unavailable = false;
+            let mut healthy = false;
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    StreamEvent::RoomUnavailable(channel) => {
+                        assert_eq!(channel, "missing");
+                        unavailable = true;
+                    }
+                    StreamEvent::Observations(rows) => {
+                        healthy |= rows.iter().any(|e| e.account.as_deref() == Some("alice"));
+                    }
+                    _ => {}
+                }
+            }
+            assert!(unavailable && healthy);
+        });
+        timeout(
+            Duration::from_secs(5),
+            stream_configured(
+                vec!["healthy".into(), "missing".into()],
+                sender,
+                stop_rx,
+                &endpoint,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuous_join_batches_count_channels_and_keep_processing_ping() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("CAP REQ :twitch.tv/membership\r\n")
+            );
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PASS SCHMOOPIIE\r\n")
+            );
+            let nick = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let guest = nick.strip_prefix("NICK ").unwrap().trim().to_owned();
+            socket.send(Message::text(format!(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 {guest} :Welcome\r\n"))).await.unwrap();
+            let joined = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let targets = joined.strip_prefix("JOIN ").unwrap().trim();
+            assert_eq!(targets.split(',').count(), 10);
+            assert!(timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err());
+            socket
+                .send(Message::text("PING :during-paced-joins\r\n"))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PONG :during-paced-joins\r\n")
+            );
+            stop_tx.send(true).unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text(format!("PART {targets}\r\n"))
+            );
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+        let channels = (0..50).map(|n| format!("channel{n:02}")).collect();
+        timeout(
+            Duration::from_secs(5),
+            stream_endpoint(channels, events_tx, stop_rx, &endpoint),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        drain.await.unwrap();
+        assert!(
+            normalize_channels(&(0..4).map(|n| format!("channel{n}")).collect::<Vec<_>>()).is_err()
+        );
+    }
 
     async fn expect_registration(
         server: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,

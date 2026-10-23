@@ -1,9 +1,15 @@
-name: Windows prototype
+name: Windows application
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      legacy_browser:
+        description: Build and test the historical browser-assisted probe bundle
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -11,61 +17,84 @@ permissions:
 jobs:
   test-and-build:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24.13.1'
+      - name: Test embedded UI behavior without a browser
+        run: node --test web/app.test.cjs
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install pinned browser helper dependencies
-        shell: pwsh
-        run: |
-          $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
-          npm ci --prefix browser-helper --omit=dev
-          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
-      - name: Install matched Chromium for bundle
-        shell: pwsh
-        run: |
-          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-staging'
-          node browser-helper/node_modules/playwright/cli.js install chromium --no-shell
-          if ($LASTEXITCODE -ne 0) { throw 'Chromium installation failed' }
-      - name: Test browser helper against offline fixture
-        shell: pwsh
-        run: |
-          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-staging'
-          node browser-helper/test-helper.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Offline helper fixture failed' }
-          node --test browser-helper/test-native-response.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Native response classifier tests failed' }
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Build release prototype
+      - name: Build release application and probes
         run: cargo build --release --locked
-      - name: Package self-contained Stage 3 probe
+      - name: Smoke-check application help without Twitch
         shell: pwsh
         run: |
-          .\scripts\package-windows.ps1 -BrowserDirectory (Join-Path $PWD 'browser-staging') -OutputDirectory (Join-Path $PWD 'stage3-bundle')
-      - name: Smoke-check packaged Stage 3 probe without Twitch
+          .\target\release\veylurk.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Application help check failed' }
+      - name: Verify packaged application startup and graceful exit without Twitch
         shell: pwsh
         run: |
-          .\stage3-bundle\veylurk-browser-probe.exe --help
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged probe help check failed' }
-          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'stage3-bundle\browsers'
-          .\stage3-bundle\node.exe .\stage3-bundle\browser-helper\test-helper.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged offline helper fixture failed' }
-          .\stage3-bundle\node.exe --test .\stage3-bundle\browser-helper\test-native-response.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged native response classifier tests failed' }
+          Remove-Item Env:\VEYLURK_TWITCH_CLIENT_ID -ErrorAction SilentlyContinue
+          Remove-Item Env:\VEYLURK_TWITCH_CLIENT_SECRET -ErrorAction SilentlyContinue
+          $smokeDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-smoke-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $smokeDirectory -ErrorAction Stop | Out-Null
+          $portReservation = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $portReservation.Start()
+          $smokePort = $portReservation.LocalEndpoint.Port
+          $portReservation.Stop()
+          $process = Start-Process -FilePath (Join-Path $PWD 'target/release/veylurk.exe') -ArgumentList @('--database', 'smoke.sqlite3', '--port', $smokePort, '--run-for-seconds', '10') -WorkingDirectory $smokeDirectory -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $smokeDirectory 'stdout.log') -RedirectStandardError (Join-Path $smokeDirectory 'stderr.log')
+          try {
+            $baseUrl = "http://127.0.0.1:$smokePort"
+            $ready = $null
+            $deadline = [DateTime]::UtcNow.AddSeconds(8)
+            while ([DateTime]::UtcNow -lt $deadline -and -not $process.HasExited) {
+              try { $ready = Invoke-RestMethod -Uri "$baseUrl/api/status" -TimeoutSec 2 } catch { $ready = $null }
+              if ($ready -and $ready.state -eq 'idle') { break }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not $ready -or $ready.state -ne 'idle' -or $ready.enabled_channels -ne 0 -or $ready.session_count -ne 0 -or $ready.observation_count -ne 0 -or $ready.storage_health -ne 'available') { throw 'Empty application startup status was invalid' }
+            $metadata = Invoke-RestMethod -Uri "$baseUrl/api/metadata/status" -TimeoutSec 2
+            if ($metadata.configured -or $metadata.channels.Count -ne 0) { throw 'Offline smoke unexpectedly enabled metadata' }
+            $page = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 2
+            if ($page.StatusCode -ne 200 -or -not $page.Content.Contains('Veylurk')) { throw 'Embedded interface was unavailable' }
+            foreach ($asset in @('app.js', 'style.css')) {
+              $response = Invoke-WebRequest -Uri "$baseUrl/$asset" -TimeoutSec 2
+              if ($response.StatusCode -ne 200 -or $response.RawContentLength -le 0) { throw 'Embedded asset was unavailable' }
+            }
+            if (-not $process.WaitForExit(20000)) { throw 'Timed graceful shutdown exceeded its watchdog' }
+            if ($process.ExitCode -ne 0) { throw 'Timed application exit was unsuccessful' }
+            $database = Get-Item -LiteralPath (Join-Path $smokeDirectory 'smoke.sqlite3') -ErrorAction Stop
+            if ($database.Length -le 0) { throw 'Application database was not created' }
+          } finally {
+            if (-not $process.HasExited) { $process.Kill(); $process.WaitForExit() }
+            $process.Dispose()
+          }
       - name: Smoke-check IRC probe help without Twitch
         shell: pwsh
         run: |
           .\target\release\veylurk-irc-probe.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'IRC probe help check failed' }
+      - name: Package standalone application and documentation
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path app-package -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath target/release/veylurk.exe, README.md, LICENSE -Destination app-package -ErrorAction Stop
+      - name: Publish standalone Windows application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylurk-windows-x64
+          path: app-package/
+          if-no-files-found: error
       - name: Upload Windows IRC probe
         uses: actions/upload-artifact@v4
         with:
@@ -78,13 +107,6 @@ jobs:
           name: veylurk-probe-windows-x64
           path: target/release/veylurk-probe.exe
           if-no-files-found: error
-      - name: Upload Windows browser-assisted prototype
-        uses: actions/upload-artifact@v4
-        with:
-          name: veylurk-browser-probe-windows-x64
-          path: stage3-bundle/
-          if-no-files-found: error
-          include-hidden-files: true
       - name: Upload resolved lockfile
         if: always()
         uses: actions/upload-artifact@v4
@@ -92,3 +114,50 @@ jobs:
           name: veylurk-resolved-lockfile
           path: Cargo.lock
           if-no-files-found: error
+
+  legacy-browser-bundle:
+    if: github.event_name == 'workflow_dispatch' && inputs.legacy_browser
+    needs: test-and-build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.13.1'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned browser helper dependencies
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+          npm ci --prefix browser-helper --omit=dev
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+      - name: Install matched Chromium for bundle
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-staging'
+          node browser-helper/node_modules/playwright/cli.js install chromium --no-shell
+          if ($LASTEXITCODE -ne 0) { throw 'Chromium installation failed' }
+      - name: Build historical browser probe
+        run: cargo build --release --locked --bin veylurk-browser-probe
+      - name: Package historical browser probe
+        shell: pwsh
+        run: |
+          .\scripts\package-windows.ps1 -BrowserDirectory (Join-Path $PWD 'browser-staging') -OutputDirectory (Join-Path $PWD 'stage3-bundle')
+      - name: Smoke-check historical bundle without Twitch
+        shell: pwsh
+        run: |
+          .\stage3-bundle\veylurk-browser-probe.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged probe help check failed' }
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'stage3-bundle\browsers'
+          .\stage3-bundle\node.exe .\stage3-bundle\browser-helper\test-helper.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged offline helper fixture failed' }
+          .\stage3-bundle\node.exe --test .\stage3-bundle\browser-helper\test-native-response.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged native response classifier tests failed' }
+      - name: Upload historical browser-assisted prototype
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylurk-browser-probe-windows-x64
+          path: stage3-bundle/
+          if-no-files-found: error
+          include-hidden-files: true

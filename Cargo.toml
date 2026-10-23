@@ -17,6 +17,10 @@ path = "src/bin/browser_probe.rs"
 name = "veylurk-irc-probe"
 path = "src/bin/irc_probe.rs"
 
+[[bin]]
+name = "veylurk"
+path = "src/bin/veylurk.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -25,13 +29,19 @@ serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
 futures-util = { version = "0.3", features = ["sink"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+axum = "0.8"
+rusqlite = { version = "0.37", features = ["bundled", "hooks"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 strip = true
