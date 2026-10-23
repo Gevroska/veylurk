@@ -195,6 +195,12 @@ fn users() -> Reply {
 fn streams(data: Value) -> Reply {
     Reply::ok("/streams", json!({"data":data,"pagination":{}}))
 }
+fn stream_page(data: Value, cursor: &str) -> Reply {
+    Reply::ok(
+        "/streams",
+        json!({"data":data,"pagination":{"cursor":cursor}}),
+    )
+}
 fn live() -> Value {
     json!({"id":"1234","user_id":"42","user_login":"example","type":"live","title":"Fixture","game_name":"Game","language":"en","started_at":"2026-10-23T07:00:00Z","viewer_count":123})
 }
@@ -333,6 +339,288 @@ async fn rate_limit_returns_wait_without_token_renewal_or_immediate_retry() {
 }
 
 #[tokio::test]
+async fn two_live_rows_with_cursor_and_empty_terminal_page_preserve_both_streams() {
+    let mut other = live();
+    other["id"] = json!("5678");
+    other["user_id"] = json!("43");
+    other["user_login"] = json!("second");
+    let fixture = Fixture::new(vec![
+        Reply::ok(
+            "/users",
+            json!({"data":[{"id":"42","login":"example"},{"id":"43","login":"second"}]}),
+        ),
+        stream_page(json!([live(), other]), "next+/=page"),
+        streams(json!([])),
+    ])
+    .await;
+    let channels = vec!["example".into(), "second".into()];
+    let poll = fetch_streams(
+        &client(),
+        &credentials(),
+        &mut cached_token(),
+        &channels,
+        &fixture.endpoints,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("complete paginated poll failed: {}", error.code));
+    assert_eq!(poll.streams.len(), 2);
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(SCHEMA).unwrap();
+    record_check(&mut conn, &channels, "2026-10-23T08:00:00.000Z", Ok(poll)).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM metadata_checks WHERE state='live'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    fixture.assert_paths(&["/users", "/streams", "/streams"]);
+    let requests = fixture.state.requests.lock().unwrap();
+    for request in &requests[1..] {
+        let logins: Vec<_> = request
+            .query
+            .iter()
+            .filter(|(key, _)| key == "user_login")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(logins, ["example", "second"]);
+    }
+    assert!(!requests[1].query.iter().any(|(key, _)| key == "after"));
+    assert!(requests[2]
+        .query
+        .contains(&("after".into(), "next+/=page".into())));
+}
+
+#[tokio::test]
+async fn continuation_failure_discards_partial_live_rows_and_records_unknown() {
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        let mut failure = Reply::status("/streams", status);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            failure.retry_after = Some("137");
+        }
+        let fixture =
+            Fixture::new(vec![users(), stream_page(json!([live()]), "next"), failure]).await;
+        let mut token = cached_token();
+        let result = fetch_streams(
+            &client(),
+            &credentials(),
+            &mut token,
+            &["example".into()],
+            &fixture.endpoints,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("partial pages must not become a successful poll");
+        };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert_eq!(error.retry_after, Duration::from_secs(137));
+        }
+        assert_eq!(token.as_ref().unwrap().value, "fixture-token-cached");
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        record_check(
+            &mut conn,
+            &["example".into()],
+            "2026-10-23T08:00:00.000Z",
+            Err(error.code),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT state FROM metadata_checks", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "unknown"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM metadata_broadcasts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        fixture.assert_paths(&["/users", "/streams", "/streams"]);
+    }
+}
+
+#[tokio::test]
+async fn continuation_unauthorized_restarts_entire_poll_once_without_old_rows_or_cursor() {
+    let fixture = Fixture::new(vec![
+        users(),
+        stream_page(json!([live()]), "old-cursor"),
+        Reply::status("/streams", StatusCode::UNAUTHORIZED),
+        token_reply("fixture-token-renewed"),
+        validation(),
+        users(),
+        streams(json!([])),
+    ])
+    .await;
+    let mut token = cached_token();
+    let poll = fetch_streams(
+        &client(),
+        &credentials(),
+        &mut token,
+        &["example".into()],
+        &fixture.endpoints,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("renewed poll failed: {}", error.code));
+    assert!(poll.streams.is_empty());
+    fixture.assert_paths(&[
+        "/users",
+        "/streams",
+        "/streams",
+        "/token",
+        "/validate",
+        "/users",
+        "/streams",
+    ]);
+    let requests = fixture.state.requests.lock().unwrap();
+    assert!(requests[2]
+        .query
+        .contains(&("after".into(), "old-cursor".into())));
+    assert!(!requests[6].query.iter().any(|(key, _)| key == "after"));
+    assert_eq!(requests[6].authorization, "Bearer fixture-token-renewed");
+}
+
+#[tokio::test]
+async fn continuation_unauthorized_uses_shared_single_renewal_budget() {
+    let fixture = Fixture::new(vec![
+        users(),
+        stream_page(json!([live()]), "first-cursor"),
+        Reply::status("/streams", StatusCode::UNAUTHORIZED),
+        token_reply("fixture-token-renewed"),
+        validation(),
+        users(),
+        stream_page(json!([live()]), "second-cursor"),
+        Reply::status("/streams", StatusCode::UNAUTHORIZED),
+    ])
+    .await;
+    let mut token = cached_token();
+    let result = fetch_streams(
+        &client(),
+        &credentials(),
+        &mut token,
+        &["example".into()],
+        &fixture.endpoints,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("a second continuation 401 must fail");
+    };
+    assert_eq!(
+        error.code,
+        "Twitch rejected the configured app credentials."
+    );
+    assert!(token.is_none());
+    fixture.assert_paths(&[
+        "/users",
+        "/streams",
+        "/streams",
+        "/token",
+        "/validate",
+        "/users",
+        "/streams",
+        "/streams",
+    ]);
+}
+
+#[tokio::test]
+async fn pagination_loops_oversized_cursors_and_page_limit_fail_with_bounded_requests() {
+    for cursors in [
+        vec!["repeat".to_string(), "repeat".to_string()],
+        vec!["x".repeat(MAX_CURSOR_BYTES + 1)],
+        (0..MAX_STREAM_PAGES)
+            .map(|index| format!("page-{index}"))
+            .collect(),
+    ] {
+        let mut replies = vec![users()];
+        replies.extend(
+            cursors
+                .iter()
+                .map(|cursor| stream_page(json!([live()]), cursor)),
+        );
+        let fixture = Fixture::new(replies).await;
+        let result = fetch_streams(
+            &client(),
+            &credentials(),
+            &mut cached_token(),
+            &["example".into()],
+            &fixture.endpoints,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("unterminated pagination must fail");
+        };
+        assert_eq!(error.code, "Twitch returned an incomplete metadata batch.");
+        let mut paths = vec!["/users"];
+        paths.extend(std::iter::repeat_n("/streams", cursors.len()));
+        fixture.assert_paths(&paths);
+    }
+}
+
+#[tokio::test]
+async fn cross_page_duplicates_allow_mutable_fields_only_for_the_same_identity() {
+    let mut duplicate = live();
+    duplicate["title"] = json!("Updated title");
+    duplicate["viewer_count"] = json!(456);
+    duplicate["started_at"] = json!("2026-10-23T09:00:00+02:00");
+    let fixture = Fixture::new(vec![
+        users(),
+        stream_page(json!([live()]), "next"),
+        streams(json!([duplicate])),
+    ])
+    .await;
+    let poll = fetch_streams(
+        &client(),
+        &credentials(),
+        &mut cached_token(),
+        &["example".into()],
+        &fixture.endpoints,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("stable duplicate failed: {}", error.code));
+    assert_eq!(poll.streams.len(), 1);
+    assert_eq!(poll.streams[0].title, "Updated title");
+    assert_eq!(poll.streams[0].viewer_count, 456);
+    fixture.assert_paths(&["/users", "/streams", "/streams"]);
+    for (field, changed) in [
+        ("id", "5678"),
+        ("user_id", "99"),
+        ("user_login", "other"),
+        ("started_at", "2026-10-23T07:01:00Z"),
+    ] {
+        let mut invalid = live();
+        invalid[field] = json!(changed);
+        let fixture = Fixture::new(vec![
+            users(),
+            stream_page(json!([live()]), "next"),
+            streams(json!([invalid])),
+        ])
+        .await;
+        let result = fetch_streams(
+            &client(),
+            &credentials(),
+            &mut cached_token(),
+            &["example".into()],
+            &fixture.endpoints,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("changed {field} identity must fail");
+        };
+        assert_eq!(
+            error.code,
+            "Twitch returned inconsistent broadcast metadata."
+        );
+        fixture.assert_paths(&["/users", "/streams", "/streams"]);
+    }
+}
+
+#[tokio::test]
 async fn incomplete_batches_and_invalid_stream_identity_fail_instead_of_looking_offline() {
     let mut invalid_type = live();
     invalid_type["type"] = json!("");
@@ -341,7 +629,7 @@ async fn incomplete_batches_and_invalid_stream_identity_fail_instead_of_looking_
     for payload in [
         json!({"data":[]}),
         json!({"data":[],"pagination":null}),
-        json!({"data":[],"pagination":{"cursor":"more"}}),
+        json!({"data":[live(),live()],"pagination":{}}),
         json!({"data":[invalid_type],"pagination":{}}),
         json!({"data":[wrong_identity],"pagination":{}}),
     ] {

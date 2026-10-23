@@ -18,6 +18,8 @@ use std::{
 use tokio::sync::{watch, RwLock};
 
 const ASSOCIATION: &str = "Received in this channel between the reported broadcast start and last confirmed live check; chat evidence, not video watching. Collection gaps remain unknown.";
+const MAX_STREAM_PAGES: usize = 4;
+const MAX_CURSOR_BYTES: usize = 4096;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata_broadcasts (
  id INTEGER PRIMARY KEY, stream_id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL,
@@ -540,7 +542,7 @@ async fn fetch_streams(
             return Err(error);
         }
     }
-    for attempt in 0..2 {
+    'authorization: for attempt in 0..2 {
         // Resolve the explicitly requested logins first: a missing account is
         // unknown, not evidence of an offline broadcast.
         let user_query: Vec<_> = channels
@@ -596,61 +598,90 @@ async fn fetch_streams(
                 .cloned()
                 .map(|channel| ("user_login", channel)),
         );
-        let response = client
-            .get(&endpoints.streams)
-            .header("Client-Id", &credentials.client_id)
-            .bearer_auth(&token.as_ref().expect("token initialized").value)
-            .query(&query)
-            .send()
-            .await
-            .map_err(|_| FetchError::new("Could not connect to Twitch metadata."))?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            *token = None;
-            if attempt == 0 {
-                *token = Some(new_token(client, credentials, endpoints).await?);
-                continue;
+        let mut after = None::<String>;
+        let mut cursors = HashSet::new();
+        let mut by_channel = HashMap::<String, Stream>::new();
+        let mut stream_ids = HashMap::<String, String>::new();
+        for _ in 0..MAX_STREAM_PAGES {
+            let mut request = client
+                .get(&endpoints.streams)
+                .header("Client-Id", &credentials.client_id)
+                .bearer_auth(&token.as_ref().expect("token initialized").value)
+                .query(&query);
+            if let Some(cursor) = &after {
+                request = request.query(&[("after", cursor)]);
             }
-            return Err(FetchError::new(
-                "Twitch rejected the configured app credentials.",
-            ));
-        }
-        check_http(&response)?;
-        let payload: Streams = bounded_json(response).await?;
-        if payload
-            .pagination
-            .cursor
-            .is_some_and(|cursor| !cursor.is_empty())
-        {
-            return Err(FetchError::new(
-                "Twitch returned an incomplete metadata batch.",
-            ));
-        }
-        let mut seen = HashSet::new();
-        let mut stream_ids = HashSet::new();
-        for stream in &payload.data {
-            if !channels.contains(&stream.user_login)
-                || users.get(&stream.user_login) != Some(&stream.user_id)
-                || stream.r#type != "live"
-                || !seen.insert(&stream.user_login)
-                || !stream_ids.insert(&stream.id)
-                || stream.id.is_empty()
-                || stream.id.len() > 128
-                || !stream.id.bytes().all(|byte| byte.is_ascii_digit())
-                || stream.title.len() > 8192
-                || stream.game_name.len() > 1024
-                || stream.language.len() > 32
-                || stream.viewer_count > i64::MAX as u64
-                || DateTime::parse_from_rfc3339(&stream.started_at).is_err()
-            {
+            let response = request
+                .send()
+                .await
+                .map_err(|_| FetchError::new("Could not connect to Twitch metadata."))?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                *token = None;
+                if attempt == 0 {
+                    *token = Some(new_token(client, credentials, endpoints).await?);
+                    // Discard partial pages and resolve identities again with the new token.
+                    continue 'authorization;
+                }
                 return Err(FetchError::new(
-                    "Twitch returned inconsistent broadcast metadata.",
+                    "Twitch rejected the configured app credentials.",
                 ));
             }
+            check_http(&response)?;
+            let payload: Streams = bounded_json(response).await?;
+            let mut page_channels = HashSet::new();
+            let mut page_ids = HashSet::new();
+            for stream in payload.data {
+                if !channels.contains(&stream.user_login)
+                    || users.get(&stream.user_login) != Some(&stream.user_id)
+                    || stream.r#type != "live"
+                    || !page_channels.insert(stream.user_login.clone())
+                    || !page_ids.insert(stream.id.clone())
+                    || stream.id.is_empty()
+                    || stream.id.len() > 128
+                    || !stream.id.bytes().all(|byte| byte.is_ascii_digit())
+                    || stream.title.len() > 8192
+                    || stream.game_name.len() > 1024
+                    || stream.language.len() > 32
+                    || stream.viewer_count > i64::MAX as u64
+                    || DateTime::parse_from_rfc3339(&stream.started_at).is_err()
+                    || stream_ids
+                        .get(&stream.id)
+                        .is_some_and(|login| login != &stream.user_login)
+                    || by_channel.get(&stream.user_login).is_some_and(|previous| {
+                        previous.id != stream.id
+                            || previous.user_id != stream.user_id
+                            || DateTime::parse_from_rfc3339(&previous.started_at).ok()
+                                != DateTime::parse_from_rfc3339(&stream.started_at).ok()
+                    })
+                {
+                    return Err(FetchError::new(
+                        "Twitch returned inconsistent broadcast metadata.",
+                    ));
+                }
+                // Viewer ranking can repeat a stream on a later page. Preserve the
+                // latest mutable fields only after its immutable identity agrees.
+                stream_ids.insert(stream.id.clone(), stream.user_login.clone());
+                by_channel.insert(stream.user_login.clone(), stream);
+            }
+            let Some(cursor) = payload.pagination.cursor.filter(|value| !value.is_empty()) else {
+                return Ok(Poll {
+                    streams: channels
+                        .iter()
+                        .filter_map(|channel| by_channel.remove(channel))
+                        .collect(),
+                    users,
+                });
+            };
+            if cursor.len() > MAX_CURSOR_BYTES || !cursors.insert(cursor.clone()) {
+                return Err(FetchError::new(
+                    "Twitch returned an incomplete metadata batch.",
+                ));
+            }
+            after = Some(cursor);
         }
-        return Ok(Poll {
-            streams: payload.data,
-            users,
-        });
+        return Err(FetchError::new(
+            "Twitch returned an incomplete metadata batch.",
+        ));
     }
     Err(FetchError::new("Twitch metadata authorization failed."))
 }
