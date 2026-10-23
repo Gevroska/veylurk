@@ -82,6 +82,15 @@ pub fn router(state: AppState, additional: Router) -> Router {
             }),
         )
         .route(
+            "/theme.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../web/theme.js"),
+                )
+            }),
+        )
+        .route(
             "/style.css",
             get(|| async {
                 (

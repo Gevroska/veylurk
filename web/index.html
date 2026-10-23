@@ -3,9 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
   <title>Veylurk · Chat observations</title>
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
@@ -13,7 +14,11 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="app-header">
     <div class="brand"><span class="brand-mark" aria-hidden="true">V</span><div><h1>Veylurk</h1><p>Local chat observation history</p></div></div>
-    <div class="connection"><span id="connection-status" class="badge neutral">Connecting to local app</span><button id="refresh-status" class="secondary" type="button">Refresh status</button></div>
+    <div class="header-tools">
+      <div class="connection"><span id="connection-status" class="badge neutral">Connecting to local app</span><button id="refresh-status" class="secondary" type="button">Refresh status</button></div>
+      <div class="theme-setting"><label for="theme-select">Theme</label><select id="theme-select" title="Auto follows your browser or system preference"><option value="auto">Auto (system)</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+      <p id="theme-message" class="theme-message" role="status" aria-live="polite" hidden></p>
+    </div>
   </header>
 
   <main id="main" tabindex="-1">
@@ -38,7 +43,7 @@
     </section>
 
     <section id="section-history" aria-labelledby="history-title" hidden>
-      <div class="section-heading"><div><h2 id="history-title">Observation history</h2><p>Find an account across channels, or explore the accounts recorded in a channel.</p></div></div>
+      <div class="section-heading"><div><h2 id="history-title" tabindex="-1">Observation history</h2><p>Find an account across channels, or explore the accounts recorded in a channel.</p></div></div>
       <form id="search-form" class="card search-form">
         <div class="field"><label for="search-account">Account login</label><input id="search-account" maxlength="26" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Any account" aria-describedby="search-help"></div>
         <div class="field"><label for="search-channel">Channel login</label><input id="search-channel" maxlength="26" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Any channel" aria-describedby="search-help"></div>

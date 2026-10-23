@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: '24.13.1'
       - name: Test embedded UI behavior without a browser
-        run: node --test web/app.test.cjs
+        run: node --test web/app.test.cjs web/theme.test.cjs
       - name: Test Windows PowerShell launcher without Twitch
         shell: powershell
         run: .\scripts\Test-VeylurkLauncher.ps1
@@ -70,7 +70,7 @@ jobs:
             if ($metadata.configured -or $metadata.channels.Count -ne 0) { throw 'Offline smoke unexpectedly enabled metadata' }
             $page = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 2
             if ($page.StatusCode -ne 200 -or -not $page.Content.Contains('Veylurk')) { throw 'Embedded interface was unavailable' }
-            foreach ($asset in @('app.js', 'style.css')) {
+            foreach ($asset in @('app.js', 'theme.js', 'style.css')) {
               $response = Invoke-WebRequest -Uri "$baseUrl/$asset" -TimeoutSec 2
               if ($response.StatusCode -ne 200 -or $response.RawContentLength -le 0) { throw 'Embedded asset was unavailable' }
             }

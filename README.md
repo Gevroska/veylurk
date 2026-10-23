@@ -16,6 +16,8 @@ Open `http://127.0.0.1:8794`. The launcher uses `data\observations.sqlite3` besi
 
 Add channels in the interface, pause or resume collection for a channel, and search exact Twitch account or channel logins. Up to 50 channels can be tracked. For direct executable use, `--database` selects a database, repeatable `--channel` seeds channels, and optional `--run-for-seconds` accepts 1–3600 seconds before graceful shutdown. A direct executable launch without `--database` uses `veylurk-data/observations.sqlite3` relative to its working directory; use the launcher to keep the package's stable data location.
 
+The interface's **Theme** selector defaults to **Auto**, which follows your browser or system's light/dark preference and updates when it changes. **Light** and **Dark** override that preference. Your selection is saved in this browser for the local application address; if browser storage is unavailable, it applies only to the current tab.
+
 The HTTP listener binds only to `127.0.0.1`. Changes require requests from the local application's own origin. There is no remote-access mode, account system, or CSV export. The browser receives embedded local assets without third-party scripts or a CDN.
 
 One chat connection serves all enabled channels, with paced JOIN requests, keepalives, bounded queues, and reconnect backoff. A room that fails its initial membership deadline is marked unavailable while healthy rooms continue. It is retried on the next connection; pausing then resuming it requests a configuration reconnect. Configuration changes restart the connection and create a new recorded session. A storage failure stops collection and is shown in status; a retry cannot recover observations that were never saved. A second instance cannot open the same database while the first holds its lock.
@@ -60,7 +62,7 @@ Broadcast records retain Twitch's stream ID, title changes, reported start, and 
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-node --test web/app.test.cjs
+node --test web/app.test.cjs web/theme.test.cjs
 cargo build --release --locked --bin veylurk
 ```
 

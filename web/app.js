@@ -11,6 +11,7 @@
   let channelsGeneration = 0;
   let channelsLoaded = false;
   let healthLoaded = false;
+  let renderedChannelsSignature = null;
   let searchQuery = null;
   let broadcastQuery = null;
 
@@ -122,6 +123,9 @@
 
   function table(headers, data, makeRow, caption) {
     const wrapper = node("div", null, "table-wrap");
+    wrapper.tabIndex = 0;
+    wrapper.setAttribute("role", "region");
+    wrapper.setAttribute("aria-label", caption || "Scrollable results table");
     const result = node("table");
     if (caption) result.append(node("caption", caption));
     const head = node("thead");
@@ -149,8 +153,8 @@
   function empty(text) { return node("p", text, "empty"); }
 
   function navigate(section) {
-    if (location.hash === "#" + section) showSection();
-    else location.hash = section;
+    if (location.hash !== "#" + section) location.hash = section;
+    showSection();
   }
 
   function showSection() {
@@ -168,6 +172,8 @@
     $("search-channel").value = channel || "";
     navigate("history");
     startSearch();
+    $("history-title").focus({ preventScroll: true });
+    $("section-history").scrollIntoView({ block: "start" });
   }
 
   function historyLink(text, account, channel) {
@@ -175,6 +181,13 @@
   }
 
   function renderChannels() {
+    const signature = JSON.stringify([channels, [...pendingChannels].sort()]);
+    if (signature === renderedChannelsSignature) return;
+    renderedChannelsSignature = signature;
+    const container = $("channels-results");
+    const focused = document.activeElement;
+    const focusKey = focused && container.contains(focused) ? focused.dataset.channelAction : null;
+    const scrollLeft = container.querySelector(".table-wrap")?.scrollLeft || 0;
     const tracked = channels.filter((channel) => channel.tracked !== false);
     $("channel-count").textContent = `${count(tracked.length)} tracked · ${count(channels.length - tracked.length)} history only`;
     if (!channels.length) {
@@ -182,31 +195,43 @@
       return;
     }
     const ordered = [...channels].sort((a, b) => Number(b.tracked !== false) - Number(a.tracked !== false) || String(a.login).localeCompare(String(b.login)));
-    $("channels-results").replaceChildren(table(["Channel", "Tracking", "Latest receipt", "Actions"], ordered, (channel) => {
+    const content = table(["Channel", "Tracking", "Latest receipt", "Actions"], ordered, (channel) => {
       const row = node("tr");
       const historical = channel.tracked === false;
-      const collection = {
-        joining: ["Joining chat", "warning"],
-        collecting: ["Collecting chat", "good"],
-        unavailable: ["Membership unavailable", "bad"],
-      }[channel.collection_state];
+      const collection = new Map([
+        ["joining", ["Joining chat", "warning"]],
+        ["collecting", ["Collecting chat", "good"]],
+        ["unavailable", ["Membership unavailable", "bad"]],
+      ]).get(channel.collection_state);
       const state = node("div");
       state.append(historical ? badge("History only") : !channel.enabled ? badge("Paused", "warning") : collection ? badge(...collection) : channel.active_session_id != null ? badge("Session open", "good") : badge("Waiting for session", "warning"));
       if (!historical && channel.enabled && channel.collection_error) state.append(node("span", channel.collection_error, "secondary-line"));
+      const control = (text, action, handler, className = "secondary small") => {
+        const result = button(text, handler, className);
+        result.dataset.channelAction = JSON.stringify([channel.login, action]);
+        if (pendingChannels.has(channel.login) && !["history", "login"].includes(action)) result.setAttribute("aria-disabled", "true");
+        return result;
+      };
       const actions = node("div", null, "actions-inner");
-      actions.append(button("History", () => openHistory("", channel.login)));
+      actions.append(control("History", "history", () => openHistory("", channel.login)));
       if (historical) {
-        actions.append(button("Track again", () => mutateChannel(channel.login, "track")));
+        actions.append(control("Track again", "tracking", () => mutateChannel(channel.login, "track")));
       } else {
-        actions.append(button(channel.enabled ? "Pause" : "Resume", () => mutateChannel(channel.login, channel.enabled ? "pause" : "resume")));
-        const remove = button("Remove tracking", () => mutateChannel(channel.login, "remove"), "secondary small danger");
+        actions.append(control(channel.enabled ? "Pause" : "Resume", "toggle", () => mutateChannel(channel.login, channel.enabled ? "pause" : "resume")));
+        const remove = control("Remove tracking", "tracking", () => mutateChannel(channel.login, "remove"), "secondary small danger");
         remove.title = "Stop tracking this channel and retain its stored history";
         actions.append(remove);
       }
-      for (const action of actions.children) action.disabled = pendingChannels.has(channel.login);
-      row.append(cell(historyLink(channel.login, "", channel.login)), cell(state), cell(timestamp(channel.last_observed_at), "time"), cell(actions, "actions"));
+      row.append(cell(control(channel.login, "login", () => openHistory("", channel.login), "link-button")), cell(state), cell(timestamp(channel.last_observed_at), "time"), cell(actions, "actions"));
       return row;
-    }, "Channels configured for collection and channels with retained history"));
+    }, "Channels configured for collection and channels with retained history");
+    content.dataset.channelAction = "table";
+    container.replaceChildren(content);
+    content.scrollLeft = scrollLeft;
+    if (focusKey) {
+      const replacement = [...container.querySelectorAll("[data-channel-action]")].find((element) => element.dataset.channelAction === focusKey);
+      (replacement || content).focus({ preventScroll: true });
+    }
   }
 
   async function updateChannels() {
@@ -312,7 +337,8 @@
   async function refreshStatus() {
     if (refreshInProgress) return;
     refreshInProgress = true;
-    $("refresh-status").disabled = true;
+    $("refresh-status").setAttribute("aria-disabled", "true");
+    $("refresh-status").setAttribute("aria-busy", "true");
     const results = await Promise.allSettled([api("/api/status"), updateChannels(), api("/api/metadata/status")]);
     const errors = [];
     if (results[0].status === "fulfilled") renderHealth(results[0].value);
@@ -335,7 +361,8 @@
     $("app-message").className = "notice error";
     $("channels-results").setAttribute("aria-busy", "false");
     $("health-results").setAttribute("aria-busy", "false");
-    $("refresh-status").disabled = false;
+    $("refresh-status").removeAttribute("aria-disabled");
+    $("refresh-status").setAttribute("aria-busy", "false");
     refreshInProgress = false;
   }
 
@@ -372,7 +399,7 @@
         state.loaded = true;
         result.replaceChildren(content);
         result.classList.toggle("stale", state.dirty);
-        message(prefix + "-message", state.dirty ? "Filters changed. Submit the search to update these results." : "Loaded " + clock.format(new Date()) + ". Results do not update automatically.");
+        message(prefix + "-message", state.dirty ? "Filters changed. Submit the search to update these results." : "Loaded " + clock.format(new Date()) + ". Results do not update automatically.", state.dirty ? "warning" : "");
       } catch (error) {
         if (generation !== state.generation) return;
         if (!state.loaded) result.replaceChildren(empty("Results unavailable. Retry the search."));
@@ -400,7 +427,7 @@
         result.replaceChildren(); result.setAttribute("aria-busy", "false"); result.classList.remove("stale");
         message(prefix + "-message", ""); controls();
       },
-      markStale() { if (state.query) { state.dirty = true; result.classList.add("stale"); message(prefix + "-message", "Filters changed. Submit the search to update these results."); controls(); } },
+      markStale() { if (state.query) { state.dirty = true; result.classList.add("stale"); message(prefix + "-message", "Filters changed. Submit the search to update these results.", "warning"); controls(); } },
     };
   }
 
