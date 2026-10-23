@@ -21,6 +21,8 @@ veylurk-irc-probe --channel firstchannel --channel secondchannel --window 30 --t
 
 The probe requests the membership capability, registers a generated `justinfan` guest using the public guest convention, joins the requested rooms, and handles both IRC and WebSocket keepalives. It never sends a chat message. Anonymous guest access is an experimentally verified convention, not a guaranteed Twitch API contract.
 
+Each outgoing IRC command uses its own WebSocket text message. Registration sends CAP, PASS, then NICK separately; combining those commands in one message caused Twitch to return CAP NAK during a bounded protocol check. Incoming server messages can still contain multiple IRC lines. The probe distinguishes an explicit CAP NAK from an unexpected capability response using fixed error text without logging the server payload.
+
 `--window` accepts 0–300 seconds and begins once every requested channel has supplied its first NAMES terminator. `--timeout` accepts 15–600 seconds and bounds the whole run, including shutdown. Up to four seconds of that budget are reserved for attempting PART and WebSocket Close. The budget must leave enough time for connection, registration, initial terminators, the requested window, and shutdown. A zero-second window requests only the observations available when all initial terminators have arrived.
 
 The probe prints one aggregate JSON line per channel only after the requested observation completes successfully. Account names stay in memory and are never printed or persisted. Its output fields mean:
@@ -47,7 +49,7 @@ cargo test --locked
 cargo build --release --locked --bin veylurk-irc-probe
 ```
 
-The IRC executable uses Rust and the Windows trust store through rustls. It has no browser runtime or Node.js dependency. Unit fixtures cover fragmented input, identity validation, duplicate and reordered messages, delayed membership, per-channel isolation, account bounds, and exclusion of only the probe's own nickname. Local WebSocket fixtures cover protocol keepalives, observation failure, deadlines, and shutdown without contacting Twitch.
+The IRC executable uses Rust and the Windows trust store through rustls. It has no browser runtime or Node.js dependency. Unit fixtures cover fragmented input, identity validation, duplicate and reordered messages, delayed membership, per-channel isolation, account bounds, and exclusion of only the probe's own nickname. Local WebSocket fixtures require exact separate registration messages and cover acknowledgement ordering, rejection before JOIN, protocol keepalives, observation failure, deadlines, and shutdown without contacting Twitch.
 
 The Windows workflow checks formatting, lints, runs offline tests, builds the executables, and publishes `veylurk-irc-probe-windows-x64` as a separate artifact. Its IRC smoke check uses `--help` only. Successful build and offline tests are distinct from a completed live run and from acceptance of the eventual application.
 

@@ -21,8 +21,10 @@ pub enum IrcError {
     Limit,
     #[error("IRC server rejected the anonymous session or channel")]
     Rejected,
-    #[error("IRC membership capability was rejected")]
-    Capability,
+    #[error("IRC server returned CAP NAK")]
+    CapabilityNak,
+    #[error("IRC server sent an unexpected capability response")]
+    CapabilityResponse,
     #[error("IRC connection failed")]
     Connect,
     #[error("IRC transport failed or closed before observation completed")]
@@ -308,14 +310,14 @@ impl Membership {
                     return Err(IrcError::Protocol);
                 }
                 if params[1].eq_ignore_ascii_case("NAK") {
-                    return Err(IrcError::Capability);
+                    return Err(IrcError::CapabilityNak);
                 }
                 if !params[1].eq_ignore_ascii_case("ACK")
                     || !params[2]
                         .split_whitespace()
                         .any(|cap| cap == "twitch.tv/membership")
                 {
-                    return Err(IrcError::Capability);
+                    return Err(IrcError::CapabilityResponse);
                 }
                 self.capability = true;
             }
@@ -468,15 +470,18 @@ async fn observe_endpoint(
     .map_err(|_| IrcError::Timeout)?
     .map_err(|_| IrcError::Connect)?;
     let result = timeout_at(collection_deadline, async {
-        timeout(
-            Duration::from_secs(5),
-            socket.send(Message::text(format!(
-                "CAP REQ :twitch.tv/membership\r\nPASS SCHMOOPIIE\r\nNICK {guest}\r\n"
-            ))),
-        )
-        .await
-        .map_err(|_| IrcError::Timeout)?
-        .map_err(|_| IrcError::Transport)?;
+        // Twitch accepts one client command per WebSocket message, even though
+        // its incoming messages may contain several CRLF-delimited commands.
+        for command in [
+            "CAP REQ :twitch.tv/membership\r\n".to_owned(),
+            "PASS SCHMOOPIIE\r\n".to_owned(),
+            format!("NICK {guest}\r\n"),
+        ] {
+            timeout(Duration::from_secs(5), socket.send(Message::text(command)))
+                .await
+                .map_err(|_| IrcError::Timeout)?
+                .map_err(|_| IrcError::Transport)?;
+        }
         let mut deadline = Instant::now() + Duration::from_secs(10);
         let mut observing = false;
         let mut lines = LineBuffer::default();
@@ -568,6 +573,24 @@ async fn observe_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn expect_registration(
+        server: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        for expected in [
+            "CAP REQ :twitch.tv/membership\r\n",
+            "PASS SCHMOOPIIE\r\n",
+            "NICK justinfan123\r\n",
+        ] {
+            let actual = timeout(Duration::from_secs(2), server.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, Message::text(expected));
+        }
+    }
+
     fn joined() -> Membership {
         let mut state = Membership::new("justinfan123", &["test".into()]).unwrap();
         state
@@ -755,7 +778,15 @@ mod tests {
         );
         assert_eq!(
             joined().line(":tmi.twitch.tv CAP * NAK :twitch.tv/membership"),
-            Err(IrcError::Capability)
+            Err(IrcError::CapabilityNak)
+        );
+        assert_eq!(
+            joined().line(":tmi.twitch.tv CAP * ACK :twitch.tv/commands"),
+            Err(IrcError::CapabilityResponse)
+        );
+        assert_eq!(
+            joined().line(":tmi.twitch.tv CAP * LS :twitch.tv/membership"),
+            Err(IrcError::CapabilityResponse)
         );
         assert_eq!(
             joined().line(":tmi.twitch.tv NOTICE * :Login authentication failed"),
@@ -837,15 +868,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_registration_accepts_separate_ack_and_welcome_in_either_order() {
+        for welcome_first in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server_task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+                expect_registration(&mut server).await;
+                let welcome = ":tmi.twitch.tv 001 justinfan123 :Welcome\r\n";
+                let ack = ":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n";
+                let messages = if welcome_first {
+                    [welcome, ack]
+                } else {
+                    [ack, welcome]
+                };
+                server.send(Message::text(messages[0])).await.unwrap();
+                // A single prerequisite must not trigger JOIN.
+                assert!(timeout(Duration::from_millis(50), server.next())
+                    .await
+                    .is_err());
+                server.send(Message::text(messages[1])).await.unwrap();
+                assert_eq!(
+                    server.next().await.unwrap().unwrap(),
+                    Message::text("JOIN #test\r\n")
+                );
+                server
+                    .send(Message::text(
+                        ":tmi.twitch.tv 366 justinfan123 #test :End\r\n",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    server.next().await.unwrap().unwrap(),
+                    Message::text("PART #test\r\n")
+                );
+                assert!(matches!(
+                    server.next().await.unwrap().unwrap(),
+                    Message::Close(_)
+                ));
+            });
+            let result = observe_endpoint(
+                &["test".into()],
+                Duration::ZERO,
+                Duration::from_secs(5),
+                "justinfan123",
+                &endpoint,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result[0].observed_accounts_at_end, 0);
+            timeout(Duration::from_secs(2), server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_cap_nak_closes_without_joining_or_echoing_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+            expect_registration(&mut server).await;
+            server
+                .send(Message::text(
+                    ":tmi.twitch.tv CAP * NAK :untrusted_server_payload\r\n",
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                server.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let error = observe_endpoint(
+            &["test".into()],
+            Duration::ZERO,
+            Duration::from_secs(5),
+            "justinfan123",
+            &endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, IrcError::CapabilityNak);
+        assert_eq!(error.to_string(), "IRC server returned CAP NAK");
+        timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn offline_transport_handles_both_ping_types_and_graceful_part() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let registration = server.next().await.unwrap().unwrap().into_text().unwrap();
-            assert!(registration.contains("NICK justinfan123\r\n"));
-            assert!(!registration.contains("PRIVMSG"));
+            expect_registration(&mut server).await;
             server.send(Message::text(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 justinfan123 :Welcome\r\n")).await.unwrap();
             assert_eq!(
                 server.next().await.unwrap().unwrap().into_text().unwrap(),
@@ -904,17 +1027,17 @@ mod tests {
             let server_task = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let _ = server.next().await;
+                expect_registration(&mut server).await;
                 if disconnect {
                     server.close(None).await.unwrap();
                 } else {
-                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
                 }
             });
             let result = observe_endpoint(
                 &["test".into()],
                 Duration::from_millis(10),
-                Duration::from_millis(80),
+                Duration::from_millis(500),
                 "justinfan123",
                 &endpoint,
             )
@@ -937,7 +1060,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = server.next().await;
+            expect_registration(&mut server).await;
             server.send(Message::text(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 justinfan123 :Welcome\r\n")).await.unwrap();
             assert_eq!(
                 server.next().await.unwrap().unwrap().into_text().unwrap(),
@@ -975,7 +1098,7 @@ mod tests {
             let server_task = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let _ = server.next().await;
+                expect_registration(&mut server).await;
                 server.send(Message::text(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 justinfan123 :Welcome\r\n")).await.unwrap();
                 let _ = server.next().await;
                 server.send(Message::text(":tmi.twitch.tv 353 justinfan123 = #test :alice\r\n:tmi.twitch.tv 366 justinfan123 #test :End\r\n")).await.unwrap();
