@@ -3,7 +3,7 @@ name = "veylurk-probe"
 version = "0.1.0"
 edition = "2021"
 license = "Unlicense"
-description = "Bounded Twitch community-sample transport probe"
+description = "Bounded Twitch chat-presence transport probes"
 
 [[bin]]
 name = "veylurk-probe"
@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "veylurk-browser-probe"
 path = "src/bin/browser_probe.rs"
 
+[[bin]]
+name = "veylurk-irc-probe"
+path = "src/bin/irc_probe.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -20,6 +24,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects"] }
 

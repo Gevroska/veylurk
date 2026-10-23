@@ -1,52 +1,60 @@
 # Veylurk
 
-Veylurk is planned as a lightweight local Rust service for Twitch chat-presence observations. The intended product will target Windows, retain evidence in SQLite, and provide an English localhost interface for searching by channel, broadcast, or observed account.
+Veylurk is being developed as a lightweight Windows application in Rust for observing Twitch chat presence. The intended application will retain evidence in SQLite and provide an English localhost interface for searching by channel, broadcast, or observed account.
 
-This repository currently contains the Stage 2 direct transport probe and the **Stage 3 browser-assisted proof of concept**. Neither binary is the Veylurk application; they do not store history or provide a web interface.
+The current implementation is a **bounded, browser-free IRC prototype** named `veylurk-irc-probe`. It uses one anonymous secure WebSocket connection for up to three channels. It needs no browser, extension, Twitch login, or user token. It does not yet provide continuous monitoring, stored history, broadcast identification, or a user interface.
 
-## Current finding
+## Current evidence
 
-Twitch's normal logged-out web interface exposed changing samples of chat-connected accounts for a tested third-party live channel. A standalone anonymous HTTP request using Twitch's public web client identifier reached Twitch, but Twitch returned `IntegrityCheckFailed` for `channel.chatters` and requested an integrity challenge. The probe stops there. It does not copy browser credentials, obtain an integrity token, solve a challenge, or claim that sampled accounts are video viewers.
+A separate, bounded .NET protocol experiment established that anonymous IRC could return nonself account observations on two tested third-party channels. One room initially returned only the probe's guest account, then delivered nonself JOIN messages. That sequence is why an initial zero count is treated as incomplete evidence rather than an empty room. This protocol experiment is separate from validation of the Rust executable.
 
-This leaves the browser UI path feasible for experimentation while the preferred lightweight standalone transport is currently blocked. It does not establish a safe collection cadence or a complete population model.
+The earlier HTTP and browser CommunityTab experiments encountered `IntegrityCheckFailed`. The IRC prototype uses a different Twitch interface and does not request, obtain, or replay an integrity token.
 
-The Stage 3 probe supervises a pinned Playwright helper and its matched Chromium build. It creates up to three ordinary popout-chat pages in a fresh context, reopens the public viewer panel for each bounded sample, and reads rendered DOM rows. If Twitch's exact known "Cookies and Advertising Choices" banner appears with its Accept, Customize, and Reject controls, the probe chooses Reject before continuing. It observes only the page's own matching viewer-list response in memory to identify an integrity, authentication, or rate-limit denial and stops promptly; it does not replay requests or retain response content. It does not use the user's browser profile, copy cookies or tokens, solve challenges, or claim that panel samples are independent. Any explicit challenge stops the run. This migration has not established that Twitch will expose rows in a real run.
+Twitch documents that IRC messages can be duplicated or reordered. Its membership documentation also states that JOIN/PART messages are unavailable when a chat room contains more than 1,000 users. That threshold concerns chat membership, not the video's displayed audience. These limitations prevent a completeness guarantee. See [Twitch IRC concepts](https://dev.twitch.tv/docs/chat/irc/#parsing-messages) and the [PART reference](https://dev.twitch.tv/docs/chat/irc/#part-command).
 
-## Probe behavior
-
-The CLI is constrained to 1–20 samples, an interval of at least 15 seconds, at most 10 distinct sequential channels, a global time budget, a 15-second request cap, and a 2 MiB response cap. It retries only transport failures, at most twice, and stops on authorization, rate limits, integrity challenges, channel mismatch, and schema failures.
-
-It prints aggregate JSON Lines only: counts, overlap, union size, latency, and a one-way fingerprint. Account names remain in memory only long enough to calculate those metrics and are never printed or persisted. A nonzero exit means the requested experiment did not complete.
+## Running the IRC prototype
 
 ```text
-veylurk-probe --channel ouaiseddy --samples 1 --timeout 30
+veylurk-irc-probe --channel examplechannel --window 30 --timeout 60
+veylurk-irc-probe --channel firstchannel --channel secondchannel --window 30 --timeout 60
 ```
 
-Use `veylurk-probe --help` for all options. Absence of stream metadata is treated as unknown, not proof that a channel is offline. The persisted query and undocumented schema can change without notice.
+The probe requests the membership capability, registers a generated `justinfan` guest using the public guest convention, joins the requested rooms, and handles both IRC and WebSocket keepalives. It never sends a chat message. Anonymous guest access is an experimentally verified convention, not a guaranteed Twitch API contract.
 
-```text
-veylurk-browser-probe --channel parolesdhonneur_ --samples 3 --interval 15 --timeout 120
-```
+`--window` accepts 0–300 seconds and begins once every requested channel has supplied its first NAMES terminator. `--timeout` accepts 15–600 seconds and bounds the whole run, including shutdown. Up to four seconds of that budget are reserved for attempting PART and WebSocket Close. The budget must leave enough time for connection, registration, initial terminators, the requested window, and shutdown. A zero-second window requests only the observations available when all initial terminators have arrived.
 
-The browser probe prints aggregate counts, overlap, cumulative discovery, and one-way fingerprints. Usernames stay in memory. Its three-tab cap is an experiment boundary and provides no evidence for dozens-channel scale. The preflight runtime budget is checked between operations; an in-flight browser protocol operation has a separate 25-second I/O cap.
+The probe prints one aggregate JSON line per channel only after the requested observation completes successfully. Account names stay in memory and are never printed or persisted. Its output fields mean:
 
-For local failure diagnosis, `--failure-screenshot <path.png>` optionally saves the current public browser page when DOM collection fails. The screenshot is never uploaded, but it can contain public page or chat text and should be handled accordingly. The measurement wrapper accepts the same path through `-FailureScreenshot`.
+| Field | Meaning |
+| --- | --- |
+| `initial_observed_accounts` | Unique nonself accounts observed by the first NAMES terminator for this channel. Later NAMES messages can add observations. |
+| `observed_accounts_at_end` | Size of the in-memory observed set after applying the membership messages received during this run. This is not a verified current population. |
+| `nonself_join_events` / `nonself_part_events` | Received nonself JOIN/PART message counts across bootstrap and the observation window. These can include duplicates and delayed roster delivery, so they are not counts of unique arrivals or departures. |
+| `names_terminator_received` | A protocol terminator arrived. This establishes neither complete membership nor an empty room. |
+| `membership_window_seconds` | Requested observation duration after every channel's first terminator. |
+| `evidence_scope` | The limitations that apply to every observation. |
 
-Playwright uses a fresh browser context and its own temporary browser data. The Rust supervisor contains the Node helper and Chromium descendants in a Windows kill-on-close Job, then requests graceful shutdown. It never uses the user's existing browser profile. Failure output contains only fixed reason and phase codes, allowlisted error classes, bounded counts, and sanitized network error codes.
+Only the probe's own guest nickname is excluded. Other guest accounts are observations too. Valid duplicate welcome, NAMES, and terminator messages are tolerated; duplicate terminators do not restart the window. A PART prevents a delayed NAMES response from restoring that account unless a subsequent JOIN is received. The server's ordering and delivery limitations still apply.
 
-## Build and test
+Channel identities, server prefixes, account prefixes, line framing, UTF-8, and capability acknowledgement are checked. The experiment caps each room's observed accounts and remembered departures at 10,000 entries each, IRC lines at 64 KiB, and buffered data and WebSocket messages at 128 KiB. Connection, registration, initial terminators, and individual writes have additional time limits. Rejections, reconnect requests, malformed data, exceeded bounds, a self PART, or a disconnect during collection fail the run without emitting a successful observation. There is no automatic reconnect or retry loop.
 
-Stage 3 requires Node.js 20 or later, Playwright 1.62.1, and the matching full Chromium build. The Windows release artifact bundles these beside the Rust executable; it does not download a browser at runtime. Source builds can run `npm ci` from `browser-helper`, then install matching Chromium with `node node_modules/playwright/cli.js install chromium --no-shell` while `PLAYWRIGHT_BROWSERS_PATH` points to the desired local browser directory. Set `--node-path` and `--helper-path` when using a non-bundled layout. The Stage 2 direct probe needs none of these browser components.
+## Build and offline checks
 
 ```text
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-cargo build --release --locked
+cargo build --release --locked --bin veylurk-irc-probe
 ```
 
-GitHub Actions runs these checks plus offline HTML and native-response helper fixtures on Windows, preserves the Stage 2 artifact, and packages the Stage 3 executable with Node.js, Playwright, matching Chromium, and third-party notices. `scripts/measure-browser-probe.ps1` samples the Rust and browser process tree, reports simultaneous memory peaks and aggregate CPU, and checks observed process identities for survivors after exit. Polling can miss short-lived processes.
+The IRC executable uses Rust and the Windows trust store through rustls. It has no browser runtime or Node.js dependency. Unit fixtures cover fragmented input, identity validation, duplicate and reordered messages, delayed membership, per-channel isolation, account bounds, and exclusion of only the probe's own nickname. Local WebSocket fixtures cover protocol keepalives, observation failure, deadlines, and shutdown without contacting Twitch.
 
-Veylurk can only describe an account as **observed in a Twitch chat-connected sample**. It cannot establish video watch time, exact arrival or departure, anonymous viewers, or complete coverage.
+The Windows workflow checks formatting, lints, runs offline tests, builds the executables, and publishes `veylurk-irc-probe-windows-x64` as a separate artifact. Its IRC smoke check uses `--help` only. Successful build and offline tests are distinct from a completed live run and from acceptance of the eventual application.
+
+## Earlier experiments
+
+`veylurk-probe` and `veylurk-browser-probe` remain in the repository as earlier transport experiments. They are not needed to run the IRC executable. The browser experiment uses the separate `browser-helper` package and its pinned Playwright/Chromium runtime; its historical bundle remains in the Windows workflow. No browser companion or extension is part of the IRC prototype.
+
+Veylurk can describe an account only as **observed through Twitch chat membership**. It cannot establish video watch time, exact arrival or departure, anonymous video viewers, complete coverage, or current presence from silence.
 
 Released under the [Unlicense](LICENSE).

@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
 pub mod browser;
+pub mod irc;
 
 pub const COMMUNITY_TAB_HASH: &str =
     "92168b4434c8f4d32df14510052131c3544b929723d5f8b69bb96c96207e483e";
