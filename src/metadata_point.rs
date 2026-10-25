@@ -225,7 +225,7 @@ fn lookup(
             .as_ref()
             .map_or(context.at.as_str(), |next| next.checked_at.as_str());
         if milliseconds_between(&check.checked_at, next_at)
-            .is_none_or(|milliseconds| milliseconds > 150_000 || milliseconds < 0)
+            .is_none_or(|milliseconds| !(0..=150_000).contains(&milliseconds))
         {
             context.reason = Some("polling_gap");
             return Ok(context);
