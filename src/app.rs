@@ -45,7 +45,7 @@ impl From<StoreError> for ApiError {
             StoreError::Invalid => Self(
                 StatusCode::BAD_REQUEST,
                 "invalid_input",
-                "Use a valid account or channel login and bounded query.",
+                "Use valid logins, RFC3339 dates, an ordered range, and a bounded query. Point-in-time queries cannot be in the future.",
             ),
             StoreError::ChannelLimit => Self(
                 StatusCode::BAD_REQUEST,
@@ -105,6 +105,8 @@ pub fn router(state: AppState, additional: Router) -> Router {
         .route("/api/channels/{login}/history", get(history))
         .route("/api/search", get(search))
         .route("/api/relationships", get(relationships))
+        .route("/api/history", get(visits))
+        .route("/api/presence", get(presence))
         .with_state(state.clone())
         .merge(additional)
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, "not_found", "Endpoint not found.") })
@@ -182,6 +184,13 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
             value["session_count"] = json!(stats.session_count);
             value["storage_bytes"] = json!(stats.storage_bytes);
             value["storage_health"] = json!("available");
+            let available = crate::runtime::disk_available(state.store.path());
+            value["disk_available_bytes"] = json!(available);
+            value["storage_warning"] = json!(available
+                .filter(|bytes| *bytes < 512 * 1024 * 1024)
+                .map(|_| {
+                    "Low disk space; retained history may stop growing when the disk is full."
+                }));
         }
         Err(_) => {
             value["storage_health"] = json!("unavailable");
@@ -289,6 +298,10 @@ struct Filters {
     before: Option<i64>,
     limit: Option<usize>,
     offset: Option<usize>,
+    from: Option<String>,
+    to: Option<String>,
+    at: Option<String>,
+    broadcast_id: Option<i64>,
 }
 fn query_filters(query: Result<Query<Filters>, QueryRejection>) -> Result<Filters, ApiError> {
     query.map(|v| v.0).map_err(|_| {
@@ -300,11 +313,18 @@ fn query_filters(query: Result<Query<Filters>, QueryRejection>) -> Result<Filter
     })
 }
 impl Filters {
+    fn range(&self) -> Result<crate::history::TimeRange, ApiError> {
+        Ok(crate::history::TimeRange::parse(
+            self.from.clone(),
+            self.to.clone(),
+        )?)
+    }
     fn limit(&self) -> Result<usize, ApiError> {
         let limit = self.limit.unwrap_or(100);
         if !(1..=500).contains(&limit)
             || self.before.is_some_and(|v| v < 1)
             || self.offset.is_some_and(|v| v > 1_000_000)
+            || self.broadcast_id.is_some_and(|v| v <= 0)
         {
             return Err(StoreError::Invalid.into());
         }
@@ -317,9 +337,16 @@ async fn search(
 ) -> Result<Json<Value>, ApiError> {
     let query = query_filters(query)?;
     let limit = query.limit()?;
+    let range = query.range()?;
     let mut rows = state
         .store
-        .search(query.account, query.channel, query.before, limit + 1)
+        .search_range(
+            query.account,
+            query.channel,
+            query.before,
+            limit + 1,
+            range.clone(),
+        )
         .await?;
     let more = rows.len() > limit;
     rows.truncate(limit);
@@ -328,7 +355,9 @@ async fn search(
     } else {
         None
     };
-    Ok(Json(json!({"observations":rows,"next_before":next})))
+    Ok(Json(
+        json!({"observations":rows,"next_before":next,"range":range,"time_scope":"Inclusive from, exclusive to; received timestamps, not event occurrence times."}),
+    ))
 }
 async fn history(
     State(state): State<AppState>,
@@ -337,7 +366,11 @@ async fn history(
 ) -> Result<Json<Value>, ApiError> {
     let query = query_filters(query)?;
     let limit = query.limit()?;
-    let mut rows = state.store.history(login, query.before, limit + 1).await?;
+    let range = query.range()?;
+    let mut rows = state
+        .store
+        .history_range(login, query.before, limit + 1, range.clone())
+        .await?;
     let more = rows.len() > limit;
     rows.truncate(limit);
     let next = if more {
@@ -345,7 +378,9 @@ async fn history(
     } else {
         None
     };
-    Ok(Json(json!({"sessions":rows,"next_before":next})))
+    Ok(Json(
+        json!({"sessions":rows,"next_before":next,"range":range}),
+    ))
 }
 async fn relationships(
     State(state): State<AppState>,
@@ -353,15 +388,101 @@ async fn relationships(
 ) -> Result<Json<Value>, ApiError> {
     let query = query_filters(query)?;
     let limit = query.limit()?;
+    let range = query.range()?;
     let offset = query.offset.unwrap_or(0);
     let mut rows = state
         .store
-        .relationships(query.account, query.channel, offset, limit + 1)
+        .relationships_range(
+            query.account,
+            query.channel,
+            offset,
+            limit + 1,
+            range.clone(),
+        )
         .await?;
     let more = rows.len() > limit;
     rows.truncate(limit);
     Ok(Json(
-        json!({"relationships":rows,"has_more":more,"next_offset":if more {Some(offset+limit)} else {None}}),
+        json!({"relationships":rows,"has_more":more,"next_offset":if more {Some(offset+limit)} else {None},"range":range}),
+    ))
+}
+
+async fn visits(
+    State(state): State<AppState>,
+    query: Result<Query<Filters>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let query = query_filters(query)?;
+    let limit = query.limit()?;
+    let mut range = query.range()?;
+    let mut channel = query.channel;
+    if let Some(id) = query.broadcast_id {
+        use rusqlite::OptionalExtension;
+        let broadcast=state.store.call(move|conn|Ok(conn.query_row("SELECT channel,started_at,last_live_at FROM metadata_broadcasts WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?)).await?.ok_or(StoreError::NotFound)?;
+        if channel
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case(&broadcast.0))
+        {
+            return Err(StoreError::Invalid.into());
+        }
+        channel = Some(broadcast.0);
+        if range.from.as_ref().is_none_or(|from| from < &broadcast.1) {
+            range.from = Some(broadcast.1);
+        }
+        // The inclusive last live receipt is represented by the following millisecond.
+        let end = chrono::DateTime::parse_from_rfc3339(&broadcast.2)
+            .map_err(|_| StoreError::Invalid)?
+            + chrono::Duration::milliseconds(1);
+        let end = end.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        if range.to.as_ref().is_none_or(|to| to > &end) {
+            range.to = Some(end);
+        }
+    }
+    let offset = query.offset.unwrap_or(0);
+    let empty = matches!((&range.from,&range.to),(Some(from),Some(to)) if from>=to);
+    let mut rows = if empty {
+        Vec::new()
+    } else {
+        state
+            .store
+            .visits(crate::history::VisitQuery {
+                account: query.account,
+                channel,
+                range: range.clone(),
+                before: query.before,
+                offset,
+                limit: limit + 1,
+            })
+            .await?
+    };
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let next = if more {
+        rows.last().map(|r| r.id)
+    } else {
+        None
+    };
+    Ok(Json(
+        json!({"visits":rows,"has_more":more,"next_before":next,"next_offset":if more{Some(offset+limit)}else{None},"model_version":crate::history::MODEL_VERSION,"explanation":crate::history::EXPLANATION,"range":range}),
+    ))
+}
+
+async fn presence(
+    State(state): State<AppState>,
+    query: Result<Query<Filters>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let query = query_filters(query)?;
+    let limit = query.limit()?;
+    let offset = query.offset.unwrap_or(0);
+    let channel = query.channel.ok_or(StoreError::Invalid)?;
+    let at = crate::history::utc(query.at.as_deref().ok_or(StoreError::Invalid)?)?;
+    let mut rows = state
+        .store
+        .presence(channel, query.account, at.clone(), offset, limit + 1)
+        .await?;
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    Ok(Json(
+        json!({"accounts":rows,"at":at,"has_more":more,"next_offset":if more{Some(offset+limit)}else{None},"model_version":crate::history::MODEL_VERSION,"explanation":crate::history::PRESENCE_EXPLANATION}),
     ))
 }
 
@@ -472,5 +593,134 @@ mod tests {
             app.oneshot(request).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test]
+    async fn time_apis_normalize_ranges_and_reject_invalid_dates_and_future_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("ranges.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store.begin_session(vec!["example".into()]).await.unwrap();
+        store
+            .append(
+                session,
+                [
+                    ("alice", "join", "00:00:00"),
+                    ("alice", "part", "00:00:30"),
+                    ("bob", "join", "00:01:00"),
+                ]
+                .into_iter()
+                .map(|(account, kind, time)| crate::store::NewObservation {
+                    channel: "example".into(),
+                    account: Some(account.into()),
+                    kind: kind.into(),
+                    received_at: format!("2026-01-01T{time}Z"),
+                })
+                .collect(),
+            )
+            .await
+            .unwrap();
+        let (channels, _) = watch::channel(Vec::new());
+        let app = router(
+            AppState {
+                status: crate::collector::status(&store),
+                store,
+                channels,
+                port: 8794,
+                configuration: Arc::new(Mutex::new(())),
+            },
+            Router::new(),
+        );
+        let query = "from=2026-01-01T02%3A00%3A00%2B02%3A00&to=2026-01-01T00%3A01%3A00Z";
+        for (path, field, count) in [
+            (format!("/api/search?{query}"), "observations", 2),
+            (format!("/api/relationships?{query}"), "relationships", 1),
+            (format!("/api/history?{query}"), "visits", 1),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:8794")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body[field].as_array().unwrap().len(), count);
+        }
+        for path in [
+            "/api/search?from=not-a-date",
+            "/api/history?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+            "/api/presence?channel=example&at=2030-01-01T00:00:00Z",
+        ] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:8794")
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_visit_ranges_return_empty_for_disjoint_windows_despite_a_long_visit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("intersection.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store.begin_session(vec!["example".into()]).await.unwrap();
+        store
+            .append(
+                session,
+                ["2026-01-01T00:00:00Z", "2026-01-04T00:00:00Z"]
+                    .into_iter()
+                    .map(|at| crate::store::NewObservation {
+                        channel: "example".into(),
+                        account: Some("alice".into()),
+                        kind: "join".into(),
+                        received_at: at.into(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let _metadata = crate::metadata::initialize(store.clone()).await.unwrap();
+        store.call(|conn|{conn.execute("INSERT INTO metadata_broadcasts(stream_id,channel,title,game_name,language,started_at,first_seen_at,last_live_at) VALUES('1','example','Title','Game','en','2026-01-01T10:00:00.000Z','2026-01-01T10:00:00.000Z','2026-01-01T11:00:00.000Z')",[])?;Ok(())}).await.unwrap();
+        let (channels, _) = watch::channel(Vec::new());
+        let state = AppState {
+            status: crate::collector::status(&store),
+            store,
+            channels,
+            port: 8794,
+            configuration: Arc::new(Mutex::new(())),
+        };
+        for (from, to) in [
+            ("2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+            ("2025-12-30T00:00:00Z", "2026-01-01T09:00:00Z"),
+        ] {
+            let Json(result) = visits(
+                State(state.clone()),
+                Ok(Query(Filters {
+                    broadcast_id: Some(1),
+                    from: Some(from.into()),
+                    to: Some(to.into()),
+                    ..Filters::default()
+                })),
+            )
+            .await
+            .unwrap();
+            assert!(result["visits"].as_array().unwrap().is_empty());
+            assert_eq!(result["has_more"], false);
+        }
     }
 }

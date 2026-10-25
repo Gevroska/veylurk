@@ -53,7 +53,7 @@ function deferred() { let resolve; const promise = new Promise((done) => { resol
 function event(id, account = "sample_account") { return { id, session_id: 1, account, channel: "sample_channel", kind: "join", received_at: received, source: "twitch_irc" }; }
 
 function createApp(override, origin = "http://127.0.0.1:3131") {
-  const elements = new Map([...html.matchAll(/<([a-z]+)\b[^>]*\bid="([^"]+)"/g)].map((match) => [match[2], new Element(match[1])]));
+  const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"/g)].map((match) => [match[2], new Element(match[1])]));
   elements.get("search-limit").value = "50";
   const navigation = ["channels", "history", "broadcasts", "health"].map((section) => {
     const element = new Element("a"); element.dataset.section = section; return element;
@@ -65,6 +65,7 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     activeElement: null,
     getElementById(id) { assert.ok(elements.has(id), `Unknown HTML id: ${id}`); return elements.get(id); },
     createElement(tag) { const element = new Element(tag); element.ownerDocument = document; return element; },
+    createElementNS(_namespace, tag) { return this.createElement(tag); },
     querySelectorAll(selector) { assert.equal(selector, "[data-section]"); return navigation; },
     addEventListener() {},
   };
@@ -73,6 +74,10 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     if (target.pathname === "/api/status") return { state: "collecting", started_at: received, storage_path: "local.sqlite", enabled_channels: 1, connected_channels: 1, observation_count: 2, session_count: 1, storage_bytes: 1024 };
     if (target.pathname === "/api/channels") return { channels: [{ login: "sample_channel", tracked: true, enabled: true, active_session_id: 1, last_observed_at: received }] };
     if (target.pathname === "/api/metadata/status") return { configured: false, state: "unavailable", channels: [] };
+    if (target.pathname === "/api/settings") return { collection_mode: "all", unknown_policy: "collect" };
+    if (target.pathname === "/api/history") return { visits: [], has_more: false, next_offset: null };
+    if (target.pathname === "/api/presence" || target.pathname.endsWith("/accounts")) return { accounts: [], has_more: false, next_offset: null };
+    if (target.pathname.endsWith("/metadata/history")) return { observations: [], has_more: false, next_offset: null };
     if (target.pathname === "/api/relationships") return { relationships: [], has_more: false, next_offset: null };
     if (target.pathname.endsWith("/history")) return { sessions: [], next_before: null };
     if (target.pathname === "/api/broadcasts") return { broadcasts: [], next_before: null };
@@ -250,4 +255,180 @@ test("an in-flight channel action keeps keyboard focus and rejects duplicate act
   pending.resolve({ channel: { login: "sample_channel", enabled: false } });
   await request; await settle();
   assert.equal(app.document.activeElement.dataset.channelAction, pause.dataset.channelAction);
+});
+
+test("local time ranges become UTC and invalid ranges never dispatch history requests", async () => {
+  const app = createApp(); await settle();
+  app.get("search-account").value = "sample_account";
+  app.get("search-from").value = "2026-10-23T12:00:00";
+  app.get("search-to").value = "2026-10-23T13:00:00";
+  await app.get("search-form").dispatch("submit"); await settle();
+  for (const pathname of ["/api/search", "/api/relationships", "/api/history"]) {
+    const call = app.calls.find((item) => item.target.pathname === pathname);
+    assert.equal(call.target.searchParams.get("from"), new Date("2026-10-23T12:00:00").toISOString());
+    assert.equal(call.target.searchParams.get("to"), new Date("2026-10-23T13:00:00").toISOString());
+  }
+  const initialCount = app.calls.length;
+  app.get("search-to").value = "2026-10-23T11:59:00";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(app.calls.length, initialCount);
+  assert.match(app.get("search-message").textContent, /end time must be later/);
+  app.get("search-to").value = "2026-02-30T12:00:00";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(app.calls.length, initialCount);
+  assert.match(app.get("search-message").textContent, /does not exist/);
+});
+
+test("separate visits retain positive receipt bounds, gap reasons, and uncertain timelines", async () => {
+  const visit = (id, end_basis) => ({ id, account: "sample_account", channel: "sample_channel", session_id: id, first_observed_at: received, last_observed_at: received, start_basis: "names", end_basis, positive_observation_count: 2, uncertain: true });
+  const app = createApp((target) => target.pathname === "/api/history" ? { visits: [visit(1, "coverage_gap"), visit(2, "open")], has_more: false } : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const result = app.get("visits-results");
+  assert.equal(descendants(result).filter((item) => item.tagName === "SVG").length, 2);
+  assert.match(result.textContent, /2 separate supported visits/);
+  assert.match(result.textContent, /Coverage gap/);
+  assert.match(result.textContent, /First positive receipt/);
+  assert.match(result.textContent, /Last positive receipt/);
+  assert.match(result.textContent, /not measured attendance/);
+  assert.equal(descendants(result).filter((item) => item.tagName === "LINE").every((item) => item.attributes.class === "evidence-span"), true);
+});
+
+test("point-in-time evidence separates observed, inferred, and unknown without asserting absence", async () => {
+  let emptyResponse = false;
+  const app = createApp((target) => target.pathname === "/api/presence" ? { accounts: emptyResponse ? [] : [
+    { account: "observed_account", state: "observed", observed_at: received },
+    { account: "inferred_account", state: "inferred", observed_at: received, explanation: "Earlier receipt within an unclosed visit; uncertain." },
+    { account: "unknown_account", state: "unexpected" },
+  ], has_more: false } : undefined);
+  await settle(); app.get("search-channel").value = "sample_channel";
+  await app.get("search-form").dispatch("submit"); await settle();
+  app.get("presence-at").value = "2026-10-23T12:00:00";
+  await app.get("presence-form").dispatch("submit"); await settle();
+  const call = app.calls.find((item) => item.target.pathname === "/api/presence");
+  assert.equal(call.target.searchParams.get("at"), new Date("2026-10-23T12:00:00").toISOString());
+  assert.match(app.get("presence-results").textContent, /Observed/);
+  assert.match(app.get("presence-results").textContent, /Inferred/);
+  assert.match(app.get("presence-results").textContent, /Unknown/);
+  emptyResponse = true;
+  await app.get("presence-form").dispatch("submit"); await settle();
+  assert.match(app.get("presence-results").textContent, /does not mean the channel was empty/);
+});
+
+test("ambiguous delayed membership observations are not labeled as supported visits", async () => {
+  const app = createApp((target) => target.pathname === "/api/history" ? { visits: [{ id: 4, account: "sample_account", channel: "sample_channel", session_id: 1, first_observed_at: received, last_observed_at: received, start_basis: "uncertain_names", end_basis: "open", positive_observation_count: 1, supported_visit: false, uncertain: true }], next_before: null } : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("visits-results").textContent, /0 separate supported visits/);
+  assert.match(app.get("visits-results").textContent, /1 ambiguous observation segments/);
+  assert.match(app.get("visits-results").textContent, /Observation only — ambiguous/);
+  assert.match(app.get("visits-results").textContent, /no supported visit or continuity inference/);
+});
+
+test("metadata history keeps text literal and viewer samples unconnected with a table alternative", async () => {
+  const hostile = '<svg onload="throw 1">';
+  const app = createApp((target) => target.pathname.endsWith("/metadata/history") ? { observations: [
+    { checked_at: received, state: "live", title: hostile, game_name: "Category A", viewer_count: 40 },
+    { checked_at: "2026-10-23T13:00:00Z", state: "offline", title: null, viewer_count: null },
+    { checked_at: "2026-10-23T14:00:00Z", state: "live", title: "Changed title", game_name: "Category B", viewer_count: 20 },
+  ], has_more: false } : undefined);
+  await settle(); app.get("search-channel").value = "sample_channel";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const result = app.get("metadata-history-results");
+  assert.match(result.textContent, /<svg onload/);
+  assert.match(result.textContent, /Changed title/);
+  assert.match(result.textContent, /Category B/);
+  assert.match(result.textContent, /not connected across gaps/);
+  assert.equal(descendants(result).filter((item) => item.tagName === "CIRCLE").length, 2);
+  assert.equal(descendants(result).some((item) => ["POLYLINE", "PATH"].includes(item.tagName)), false);
+  assert.ok(descendants(result).some((item) => item.tagName === "TABLE"));
+});
+
+test("broadcast detail loads account summaries and separate visits within selected UTC bounds", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/broadcasts") return { broadcasts: [{ id: 9, channel: "sample_channel", title: "A title", started_at: received, last_live_at: received }], next_before: null };
+    if (target.pathname === "/api/broadcasts/9/accounts") return { accounts: [{ account: "sample_account", first_observed_at: received, last_observed_at: received, visit_count: 3, positive_observation_count: 8 }, { account: "inferred_account", state: "inferred", association_basis: "prior_connected_inference", first_observed_at: null, last_observed_at: null, prior_observed_at: "2026-10-23T09:00:00Z", positive_observation_count: 0, visit_count: 1 }], summary: { account_count: 2, observed_account_count: 1, inferred_only_account_count: 1, visit_count: 4, positive_observation_count: 8 }, has_more: false };
+  });
+  await settle(); app.get("broadcasts-from").value = "2026-10-23T10:00:00";
+  app.get("broadcasts-to").value = "2026-10-23T18:00:00";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  const open = descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events");
+  await open.dispatch("click"); await settle();
+  assert.match(app.get("broadcast-accounts-results").textContent, /sample_account/);
+  assert.match(app.get("broadcast-accounts-results").textContent, /Supported visits/);
+  assert.match(app.get("broadcast-accounts-results").textContent, /Inferred — uncertain/);
+  assert.match(app.get("broadcast-accounts-results").textContent, /No positive receipt in window/);
+  assert.match(app.get("broadcast-accounts-results").textContent, /Supporting earlier receipt/);
+  assert.match(app.get("broadcast-accounts-results").textContent, /Inferred-only accounts/);
+  const history = app.calls.find((item) => item.target.pathname === "/api/history");
+  assert.equal(history.target.searchParams.get("broadcast_id"), "9");
+  for (const call of app.calls.filter((item) => item.target.pathname.startsWith("/api/broadcasts/9/") || item.target.pathname === "/api/history")) {
+    assert.equal(call.target.searchParams.get("from"), new Date("2026-10-23T10:00:00").toISOString());
+    assert.equal(call.target.searchParams.get("to"), new Date("2026-10-23T18:00:00").toISOString());
+  }
+});
+
+test("live-only policy preserves an unsaved choice and labels fresh offline versus unknown metadata", async () => {
+  const app = createApp((target, options) => {
+    if (target.pathname === "/api/settings") return { collection_mode: options.method === "PATCH" ? JSON.parse(options.body).collection_mode : "live_only" };
+    if (target.pathname === "/api/channels") return { channels: [{ login: "offline_room", enabled: true }, { login: "unknown_room", enabled: true }] };
+    if (target.pathname === "/api/metadata/status") return { configured: true, state: "ready", channels: [{ channel: "offline_room", state: "offline", stale: false, checked_at: received }, { channel: "unknown_room", state: "unknown", stale: true, checked_at: received }] };
+  });
+  await settle();
+  assert.match(app.get("channels-results").textContent, /Paused while offline/);
+  assert.match(app.get("channels-results").textContent, /Unknown: chat observation continues/);
+  assert.match(app.get("channels-results").textContent, /completeness|coverage unknown/);
+  app.get("collection-mode").value = "all";
+  await app.get("collection-mode").dispatch("change");
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.equal(app.get("collection-mode").value, "all");
+  await app.get("settings-form").dispatch("submit"); await settle();
+  const patch = app.calls.find((item) => item.target.pathname === "/api/settings" && item.options.method === "PATCH");
+  assert.deepEqual(JSON.parse(patch.options.body), { collection_mode: "all" });
+  assert.match(app.get("settings-message").textContent, /saved/);
+});
+
+test("disk warning remains visible and shutdown needs explicit confirmation with honest acknowledgement", async () => {
+  let unavailable = false;
+  const app = createApp((target) => {
+    if (target.pathname === "/api/status") return unavailable ? new TypeError("unreachable") : { state: "collecting", disk_available_bytes: 100000, storage_warning: "Low disk space: collection may stop." };
+    if (target.pathname === "/api/shutdown") return { state: "stopping", instance_id: "test-instance" };
+  });
+  await settle();
+  assert.equal(app.get("storage-warning").hidden, false);
+  assert.match(app.get("storage-warning").textContent, /Low disk space/);
+  assert.match(app.get("health-results").textContent, /Available disk space/);
+  await app.get("stop-app").dispatch("click");
+  assert.equal(app.get("stop-confirmation").hidden, false);
+  assert.equal(app.document.activeElement, app.get("confirm-stop"));
+  assert.equal(app.calls.some((item) => item.target.pathname === "/api/shutdown"), false);
+  await app.get("cancel-stop").dispatch("click");
+  assert.equal(app.document.activeElement, app.get("stop-app"));
+  await app.get("stop-app").dispatch("click"); await app.get("confirm-stop").dispatch("click"); await settle();
+  const shutdown = app.calls.filter((item) => item.target.pathname === "/api/shutdown");
+  assert.equal(shutdown.length, 1);
+  assert.deepEqual(JSON.parse(shutdown[0].options.body), {});
+  assert.equal(app.get("connection-status").textContent, "Stopping");
+  assert.match(app.get("stopped-message").textContent, /accepted the stop request/);
+  assert.doesNotMatch(app.get("stopped-message").textContent, /has stopped/);
+  unavailable = true;
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("connection-status").textContent, /unreachable after stop/);
+  unavailable = false;
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.equal(app.get("connection-status").textContent, "Collecting");
+  assert.equal(app.get("stopped-message").hidden, true);
+  assert.equal(app.get("stop-app").disabled, false);
+});
+
+test("per-room health overrides an open session and never equates recent receipts with completeness", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/status") return { state: "membership_unavailable", rooms: [{ channel: "sample_channel", state: "unavailable", last_positive_at: received, last_error: "Room response deadline elapsed", coverage: "unknown" }] };
+  });
+  await settle();
+  assert.match(app.get("channels-results").textContent, /Membership unavailable/);
+  assert.match(app.get("channels-results").textContent, /Room response deadline elapsed/);
+  assert.match(app.get("channels-results").textContent, /Latest positive receipt/);
+  assert.match(app.get("channels-results").textContent, /completeness unknown/);
+  assert.doesNotMatch(app.get("channels-results").textContent, /Session open/);
 });

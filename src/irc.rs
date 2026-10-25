@@ -433,6 +433,8 @@ impl Membership {
 pub enum StreamEvent {
     Connected,
     Observations(Vec<crate::store::NewObservation>),
+    RoomJoining(String),
+    RoomLeft(String),
     RoomReady(String),
     RoomUnavailable(String),
 }
@@ -468,11 +470,56 @@ pub(crate) async fn stream_endpoint(
 async fn stream_configured(
     channels: Vec<String>,
     events: tokio::sync::mpsc::Sender<StreamEvent>,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    stop: tokio::sync::watch::Receiver<bool>,
     endpoint: &str,
     room_timeout: Duration,
 ) -> Result<(), IrcError> {
+    stream_managed(
+        channels,
+        events,
+        stop,
+        endpoint,
+        room_timeout,
+        None,
+        Duration::from_secs(60),
+        Duration::from_secs(6),
+    )
+    .await
+}
+
+pub(crate) async fn stream_dynamic_endpoint(
+    mut channels: tokio::sync::watch::Receiver<Vec<String>>,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    stop: tokio::sync::watch::Receiver<bool>,
+    endpoint: &str,
+) -> Result<(), IrcError> {
+    let initial = channels.borrow_and_update().clone();
+    stream_managed(
+        initial,
+        events,
+        stop,
+        endpoint,
+        Duration::from_secs(30),
+        Some(channels),
+        Duration::from_secs(60),
+        Duration::from_secs(6),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_managed(
+    channels: Vec<String>,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    endpoint: &str,
+    room_timeout: Duration,
+    mut changes: Option<tokio::sync::watch::Receiver<Vec<String>>>,
+    retry_base: Duration,
+    join_interval: Duration,
+) -> Result<(), IrcError> {
     let channels = normalize_channels_with_limit(&channels, 50)?;
+    let mut desired = channels.clone();
     let guest = format!(
         "justinfan{}",
         SystemTime::now()
@@ -504,6 +551,8 @@ async fn stream_configured(
         let mut registered=false;
         let mut names_deadlines=BTreeMap::<String,Instant>::new();
         let mut ready=HashSet::<String>::new();
+        let mut retry_at=BTreeMap::<String,Instant>::new();
+        let mut attempts=BTreeMap::<String,u32>::new();
         let mut buffer=LineBuffer::default();
         let mut last_received=Instant::now();
         let mut heartbeat=tokio::time::interval(Duration::from_millis(100));
@@ -512,6 +561,25 @@ async fn stream_configured(
             if *stop.borrow() { return Ok(()); }
             tokio::select! {
                 _=stop.changed()=>return Ok(()),
+                update=async {match &mut changes {Some(receiver)=>receiver.changed().await,None=>std::future::pending().await}}=> {
+                    if update.is_err() {return Ok(());}
+                    let next=changes.as_mut().expect("configuration receiver").borrow_and_update().clone();
+                    desired=if next.is_empty() {Vec::new()} else {normalize_channels_with_limit(&next,50)?};
+                    let removed=joined.iter().filter(|channel|!desired.contains(channel)).cloned().collect::<Vec<_>>();
+                    if !removed.is_empty() {
+                        let command=format!("PART {}\r\n",removed.iter().map(|channel|format!("#{channel}")).collect::<Vec<_>>().join(","));
+                        timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
+                    }
+                    for channel in removed {
+                        joined.retain(|current|current!=&channel);
+                        names_deadlines.remove(&channel);ready.remove(&channel);state.rooms.remove(&channel);
+                        deliver(&events,StreamEvent::RoomLeft(channel)).await?;
+                    }
+                    retry_at.retain(|channel,_|desired.contains(channel));
+                    attempts.retain(|channel,_|desired.contains(channel));
+                    state.rooms.retain(|channel,_|desired.contains(channel));
+                    for channel in &desired {state.rooms.entry(channel.clone()).or_default();}
+                }
                 _=heartbeat.tick()=> {
                     let now=Instant::now();
                     if !registered && now>=registration_deadline { return Err(IrcError::Timeout); }
@@ -519,16 +587,26 @@ async fn stream_configured(
                     let unavailable=names_deadlines.iter().filter(|(_,deadline)|now>=**deadline).map(|(channel,_)|channel.clone()).collect::<Vec<_>>();
                     for channel in unavailable {
                         names_deadlines.remove(&channel);
-                        deliver(&events,StreamEvent::RoomUnavailable(channel)).await?;
+                        ready.remove(&channel);
+                        deliver(&events,StreamEvent::RoomUnavailable(channel.clone())).await?;
+                        if changes.is_some() {
+                            let command=format!("PART #{channel}\r\n");
+                            timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
+                            joined.retain(|current|current!=&channel);
+                            let count=attempts.entry(channel.clone()).or_default();*count=(*count+1).min(4);
+                            retry_at.insert(channel.clone(),now+retry_base.saturating_mul(1<<(*count-1)));
+                            state.rooms.insert(channel,Room::default());
+                        }
                     }
                     // Ten channels per six seconds remains below the documented 20/10s limit.
-                    if registered && joined.len()<channels.len() && now>=next_join {
-                        let end=(joined.len()+10).min(channels.len());
-                        let batch=&channels[joined.len()..end];
+                    if registered && now>=next_join {
+                        let batch=desired.iter().filter(|channel|!joined.contains(channel)&&retry_at.get(*channel).is_none_or(|at|now>=*at)).take(10).cloned().collect::<Vec<_>>();
+                        if batch.is_empty() {continue;}
                         let command=format!("JOIN {}\r\n",batch.iter().map(|c|format!("#{c}")).collect::<Vec<_>>().join(","));
+                        if changes.is_some() {for channel in &batch {deliver(&events,StreamEvent::RoomJoining(channel.clone())).await?;}}
                         timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
-                        for channel in batch { names_deadlines.insert(channel.clone(),Instant::now()+room_timeout); joined.push(channel.clone()); }
-                        next_join=Instant::now()+Duration::from_secs(6);
+                        for channel in batch { names_deadlines.insert(channel.clone(),Instant::now()+room_timeout); joined.push(channel); }
+                        next_join=Instant::now()+join_interval;
                     }
                 }
                 message=socket.next()=> {
@@ -541,12 +619,32 @@ async fn stream_configured(
                                 let incoming=parse(&line)?;
                                 let room_notice=incoming.command.eq_ignore_ascii_case("NOTICE")&&incoming.params.first().is_some_and(|p|p.starts_with('#'));
                                 let own_part=incoming.command.eq_ignore_ascii_case("PART")&&user(incoming.prefix)?==guest;
+                                // Once a room is removed, late buffered room messages cannot be
+                                // assigned to another room or reopen its closed evidence session.
+                                let incoming_room=match incoming.command.to_ascii_uppercase().as_str() {
+                                    "353"=>incoming.params.get(2),
+                                    "366"=>incoming.params.get(1),
+                                    "JOIN"|"PART"=>incoming.params.first(),
+                                    "NOTICE" if room_notice=>incoming.params.first(),
+                                    _=>None,
+                                }.and_then(|raw|raw.strip_prefix('#')).and_then(login);
+                                if changes.is_some() && incoming_room.as_ref().is_some_and(|room|!joined.contains(room)) {continue;}
                                 if room_notice||own_part {
                                     if room_notice&&!server(incoming.prefix) {return Err(IrcError::Protocol);}
                                     let channel=login(incoming.params.first().and_then(|p|p.strip_prefix('#')).ok_or(IrcError::Protocol)?).ok_or(IrcError::Protocol)?;
                                     if !joined.contains(&channel) {return Err(IrcError::Protocol);}
                                     names_deadlines.remove(&channel);
-                                    deliver(&events,StreamEvent::RoomUnavailable(channel)).await?;
+                                    ready.remove(&channel);
+                                    deliver(&events,StreamEvent::RoomUnavailable(channel.clone())).await?;
+                                    if changes.is_some() {
+                                        if !own_part {
+                                            timeout(Duration::from_secs(5),socket.send(Message::text(format!("PART #{channel}\r\n")))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
+                                        }
+                                        joined.retain(|current|current!=&channel);
+                                        let count=attempts.entry(channel.clone()).or_default();*count=(*count+1).min(4);
+                                        retry_at.insert(channel.clone(),Instant::now()+retry_base.saturating_mul(1<<(*count-1)));
+                                        state.rooms.insert(channel,Room::default());
+                                    }
                                     continue;
                                 }
                                 if let Some(reply)=state.line(&line)? {
@@ -574,6 +672,7 @@ async fn stream_configured(
                                         let channel=login(message.params[1].trim_start_matches('#')).ok_or(IrcError::Protocol)?;
                                         if !joined.contains(&channel) { return Err(IrcError::Protocol); }
                                         names_deadlines.remove(&channel);
+                                        retry_at.remove(&channel);attempts.remove(&channel);
                                         observed.push(crate::store::NewObservation{channel:channel.clone(),account:None,kind:"names_end".into(),received_at:stamp});
                                         if ready.insert(channel.clone()) { deliver(&events,StreamEvent::RoomReady(channel)).await?; }
                                     }
@@ -771,6 +870,112 @@ async fn observe_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dynamic_room_retry_and_configuration_keep_healthy_room_connected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (channels_tx, channels_rx) =
+            tokio::sync::watch::channel(vec!["healthy".into(), "missing".into()]);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await;
+            let _ = socket.next().await;
+            let nick = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let guest = nick.strip_prefix("NICK ").unwrap().trim().to_owned();
+            socket.send(Message::text(format!(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 {guest} :Welcome\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("JOIN #healthy,#missing\r\n")
+            );
+            socket.send(Message::text(format!(":tmi.twitch.tv 366 {guest} #healthy :End\r\n:alice!alice@alice.tmi.twitch.tv JOIN #healthy\r\n:tmi.twitch.tv NOTICE #missing :Unavailable\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #missing\r\n")
+            );
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("JOIN #missing\r\n")
+            );
+            socket.send(Message::text(format!(":tmi.twitch.tv 366 {guest} #missing :End\r\n:bob!bob@bob.tmi.twitch.tv JOIN #healthy\r\n"))).await.unwrap();
+            channels_tx
+                .send(vec!["healthy".into(), "new".into()])
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #missing\r\n")
+            );
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("JOIN #new\r\n")
+            );
+            socket.send(Message::text(format!(":tmi.twitch.tv 353 {guest} = #missing :lateaccount\r\n:tmi.twitch.tv 366 {guest} #new :End\r\nPING :still-healthy\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PONG :still-healthy\r\n")
+            );
+            stop_tx.send(true).unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #healthy,#new\r\n")
+            );
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move {
+            let mut healthy_joins = 0;
+            let mut missing_joins = 0;
+            let mut missing_gaps = 0;
+            let mut healthy_accounts = Vec::new();
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    StreamEvent::RoomJoining(channel) if channel == "healthy" => healthy_joins += 1,
+                    StreamEvent::RoomJoining(channel) if channel == "missing" => missing_joins += 1,
+                    StreamEvent::RoomUnavailable(channel) if channel == "missing" => {
+                        missing_gaps += 1
+                    }
+                    StreamEvent::Observations(events) => {
+                        for event in events {
+                            if let Some(account) = event.account {
+                                assert_ne!(account, "lateaccount");
+                                if event.channel == "healthy" {
+                                    healthy_accounts.push(account);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(healthy_joins, 1);
+            assert_eq!(missing_joins, 2);
+            assert_eq!(missing_gaps, 1);
+            assert_eq!(healthy_accounts, vec!["alice", "bob"]);
+        });
+        timeout(
+            Duration::from_secs(8),
+            stream_managed(
+                vec!["healthy".into(), "missing".into()],
+                sender,
+                stop_rx,
+                &endpoint,
+                Duration::from_secs(2),
+                Some(channels_rx),
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        drain.await.unwrap();
+    }
 
     #[tokio::test(start_paused = true)]
     async fn continuous_delivery_stall_is_bounded_and_explicit() {

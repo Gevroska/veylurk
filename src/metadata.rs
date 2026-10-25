@@ -1,5 +1,8 @@
 //! Optional official broadcast metadata. IRC collection does not depend on this worker.
-use crate::store::{self, Store, StoreError};
+use crate::{
+    history::{TimeRange, MODEL_VERSION},
+    store::{self, Store, StoreError},
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -17,7 +20,7 @@ use std::{
 };
 use tokio::sync::{watch, RwLock};
 
-const ASSOCIATION: &str = "Received in this channel between the reported broadcast start and last confirmed live check; chat evidence, not video watching. Collection gaps remain unknown.";
+const ASSOCIATION: &str = "Positive chat receipts between the reported broadcast start and last confirmed live check are observed evidence. Earlier positive receipts in the same session without a recorded departure or gap are separately labelled uncertain prior-connected inferences. Receipt time is not event occurrence time; no result proves video watching or continuous presence. Collection gaps remain unknown.";
 const MAX_STREAM_PAGES: usize = 4;
 const MAX_CURSOR_BYTES: usize = 4096;
 const SCHEMA: &str = "
@@ -32,10 +35,13 @@ CREATE TABLE IF NOT EXISTS metadata_checks (
  state TEXT NOT NULL, broadcast_id INTEGER REFERENCES metadata_broadcasts(id),
  viewer_count INTEGER, error_code TEXT);
 CREATE INDEX IF NOT EXISTS metadata_checks_channel ON metadata_checks(channel,id);
+CREATE INDEX IF NOT EXISTS metadata_checks_channel_time ON metadata_checks(channel,checked_at,id);
+CREATE INDEX IF NOT EXISTS metadata_checks_broadcast ON metadata_checks(broadcast_id,id);
 CREATE TABLE IF NOT EXISTS metadata_titles (
  id INTEGER PRIMARY KEY, broadcast_id INTEGER NOT NULL REFERENCES metadata_broadcasts(id),
  seen_at TEXT NOT NULL, title TEXT NOT NULL, game_name TEXT NOT NULL, language TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS metadata_titles_broadcast ON metadata_titles(broadcast_id,id);
+CREATE INDEX IF NOT EXISTS metadata_titles_time ON metadata_titles(broadcast_id,seen_at,id);
 ";
 
 #[derive(Clone)]
@@ -118,6 +124,9 @@ struct Search {
     account: Option<String>,
     before: Option<i64>,
     limit: Option<u32>,
+    offset: Option<usize>,
+    from: Option<String>,
+    to: Option<String>,
 }
 impl Search {
     fn normalized(mut self) -> Result<Self, (StatusCode, Json<Value>)> {
@@ -135,9 +144,15 @@ impl Search {
                 }
             }
         }
-        if self.before.is_some_and(|v| v <= 0) || self.limit.is_some_and(|v| v == 0 || v > 500) {
+        if self.before.is_some_and(|v| v <= 0)
+            || self.limit.is_some_and(|v| v == 0 || v > 500)
+            || self.offset.is_some_and(|v| v > 1_000_000)
+        {
             return Err(bad_query());
         }
+        let range = TimeRange::parse(self.from, self.to).map_err(|_| bad_query())?;
+        self.from = range.from;
+        self.to = range.to;
         Ok(self)
     }
 }
@@ -180,7 +195,30 @@ impl Metadata {
                 "/api/broadcasts/{id}/observations",
                 get(broadcast_observations),
             )
+            .route("/api/broadcasts/{id}/accounts", get(broadcast_accounts))
+            .route(
+                "/api/channels/{login}/metadata/history",
+                get(metadata_history),
+            )
             .with_state(self.clone())
+    }
+
+    /// Returns safe current states for scheduling. Old successful checks never remain live/offline
+    /// when metadata is unavailable, unhealthy, stale, or dated in the future.
+    pub async fn channel_states(&self) -> Result<Vec<ChannelState>, StoreError> {
+        let health = self.health.read().await.clone();
+        let available = health.configured && health.state == "ready";
+        self.store.call(move|conn| {
+            let mut stmt=conn.prepare("SELECT c.login,m.state,m.checked_at,m.broadcast_id,m.viewer_count FROM channels c LEFT JOIN metadata_checks m ON m.id=(SELECT MAX(id) FROM metadata_checks WHERE channel=c.login) WHERE c.tracked=1 ORDER BY c.login")?;
+            let rows=stmt.query_map([],|row| {
+                let checked_at:Option<String>=row.get(2)?;
+                let age=checked_at.as_deref().and_then(|at|DateTime::parse_from_rfc3339(at).ok()).map(|at|Utc::now().signed_duration_since(at).num_seconds());
+                let stale=!available||age.is_none_or(|seconds|!(0..=150).contains(&seconds));
+                let reported:Option<String>=row.get(1)?;
+                let state=if stale {"unknown"}else{match reported.as_deref(){Some("live")=>"live",Some("offline")=>"offline",_=>"unknown"}};
+                Ok(ChannelState {channel:row.get(0)?,state:state.into(),last_reported_state:reported,checked_at,stale,broadcast_id:row.get(3)?,viewer_count:row.get(4)?})
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;Ok(rows)
+        }).await
     }
 
     pub async fn run(
@@ -252,21 +290,20 @@ impl Metadata {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelState {
+    pub channel: String,
+    pub state: String,
+    pub last_reported_state: Option<String>,
+    pub checked_at: Option<String>,
+    pub stale: bool,
+    pub broadcast_id: Option<i64>,
+    pub viewer_count: Option<i64>,
+}
+
 async fn status(State(service): State<Metadata>) -> ApiResult {
     let health = service.health.read().await.clone();
-    let current_checks_available = health.configured && health.state == "ready";
-    let channels = service.store.call(move |conn| {
-        let mut statement = conn.prepare("SELECT c.login,m.state,m.checked_at,m.broadcast_id,m.viewer_count FROM channels c LEFT JOIN metadata_checks m ON m.id=(SELECT MAX(id) FROM metadata_checks WHERE channel=c.login) WHERE c.tracked=1 ORDER BY c.login")?;
-        let rows = statement.query_map([], |row| {
-            let checked_at: Option<String> = row.get(2)?;
-            let stale = !current_checks_available || checked_at.as_deref().and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                .is_none_or(|at| Utc::now().signed_duration_since(at).num_seconds() > 150);
-            let reported: Option<String> = row.get(1)?;
-            let state = if stale { "unknown" } else { reported.as_deref().unwrap_or("unknown") };
-            Ok(json!({"channel":row.get::<_,String>(0)?,"state":state,"last_reported_state":reported,"checked_at":checked_at,"stale":stale,"broadcast_id":row.get::<_,Option<i64>>(3)?,"viewer_count":row.get::<_,Option<i64>>(4)?}))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }).await.map_err(database_error)?;
+    let channels = service.channel_states().await.map_err(database_error)?;
     Ok(Json(
         json!({"configured":health.configured,"state":health.state,"last_check_at":health.last_check_at,"last_error":health.last_error,"channels":channels}),
     ))
@@ -276,9 +313,9 @@ async fn broadcasts(State(service): State<Metadata>, Query(query): Query<Search>
     let query = query.normalized()?;
     let limit = query.limit.unwrap_or(100) as usize;
     let mut rows = service.store.call(move |conn| {
-        let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE (?1 IS NULL OR b.channel=?1) AND (?2 IS NULL OR b.id<?2) AND (?3 IS NULL OR EXISTS(SELECT 1 FROM observations o WHERE o.channel=b.channel AND o.account=?3 AND o.received_at>=b.started_at AND o.received_at<=b.last_live_at)) ORDER BY b.id DESC LIMIT ?4");
+        let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE (?1 IS NULL OR b.channel=?1) AND (?2 IS NULL OR b.id<?2) AND (?3 IS NULL OR EXISTS(SELECT 1 FROM observations o WHERE o.channel=b.channel AND o.account=?3 AND o.kind IN ('names','join') AND o.received_at_utc>=b.started_at AND o.received_at_utc<=b.last_live_at AND (?5 IS NULL OR o.received_at_utc>=?5) AND (?6 IS NULL OR o.received_at_utc<?6)) OR EXISTS(SELECT 1 FROM history_visits v JOIN sessions s ON s.id=v.session_id WHERE v.channel=b.channel AND v.account=?3 AND v.first_observed_at<MAX(b.started_at,COALESCE(?5,b.started_at)) AND v.start_basis<>'uncertain_names' AND v.out_of_order=0 AND COALESCE(v.end_basis,'open')<>'out_of_order' AND (v.closed_at IS NULL OR v.closed_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (s.ended_at IS NULL OR s.ended_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (?6 IS NULL OR MAX(b.started_at,COALESCE(?5,b.started_at))<?6))) AND (?5 IS NULL OR b.last_live_at>=?5) AND (?6 IS NULL OR b.started_at<?6) ORDER BY b.id DESC LIMIT ?4");
         let mut statement = conn.prepare(&sql)?;
-        let rows = statement.query_map(params![query.channel,query.before,query.account,limit+1], broadcast_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = statement.query_map(params![query.channel,query.before,query.account,limit+1,query.from,query.to], broadcast_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }).await.map_err(database_error)?;
     let more = rows.len() > limit;
@@ -307,14 +344,74 @@ async fn broadcast_observations(
         let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE b.id=?1");
         let broadcast = conn.query_row(&sql, [id], broadcast_row).optional()?;
         let Some(broadcast) = broadcast else { return Ok(None); };
-        let mut statement = conn.prepare("SELECT id,session_id,channel,account,kind,received_at FROM observations WHERE channel=?1 AND received_at>=?2 AND received_at<=?3 AND (?4 IS NULL OR id<?4) AND (?5 IS NULL OR account=?5) ORDER BY id DESC LIMIT ?6")?;
-        let mut observations = statement.query_map(params![broadcast.channel,broadcast.started_at,broadcast.last_live_at,query.before,query.account,limit+1], |row| {
+        let mut statement = conn.prepare("SELECT id,session_id,channel,account,kind,received_at FROM observations WHERE channel=?1 AND received_at_utc>=?2 AND received_at_utc<=?3 AND (?4 IS NULL OR id<?4) AND (?5 IS NULL OR account=?5) AND (?7 IS NULL OR received_at_utc>=?7) AND (?8 IS NULL OR received_at_utc<?8) ORDER BY id DESC LIMIT ?6")?;
+        let mut observations = statement.query_map(params![broadcast.channel,broadcast.started_at,broadcast.last_live_at,query.before,query.account,limit+1,query.from,query.to], |row| {
             Ok(json!({"id":row.get::<_,i64>(0)?,"session_id":row.get::<_,i64>(1)?,"channel":row.get::<_,String>(2)?,"account":row.get::<_,Option<String>>(3)?,"kind":row.get::<_,String>(4)?,"received_at":row.get::<_,String>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         let more = observations.len() > limit;
         observations.truncate(limit);
         let next_before = if more { observations.last().and_then(|row| row["id"].as_i64()) } else { None };
         Ok(Some(json!({"broadcast":broadcast,"observations":observations,"next_before":next_before,"association_scope":ASSOCIATION})))
+    }).await.map_err(database_error)?;
+    result.map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":{"code":"not_found","message":"Broadcast not found."}})),
+        )
+    })
+}
+
+async fn metadata_history(
+    State(service): State<Metadata>,
+    Path(login): Path<String>,
+    Query(query): Query<Search>,
+) -> ApiResult {
+    let query = query.normalized()?;
+    let login = store::normalize(&login).map_err(|_| bad_query())?;
+    let limit = query.limit.unwrap_or(100) as usize;
+    let offset = query.offset.unwrap_or(0);
+    let mut rows=service.store.call(move|conn| {
+        let mut stmt=conn.prepare("SELECT m.id,m.checked_at,m.state,m.broadcast_id,m.viewer_count,m.error_code,t.title,t.game_name,t.language FROM metadata_checks m LEFT JOIN metadata_titles t ON t.id=(SELECT id FROM metadata_titles WHERE broadcast_id=m.broadcast_id AND seen_at<=m.checked_at ORDER BY seen_at DESC,id DESC LIMIT 1) WHERE m.channel=?1 AND (?2 IS NULL OR m.checked_at>=?2) AND (?3 IS NULL OR m.checked_at<?3) AND (?4 IS NULL OR m.id<?4) ORDER BY m.id DESC LIMIT ?5 OFFSET ?6")?;
+        let rows=stmt.query_map(params![login,query.from,query.to,query.before,limit+1,offset as i64],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"checked_at":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"broadcast_id":r.get::<_,Option<i64>>(3)?,"viewer_count":r.get::<_,Option<i64>>(4)?,"error_code":r.get::<_,Option<String>>(5)?,"title":r.get::<_,Option<String>>(6)?,"game_name":r.get::<_,Option<String>>(7)?,"language":r.get::<_,Option<String>>(8)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;Ok(rows)
+    }).await.map_err(database_error)?;
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let next = if more {
+        rows.last().and_then(|r| r["id"].as_i64())
+    } else {
+        None
+    };
+    Ok(Json(
+        json!({"observations":rows,"has_more":more,"next_before":next,"next_offset":if more{Some(offset+limit)}else{None},"explanation":"Official metadata checks, newest receipt first. Titles/categories reflect the latest retained change at each check. Viewer count is Twitch's reported video audience at that check, separate from observed chat accounts. Unknown checks do not establish offline status."}),
+    ))
+}
+
+// Account rows consist of positive receipts inside the selected broadcast window plus
+// separately labelled pre-window candidates whose session has no recorded boundary.
+const ACCOUNT_CTE:&str="WITH bounds AS (SELECT *,MAX(started_at,COALESCE(?3,started_at)) AS window_start FROM metadata_broadcasts WHERE id=?1 AND (?3 IS NULL OR last_live_at>=?3) AND (?4 IS NULL OR started_at<?4)), eligible AS (SELECT v.*,b.started_at AS broadcast_start,b.last_live_at AS broadcast_last,b.window_start FROM history_visits v JOIN bounds b ON b.channel=v.channel JOIN sessions s ON s.id=v.session_id WHERE (?2 IS NULL OR v.account=?2) AND v.first_observed_at<=b.last_live_at AND (?4 IS NULL OR v.first_observed_at<?4) AND (EXISTS(SELECT 1 FROM observations o WHERE o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.kind IN ('names','join') AND o.received_at_utc>=b.window_start AND o.received_at_utc<=b.last_live_at AND (?4 IS NULL OR o.received_at_utc<?4)) OR (v.first_observed_at<b.window_start AND (v.closed_at IS NULL OR v.closed_at>b.window_start) AND COALESCE(v.end_basis,'open')<>'out_of_order' AND v.start_basis<>'uncertain_names' AND v.out_of_order=0 AND (s.ended_at IS NULL OR s.ended_at>b.window_start)))), grouped AS (SELECT v.account,MIN(o.received_at_utc) AS first_observed_at,MAX(o.received_at_utc) AS last_observed_at,COUNT(o.id) AS positive_observation_count,COUNT(DISTINCT CASE WHEN v.start_basis<>'uncertain_names' THEN v.id END) AS visit_count,MAX(CASE WHEN v.first_observed_at<v.window_start THEN (SELECT MAX(p.received_at_utc) FROM observations p WHERE p.account=v.account AND p.channel=v.channel AND p.session_id=v.session_id AND p.id>=v.first_observation_id AND p.id<=v.last_observation_id AND p.kind IN ('names','join') AND p.received_at_utc<v.window_start) END) AS prior_observed_at FROM eligible v LEFT JOIN observations o ON o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.kind IN ('names','join') AND o.received_at_utc>=v.window_start AND o.received_at_utc<=v.broadcast_last AND (?4 IS NULL OR o.received_at_utc<?4) GROUP BY v.account) ";
+
+async fn broadcast_accounts(
+    State(service): State<Metadata>,
+    Path(id): Path<i64>,
+    Query(query): Query<Search>,
+) -> ApiResult {
+    let query = query.normalized()?;
+    if id <= 0 {
+        return Err(bad_query());
+    }
+    let limit = query.limit.unwrap_or(100) as usize;
+    let offset = query.offset.unwrap_or(0);
+    let result=service.store.call(move|conn| {
+        let broadcast=conn.query_row(&format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE b.id=?1"),[id],broadcast_row).optional()?;
+        let Some(broadcast)=broadcast else{return Ok(None);};
+        let mut stmt=conn.prepare(&format!("{ACCOUNT_CTE} SELECT account,first_observed_at,last_observed_at,positive_observation_count,visit_count,prior_observed_at FROM grouped ORDER BY account LIMIT ?5 OFFSET ?6"))?;
+        let mut rows=stmt.query_map(params![id,query.account,query.from,query.to,limit+1,offset as i64],|r| {
+            let positives:i64=r.get(3)?;
+            Ok(json!({"account":r.get::<_,String>(0)?,"first_observed_at":r.get::<_,Option<String>>(1)?,"last_observed_at":r.get::<_,Option<String>>(2)?,"positive_observation_count":positives,"visit_count":r.get::<_,i64>(4)?,"prior_observed_at":r.get::<_,Option<String>>(5)?,"association_basis":if positives>0{"positive_receipts"}else{"prior_connected_inference"},"state":if positives>0{"observed"}else{"inferred"},"uncertain":true,"explanation":ASSOCIATION}))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let summary=conn.query_row(&format!("{ACCOUNT_CTE} SELECT COUNT(*),COALESCE(SUM(positive_observation_count>0),0),COALESCE(SUM(positive_observation_count=0),0),COALESCE(SUM(positive_observation_count),0),COALESCE(SUM(visit_count),0) FROM grouped"),params![id,query.account,query.from,query.to],|r|Ok(json!({"account_count":r.get::<_,i64>(0)?,"observed_account_count":r.get::<_,i64>(1)?,"inferred_only_account_count":r.get::<_,i64>(2)?,"positive_observation_count":r.get::<_,i64>(3)?,"visit_count":r.get::<_,i64>(4)?})))?;
+        let more=rows.len()>limit;rows.truncate(limit);
+        Ok(Some(json!({"broadcast":broadcast,"accounts":rows,"summary":summary,"has_more":more,"next_offset":if more{Some(offset+limit)}else{None},"model_version":MODEL_VERSION,"explanation":ASSOCIATION})))
     }).await.map_err(database_error)?;
     result.map(Json).ok_or_else(|| {
         (
@@ -965,5 +1062,226 @@ mod tests {
             .await
             .unwrap();
         store.checkpoint().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_summaries_distinguish_positive_receipts_prior_inference_and_ambiguous_rosters()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("summary.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store.begin_session(vec!["example".into()]).await.unwrap();
+        let events = [
+            ("prior", "join", "06:50:00"),
+            ("departed", "join", "06:40:00"),
+            ("departed", "part", "06:55:00"),
+            ("alice", "join", "07:10:00"),
+            ("alice", "part", "07:20:00"),
+            ("alice", "join", "07:30:00"),
+            ("part_only", "part", "07:40:00"),
+            ("late", "join", "06:00:00"),
+            ("late", "part", "06:10:00"),
+            ("late", "names", "07:50:00"),
+        ]
+        .into_iter()
+        .map(|(account, kind, time)| crate::store::NewObservation {
+            channel: "example".into(),
+            account: Some(account.into()),
+            kind: kind.into(),
+            received_at: format!("2026-10-23T{time}.000Z"),
+        })
+        .collect();
+        store.append(session, events).await.unwrap();
+        let service = initialize(store.clone()).await.unwrap();
+        store
+            .call(|conn| {
+                record_check(
+                    conn,
+                    &["example".into()],
+                    "2026-10-23T08:00:00.000Z",
+                    Ok(poll(vec![live("Title")])),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let Json(result) =
+            broadcast_accounts(State(service.clone()), Path(1), Query(Search::default()))
+                .await
+                .unwrap();
+        let rows = result["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let alice = rows.iter().find(|r| r["account"] == "alice").unwrap();
+        assert_eq!(alice["positive_observation_count"], 2);
+        assert_eq!(alice["visit_count"], 2);
+        assert_eq!(alice["association_basis"], "positive_receipts");
+        let prior = rows.iter().find(|r| r["account"] == "prior").unwrap();
+        assert_eq!(prior["association_basis"], "prior_connected_inference");
+        assert!(prior["first_observed_at"].is_null());
+        assert_eq!(prior["positive_observation_count"], 0);
+        assert_eq!(prior["prior_observed_at"], "2026-10-23T06:50:00.000Z");
+        let late = rows.iter().find(|r| r["account"] == "late").unwrap();
+        assert_eq!(late["positive_observation_count"], 1);
+        assert_eq!(late["visit_count"], 0);
+        assert_eq!(result["summary"]["observed_account_count"], 2);
+        assert_eq!(result["summary"]["inferred_only_account_count"], 1);
+        let Json(found) = broadcasts(
+            State(service.clone()),
+            Query(Search {
+                account: Some("prior".into()),
+                ..Search::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found["broadcasts"].as_array().unwrap().len(), 1);
+        let Json(within_window) = broadcasts(
+            State(service.clone()),
+            Query(Search {
+                account: Some("prior".into()),
+                from: Some("2026-10-23T07:35:00Z".into()),
+                to: Some("2026-10-23T07:45:00Z".into()),
+                ..Search::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(within_window["broadcasts"].as_array().unwrap().len(), 1);
+        let Json(filtered) = broadcast_accounts(
+            State(service),
+            Path(1),
+            Query(Search {
+                from: Some("2026-10-23T07:30:00Z".into()),
+                to: Some("2026-10-23T07:50:00Z".into()),
+                ..Search::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let rows = filtered["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows.iter().any(|r| r["account"] == "late"));
+    }
+
+    #[tokio::test]
+    async fn metadata_timeline_retains_title_category_and_viewer_checks_with_range_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("metadata.sqlite3"))
+            .await
+            .unwrap();
+        let service = initialize(store.clone()).await.unwrap();
+        store
+            .call(|conn| {
+                record_check(
+                    conn,
+                    &["example".into()],
+                    "2026-10-23T08:00:00.000Z",
+                    Ok(poll(vec![live("First")])),
+                )?;
+                let mut changed = live("Second");
+                changed.game_name = "Another category".into();
+                changed.viewer_count = 321;
+                record_check(
+                    conn,
+                    &["example".into()],
+                    "2026-10-23T08:01:00.000Z",
+                    Ok(poll(vec![changed])),
+                )?;
+                record_check(
+                    conn,
+                    &["example".into()],
+                    "2026-10-23T08:02:00.000Z",
+                    Err("Unavailable"),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let Json(first) = metadata_history(
+            State(service.clone()),
+            Path("example".into()),
+            Query(Search {
+                limit: Some(1),
+                from: Some("2026-10-23T10:00:00+02:00".into()),
+                to: Some("2026-10-23T08:02:00Z".into()),
+                ..Search::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["observations"][0]["title"], "Second");
+        assert_eq!(first["observations"][0]["game_name"], "Another category");
+        assert_eq!(first["observations"][0]["viewer_count"], 321);
+        assert_eq!(first["has_more"], true);
+        let Json(second) = metadata_history(
+            State(service.clone()),
+            Path("example".into()),
+            Query(Search {
+                limit: Some(1),
+                before: first["next_before"].as_i64(),
+                ..Search::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["observations"][0]["title"], "First");
+        assert_eq!(second["has_more"], false);
+        let Json(unknown) = metadata_history(
+            State(service),
+            Path("example".into()),
+            Query(Search {
+                limit: Some(1),
+                ..Search::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown["observations"][0]["state"], "unknown");
+        assert!(unknown["observations"][0]["viewer_count"].is_null());
+        assert!(unknown["observations"][0]["title"].is_null());
+    }
+
+    #[tokio::test]
+    async fn scheduling_states_are_unknown_when_unhealthy_stale_or_future_dated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("states.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let service = initialize(store.clone()).await.unwrap();
+        {
+            let mut health = service.health.write().await;
+            health.configured = true;
+            health.state = "ready";
+        }
+        store.call(|conn|{conn.execute("INSERT INTO metadata_checks(channel,checked_at,state) VALUES('example',?1,'offline')",[store::now()])?;Ok(())}).await.unwrap();
+        assert_eq!(service.channel_states().await.unwrap()[0].state, "offline");
+        service.health.write().await.state = "error";
+        assert_eq!(service.channel_states().await.unwrap()[0].state, "unknown");
+        service.health.write().await.state = "ready";
+        store
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE metadata_checks SET checked_at='2020-01-01T00:00:00.000Z'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(service.channel_states().await.unwrap()[0].stale);
+        store
+            .call(|conn| {
+                conn.execute(
+                    "UPDATE metadata_checks SET checked_at='2099-01-01T00:00:00.000Z'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(service.channel_states().await.unwrap()[0].state, "unknown");
     }
 }

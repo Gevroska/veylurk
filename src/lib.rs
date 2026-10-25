@@ -6,7 +6,9 @@ pub mod app;
 pub mod browser;
 pub mod collector;
 pub mod irc;
+pub mod history;
 pub mod metadata;
+pub mod runtime;
 pub mod store;
 
 pub const COMMUNITY_TAB_HASH: &str =

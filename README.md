@@ -2,7 +2,7 @@
 
 Veylurk is a Rust application for Windows that collects observable Twitch chat membership into a local SQLite database. Its embedded English interface searches accounts, channels, connection history, and optional broadcast metadata at `http://127.0.0.1:8794`.
 
-The application runs continuously while its process is open. Collection needs no browser, extension, Twitch login, or user token. You can open the local interface in an ordinary browser and close that page without stopping collection. This release is a console application, not an installed Windows Service; service installation and automatic startup are not implemented.
+The application runs continuously while its process is open. Collection needs no browser, extension, Twitch login, or user token. You can open the local interface in an ordinary browser and close that page without stopping collection. Windows launchers support foreground collection, hidden background operation and optional per-user login startup through Task Scheduler. See [Windows operation and recovery](docs/windows-operation.md) for installation, graceful stop, backup and restore.
 
 ## Run the application
 
@@ -30,7 +30,7 @@ Account search shows channels where that login was observed. Channel search show
 
 Connection history records attempts, endings, and failures separately from account evidence. Time between sessions and periods without reliable delivery remain unknown. A process interruption is recorded on the next database open; the recovery time is not the exact instant the earlier process stopped.
 
-History has no automatic expiry. Pausing or removing a channel from tracking retains its searchable history. The database and its SQLite write-ahead log consume increasing disk space. For a simple backup, stop Veylurk gracefully before copying its data directory; copying only the main database while it is running can omit recent records.
+History has no automatic expiry. Pausing or removing a channel from tracking retains its searchable history. The database and its SQLite write-ahead log consume increasing disk space. Use `Stop-Veylurk.ps1` followed by `Backup-Veylurk.ps1 -Destination <new-directory>` for a verified offline backup. The backup refuses an active lock or nonempty WAL; copying only the main database while it is running can omit recent records. `Restore-Veylurk.ps1` verifies hashes and restores into a fresh data directory without overwriting existing history. Follow the [maintenance procedure](docs/windows-operation.md#offline-backup), including removing startup before maintenance.
 
 Twitch documents duplicate and reordered IRC messages, and says JOIN/PART membership messages are unavailable when a chat room contains more than 1,000 users. That threshold describes chat membership, not the video's displayed audience. Delayed JOIN messages can be initial roster delivery. A NAMES terminator, an initial zero count, or silence establishes neither completeness nor absence. Anonymous guest access is an experimentally verified public convention, not a guaranteed Twitch API contract. See [Twitch IRC concepts](https://dev.twitch.tv/docs/chat/irc/#parsing-messages) and the [PART reference](https://dev.twitch.tv/docs/chat/irc/#part-command).
 
@@ -63,12 +63,17 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 node --test web/app.test.cjs web/theme.test.cjs
+powershell.exe -NoProfile -File scripts/Test-VeylurkLauncher.ps1
+powershell.exe -NoProfile -File scripts/Test-VeylurkOperations.ps1
+cargo test --locked scale_workload -- --ignored --nocapture
 cargo build --release --locked --bin veylurk
 ```
 
-Node.js is used only for the interface's development tests. The Windows workflow runs these checks, builds release executables, and checks application startup, local APIs, embedded assets, and timed graceful shutdown using an empty temporary database without channels or metadata credentials. It also checks application and IRC-probe help, then uploads the standalone application and bounded probe artifacts. HTTP and WebSocket fixtures use local test servers; they do not need Twitch credentials. Build success and offline tests are distinct from live operation and human acceptance.
+Node.js is used only for the interface's development tests. The Windows workflow runs these checks, builds release executables, and checks application startup, local APIs, embedded assets, and timed graceful shutdown using an empty temporary database without channels or metadata credentials. Packaged operations additionally check active-lock backup refusal, verified shutdown and offline backup/restore. Startup task fixtures mock Task Scheduler and never install actual tasks. The workflow also checks application and IRC-probe help, then uploads the application, scripts, documentation and bounded probe artifacts. HTTP and WebSocket fixtures use local test servers; they do not need Twitch credentials. Build success and offline tests are distinct from live operation and human acceptance.
 
 The Windows application completed two live, 120-second runs on two channels with clean exits. The first retained 691 observations; the restart loaded those same 691 records and reached 2,083. Account-to-channel and channel-to-account searches passed, and the real interface successfully paused and resumed collection. Peak working set was approximately 18.1 MB across those runs. This is bounded evidence for two channels in that environment, not a guarantee for long histories or dozens of channels.
+
+Synthetic 10/25/50-channel workload tests exercise historical queries and restart retention separately from live collection. A real extended live scale trial and login/reboot acceptance remain pending; see [capacity evidence and trial procedure](docs/performance.md).
 
 ## Bounded and historical probes
 

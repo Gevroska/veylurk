@@ -24,6 +24,8 @@
   <main id="main" tabindex="-1">
     <aside class="scope-note" aria-label="Evidence limits"><strong>Observed chat-connected accounts.</strong> These records do not establish video viewing, watch time, exact arrivals or departures, or complete channel membership.</aside>
     <div id="app-message" class="notice" role="status" aria-live="polite" hidden></div>
+    <div id="storage-warning" class="notice" role="status" aria-live="polite" hidden></div>
+    <div id="stopped-message" class="notice" role="status" aria-live="polite" hidden></div>
     <nav class="section-nav" aria-label="Main navigation">
       <a href="#channels" data-section="channels" aria-current="page">Channels</a>
       <a href="#history" data-section="history">Observation history</a>
@@ -37,6 +39,11 @@
         <div class="field"><label for="channel-logins">Add channel logins</label><textarea id="channel-logins" rows="2" maxlength="10000" placeholder="firstchannel, secondchannel" aria-describedby="add-help" required></textarea><p id="add-help" class="help">Separate logins with commas, spaces, or new lines. Duplicate logins are combined. Adding an existing channel resumes tracking. Up to 50 channels can be tracked. Do not enter display names or URLs.</p></div>
         <button id="add-channels" type="submit">Add channels</button>
       </form>
+      <form id="settings-form" class="card collection-settings">
+        <div class="field"><label for="collection-mode">Chat collection policy</label><select id="collection-mode"><option value="all">All enabled channels</option><option value="live_only">Live channels only</option></select><p class="help">Live-only pauses chat observation only after a current offline metadata report. Unknown or stale live status keeps chat observation running. Metadata checks continue.</p></div>
+        <button id="save-settings" class="secondary" type="submit">Save policy</button>
+        <p id="settings-message" class="inline-message full-width" role="status" aria-live="polite"></p>
+      </form>
       <p id="channel-message" class="inline-message" role="status" aria-live="polite"></p>
       <div id="channels-results" aria-busy="true"><p class="empty">Loading channels…</p></div>
       <p class="footnote">A collecting channel is a chat connection, not proof of an ongoing broadcast. Removed channels remain searchable by login.</p>
@@ -49,6 +56,9 @@
         <div class="field"><label for="search-channel">Channel login</label><input id="search-channel" maxlength="26" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Any channel" aria-describedby="search-help"></div>
         <div class="field page-size"><label for="search-limit">Results per page</label><select id="search-limit"><option value="50">50</option><option value="100">100</option><option value="250">250</option></select></div>
         <button id="search-submit" type="submit">Search history</button>
+        <div class="field"><label for="search-from">From (local time, inclusive)</label><input id="search-from" type="datetime-local" step="1" aria-describedby="time-range-help"></div>
+        <div class="field"><label for="search-to">Until (local time, exclusive)</label><input id="search-to" type="datetime-local" step="1" aria-describedby="time-range-help"></div>
+        <p id="time-range-help" class="help full-width">Optional time bounds are converted to UTC. Leave blank for all retained time. The end must be later than the start.</p>
         <p id="search-help" class="help full-width">Enter at least one exact login. Use both fields to inspect one account in one channel. Times below are local receipt times, not event occurrence times.</p>
       </form>
       <p id="search-message" class="inline-message" role="status" aria-live="polite"></p>
@@ -58,12 +68,16 @@
         <p id="relationships-message" class="inline-message" role="status" aria-live="polite"></p>
         <div id="relationships-results" aria-busy="false"></div>
         <div id="relationships-pagination" class="pagination" hidden><button id="relationships-previous" class="secondary" type="button">Previous page</button><span id="relationships-page" class="quiet"></span><button id="relationships-next" class="secondary" type="button">Next page</button></div>
+        <section aria-labelledby="visits-title"><h3 id="visits-title" class="result-heading">Supported visits and ambiguous observations</h3><p class="table-note">Separate evidence intervals within a collection session. Ambiguous segments are observations only. Dotted ends are uncertain; neither duration nor continuous viewing is established.</p><p id="visits-message" class="inline-message" role="status" aria-live="polite"></p><div id="visits-results" aria-busy="false"></div><div id="visits-pagination" class="pagination" hidden><button id="visits-previous" class="secondary" type="button">Previous page</button><span id="visits-page" class="quiet"></span><button id="visits-next" class="secondary" type="button">Next page</button></div></section>
         <h3 class="result-heading">Received events</h3>
       </div>
       <div id="search-results" aria-busy="false"><p class="empty">Enter an account or channel login to search stored evidence.</p></div>
       <div id="search-pagination" class="pagination" hidden><button id="search-previous" class="secondary" type="button">Newer page</button><span id="search-page" class="quiet"></span><button id="search-next" class="secondary" type="button">Older page</button></div>
       <details class="explanation"><summary>How to read these events</summary><dl><dt>NAMES</dt><dd>The account appeared in a received chat membership response. A response can be partial or delayed.</dd><dt>JOIN</dt><dd>A chat membership JOIN message was received. It is not a verified arrival time.</dd><dt>PART</dt><dd>A chat membership PART message was received. It is not a verified departure time.</dd><dt>NAMES end</dt><dd>A response terminator was received. It proves neither a complete list nor an empty room.</dd></dl><p>Messages can be duplicated, reordered, delayed, or absent. Silence does not establish presence or absence. Each collection session is separate; observations never establish continuity across gaps.</p></details>
       <section id="channel-context" class="context-section" aria-labelledby="sessions-title" hidden>
+        <form id="presence-form" class="card presence-form"><div class="field"><label for="presence-at">Inspect chat evidence at a time (local)</label><input id="presence-at" type="datetime-local" step="1" required><p class="help">Uses this search’s channel and optional account. Observed means a positive receipt at that exact instant; inferred means an earlier positive receipt in an unclosed supported visit. Unknown does not establish absence.</p></div><button type="submit">Inspect time</button></form>
+        <p id="presence-message" class="inline-message" role="status" aria-live="polite"></p><div id="presence-results" aria-busy="false"></div><div id="presence-pagination" class="pagination" hidden><button id="presence-previous" class="secondary" type="button">Previous page</button><span id="presence-page" class="quiet"></span><button id="presence-next" class="secondary" type="button">Next page</button></div>
+        <h3 class="result-heading">Stored title, category, and viewer-count reports</h3><p class="table-note">Samples describe metadata at check time. Gaps and stale reports do not establish continuity; viewer counts are reported channel totals.</p><p id="metadata-history-message" class="inline-message" role="status" aria-live="polite"></p><div id="metadata-history-results" aria-busy="false"></div><div id="metadata-history-pagination" class="pagination" hidden><button id="metadata-history-previous" class="secondary" type="button">Newer reports</button><span id="metadata-history-page" class="quiet"></span><button id="metadata-history-next" class="secondary" type="button">Older reports</button></div>
         <div class="section-heading"><div><h3 id="sessions-title">Channel collection sessions</h3><p id="sessions-channel"></p></div></div>
         <p id="sessions-message" class="inline-message" role="status" aria-live="polite"></p>
         <div id="sessions-results" aria-busy="false"></div>
@@ -73,19 +87,23 @@
     </section>
 
     <section id="section-broadcasts" aria-labelledby="broadcasts-title" hidden>
-      <div class="section-heading"><div><h2 id="broadcasts-title">Broadcasts</h2><p>Reported broadcasts and chat evidence received during a confirmed broadcast window.</p></div></div>
+      <div class="section-heading"><div><h2 id="broadcasts-title">Broadcasts</h2><p>Reported broadcasts with observed and inferred chat account associations.</p></div></div>
       <div class="card broadcast-card"><div><h3>Optional Twitch metadata</h3><p id="metadata-message">Unknown — checking metadata availability.</p><p class="help">Optional Twitch app credentials enable broadcast titles and live status. Chat collection works without them. Configure credentials locally before starting the app.</p></div><span id="metadata-state" class="badge neutral">Unknown</span></div>
       <form id="broadcasts-form" class="card search-form broadcast-search">
         <div class="field"><label for="broadcasts-channel">Channel login</label><input id="broadcasts-channel" maxlength="26" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Any channel"></div>
         <div class="field"><label for="broadcasts-account">Observed account login</label><input id="broadcasts-account" maxlength="26" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Any account"></div>
         <button id="broadcasts-submit" type="submit">Search broadcasts</button>
-        <p class="help full-width">An account match means a chat event was received in the channel during the broadcast’s confirmed window. It does not prove the account watched the broadcast.</p>
+        <div class="field"><label for="broadcasts-from">From (local time, inclusive)</label><input id="broadcasts-from" type="datetime-local" step="1"></div><div class="field"><label for="broadcasts-to">Until (local time, exclusive)</label><input id="broadcasts-to" type="datetime-local" step="1"></div>
+        <p class="help full-width">Account matches can use positive receipts during the confirmed window or uncertain prior-connected inferences. Open a summary to distinguish them. Neither proves the account watched the broadcast.</p>
       </form>
       <p id="broadcasts-message" class="inline-message" role="status" aria-live="polite"></p>
       <div id="broadcasts-results" aria-busy="false"><p class="empty">Search retained broadcasts. Leave both fields empty to list all recorded broadcasts.</p></div>
       <div id="broadcasts-pagination" class="pagination" hidden><button id="broadcasts-previous" class="secondary" type="button">Newer page</button><span id="broadcasts-page" class="quiet"></span><button id="broadcasts-next" class="secondary" type="button">Older page</button></div>
       <section id="broadcast-evidence" class="context-section" aria-labelledby="broadcast-evidence-title" hidden>
         <h3 id="broadcast-evidence-title">Broadcast chat evidence</h3><p id="broadcast-evidence-scope" class="table-note"></p>
+        <p id="broadcast-accounts-message" class="inline-message" role="status" aria-live="polite"></p><div id="broadcast-accounts-results" aria-busy="false"></div><div id="broadcast-accounts-pagination" class="pagination" hidden><button id="broadcast-accounts-previous" class="secondary" type="button">Previous accounts</button><span id="broadcast-accounts-page" class="quiet"></span><button id="broadcast-accounts-next" class="secondary" type="button">Next accounts</button></div>
+        <h3 class="result-heading">Visit evidence during this broadcast</h3><p id="broadcast-visits-message" class="inline-message" role="status" aria-live="polite"></p><div id="broadcast-visits-results" aria-busy="false"></div><div id="broadcast-visits-pagination" class="pagination" hidden><button id="broadcast-visits-previous" class="secondary" type="button">Previous visits</button><span id="broadcast-visits-page" class="quiet"></span><button id="broadcast-visits-next" class="secondary" type="button">Next visits</button></div>
+        <h3 class="result-heading">Received events</h3>
         <p id="broadcast-events-message" class="inline-message" role="status" aria-live="polite"></p>
         <div id="broadcast-events-results" aria-busy="false"></div>
         <div id="broadcast-events-pagination" class="pagination" hidden><button id="broadcast-events-previous" class="secondary" type="button">Newer page</button><span id="broadcast-events-page" class="quiet"></span><button id="broadcast-events-next" class="secondary" type="button">Older page</button></div>
@@ -95,6 +113,7 @@
     <section id="section-health" aria-labelledby="health-title" hidden>
       <div class="section-heading"><div><h2 id="health-title">Collection health</h2><p>Connection health and local storage. Status refreshes every 15 seconds while this page is visible.</p></div><span id="status-updated" class="quiet">Not updated yet</span></div>
       <div id="health-results" aria-busy="true"><p class="empty">Loading collection health…</p></div>
+      <div class="card stop-controls"><h3>Stop Veylurk</h3><p>Stop collection and close the local app gracefully. Stored history is retained. Start Veylurk again to resume.</p><button id="stop-app" class="secondary danger" type="button">Stop Veylurk…</button><div id="stop-confirmation" class="notice" role="group" aria-labelledby="stop-confirm-title" hidden><strong id="stop-confirm-title">Stop collection and close Veylurk now?</strong><div class="actions-inner"><button id="confirm-stop" class="secondary danger" type="button">Stop now</button><button id="cancel-stop" class="secondary" type="button">Keep running</button></div></div><p id="stop-message" class="inline-message" role="status" aria-live="polite" tabindex="-1"></p></div>
       <div class="card health-note"><h3>Collection gaps</h3><p>Disconnects, restarts, pauses, and configuration changes can interrupt collection. Open a channel’s history to inspect its recorded sessions and end reasons. An open session does not guarantee complete membership delivery.</p><h3>Retention</h3><p>Stored history is retained indefinitely in the local SQLite database. Pausing or removing channel tracking does not delete that history.</p></div>
     </section>
     <noscript><p class="notice error">JavaScript is required for this local interface. The collector can continue running independently.</p></noscript>

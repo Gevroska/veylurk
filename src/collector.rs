@@ -4,7 +4,7 @@ use crate::{
     store::{now, NewObservation, Store},
 };
 use serde::Serialize;
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch, RwLock};
 
 #[derive(Debug, Clone, Serialize)]
@@ -18,6 +18,15 @@ pub struct CollectorStatus {
     pub connected_channels: usize,
     pub evidence_scope: &'static str,
     pub broadcast_metadata: &'static str,
+    pub rooms: Vec<RoomStatus>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomStatus {
+    pub channel: String,
+    pub state: String,
+    pub last_positive_at: Option<String>,
+    pub last_error: Option<String>,
+    pub coverage: &'static str,
 }
 pub type SharedStatus = Arc<RwLock<CollectorStatus>>;
 
@@ -32,6 +41,7 @@ pub fn status(store: &Store) -> SharedStatus {
         connected_channels: 0,
         evidence_scope: irc::EVIDENCE_SCOPE,
         broadcast_metadata: "see /api/metadata/status",
+        rooms: Vec::new(),
     }))
 }
 
@@ -49,6 +59,58 @@ pub async fn run(
         "wss://irc-ws.chat.twitch.tv:443".into(),
     )
     .await;
+}
+
+async fn flush_pending(
+    store: &Store,
+    sessions: &BTreeMap<String, i64>,
+    pending: &mut Vec<NewObservation>,
+) -> Result<(), crate::store::StoreError> {
+    let mut grouped = BTreeMap::<String, Vec<NewObservation>>::new();
+    for event in std::mem::take(pending) {
+        grouped
+            .entry(event.channel.clone())
+            .or_default()
+            .push(event);
+    }
+    for (channel, events) in grouped {
+        let id = *sessions
+            .get(&channel)
+            .ok_or(crate::store::StoreError::Invalid)?;
+        for batch in events.chunks(512) {
+            store.append(id, batch.to_vec()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn publish_rooms(
+    status: &SharedStatus,
+    rooms: &BTreeMap<String, RoomStatus>,
+    sessions: &BTreeMap<String, i64>,
+    requested: usize,
+) {
+    let mut state = status.write().await;
+    state.rooms = rooms.values().cloned().collect();
+    state.enabled_channels = requested;
+    state.connected_channels = rooms
+        .values()
+        .filter(|room| room.state == "collecting")
+        .count();
+    state.active_session_id = sessions.values().next().copied();
+    state.state = if requested == 0 {
+        "idle"
+    } else if state.connected_channels > 0 {
+        "collecting"
+    } else if rooms.values().any(|room| room.state == "unavailable") {
+        "membership_unavailable"
+    } else {
+        "joining"
+    }
+    .into();
+    if rooms.values().all(|room| room.last_error.is_none()) && state.connected_channels > 0 {
+        state.last_error = None;
+    }
 }
 
 async fn run_endpoint(
@@ -69,135 +131,162 @@ async fn run_endpoint(
             state.enabled_channels = requested.len();
             state.connected_channels = 0;
             state.active_session_id = None;
+            state.rooms.clear();
         }
         if requested.is_empty() {
             status.write().await.state = "idle".into();
-            tokio::select! { _=channels.changed()=>{}, _=shutdown.changed()=>break }
+            tokio::select! {result=channels.changed()=>{if result.is_err(){break;}},_=shutdown.changed()=>break}
             continue;
         }
-        let session = match store.begin_session(requested.clone()).await {
-            Ok(id) => id,
-            Err(error) => {
-                let mut state = status.write().await;
-                state.state = "storage_error".into();
-                state.last_error = Some(error.to_string());
-                return;
-            }
-        };
-        {
-            let mut state = status.write().await;
-            state.state = "connecting".into();
-            state.active_session_id = Some(session);
-        }
+        status.write().await.state = "connecting".into();
+        let mut rooms = BTreeMap::<String, RoomStatus>::new();
+        let mut sessions = BTreeMap::<String, i64>::new();
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = watch::channel(false);
         let connection_endpoint = endpoint.clone();
+        let connection_channels = channels.clone();
         let worker = tokio::spawn(async move {
-            irc::stream_endpoint(requested, events_tx, stop_rx, &connection_endpoint).await
+            irc::stream_dynamic_endpoint(
+                connection_channels,
+                events_tx,
+                stop_rx,
+                &connection_endpoint,
+            )
+            .await
         });
         let mut reason = None::<String>;
-        let mut ready = HashSet::new();
         let mut storage_failure = false;
         let mut pending = Vec::<NewObservation>::new();
         let mut flush = tokio::time::interval(Duration::from_millis(250));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let began = std::time::Instant::now();
         loop {
-            tokio::select! {
+            let outcome: Result<(), crate::store::StoreError> = tokio::select! {
                 _=flush.tick(),if !pending.is_empty()=> {
-                    if store.append(session,std::mem::take(&mut pending)).await.is_err() {
-                        storage_failure=true; reason=Some("storage_failure_collection_stopped".into());
-                        let mut state=status.write().await; state.state="storage_error".into(); state.last_error=Some("Storage failed; collection stopped; uncommitted observations may be missing.".into());
-                        let _=stop_tx.send(true); break;
-                    }
-                }
-                _=channels.changed(),if reason.is_none()=> { reason=Some("configuration_changed".into()); let _=stop_tx.send(true); }
-                _=shutdown.changed(),if reason.is_none()=> { reason=Some("shutdown".into()); let _=stop_tx.send(true); }
+                    let saved=flush_pending(&store,&sessions,&mut pending).await;
+                    if saved.is_ok() {status.write().await.rooms=rooms.values().cloned().collect();}
+                    saved
+                },
+                result=channels.changed(),if reason.is_none()=> {
+                    if result.is_err() {reason=Some("configuration_unavailable".into());let _=stop_tx.send(true);}
+                    let desired=channels.borrow_and_update().clone();
+                    publish_rooms(&status,&rooms,&sessions,desired.len()).await;
+                    Ok(())
+                },
+                _=shutdown.changed(),if reason.is_none()=> {reason=Some("shutdown".into());let _=stop_tx.send(true);Ok(())},
                 event=events_rx.recv()=> {
                     match event {
-                        Some(StreamEvent::Connected)=> { status.write().await.state="joining".into(); }
+                        Some(StreamEvent::Connected)=> {status.write().await.state="joining".into();Ok(())},
+                        Some(StreamEvent::RoomJoining(channel))=> {
+                            let saved=store.begin_session(vec![channel.clone()]).await;
+                            match saved {
+                                Ok(id)=> {
+                                    sessions.insert(channel.clone(),id);
+                                    rooms.insert(channel.clone(),RoomStatus{channel,state:"joining".into(),last_positive_at:None,last_error:None,coverage:"unknown"});
+                                    let desired=channels.borrow().len();
+                                    publish_rooms(&status,&rooms,&sessions,desired).await;
+                                    Ok(())
+                                },
+                                Err(error)=>Err(error),
+                            }
+                        },
                         Some(StreamEvent::RoomReady(channel))=> {
-                            if let Err(error)=store.room_state(session,channel.clone(),true).await {
-                                storage_failure=true;reason=Some("storage_failure_collection_stopped".into());let _=stop_tx.send(true);
-                                let mut state=status.write().await;state.state="storage_error".into();state.last_error=Some(error.to_string());break;
+                            match sessions.get(&channel).copied() {
+                                Some(id)=> {
+                                    let saved=store.room_state(id,channel.clone(),true).await;
+                                    if saved.is_ok() {
+                                        if let Some(room)=rooms.get_mut(&channel) {room.state="collecting".into();room.last_error=None;}
+                                        let desired=channels.borrow().len();publish_rooms(&status,&rooms,&sessions,desired).await;
+                                    }
+                                    saved
+                                },
+                                None=>Err(crate::store::StoreError::Invalid),
                             }
-                            ready.insert(channel); let mut state=status.write().await; state.connected_channels=ready.len(); state.state="collecting".into();
-                        }
-                        Some(StreamEvent::RoomUnavailable(channel))=> {
-                            ready.remove(&channel);
-                            if let Err(error)=store.room_state(session,channel,false).await {
-                                storage_failure=true;reason=Some("storage_failure_collection_stopped".into());let _=stop_tx.send(true);
-                                let mut state=status.write().await;state.state="storage_error".into();state.last_error=Some(error.to_string());break;
-                            }
-                            let mut state=status.write().await;state.connected_channels=ready.len();state.last_error=Some("One or more channels have unavailable membership; healthy rooms continue collecting.".into());
-                        }
-                        Some(StreamEvent::Observations(observations))=> {
-                            pending.extend(observations);
-                            while pending.len()>=512 {
-                                let batch=pending.drain(..512).collect();
-                                if store.append(session,batch).await.is_err() {
-                                    storage_failure=true; reason=Some("storage_failure_collection_stopped".into());
-                                    let mut state=status.write().await; state.state="storage_error".into(); state.last_error=Some("Storage failed; collection stopped; uncommitted observations may be missing.".into());
-                                    let _=stop_tx.send(true); break;
+                        },
+                        Some(StreamEvent::RoomUnavailable(channel))|Some(StreamEvent::RoomLeft(channel))=> {
+                            // The transport marks an unavailable room before its retry; removing
+                            // the room has the same evidence boundary and cannot extend a visit.
+                            let desired=channels.borrow().clone();
+                            let unavailable=desired.contains(&channel);
+                            let mut saved=flush_pending(&store,&sessions,&mut pending).await;
+                            if saved.is_ok() {
+                                if let Some(id)=sessions.remove(&channel) {
+                                    saved=store.end_session(id,if unavailable {"membership_unavailable"} else {"configuration_changed"}.into()).await;
                                 }
                             }
-                            if storage_failure {break;}
-                        }
+                            if saved.is_ok() {
+                                if unavailable {
+                                    if let Some(room)=rooms.get_mut(&channel) {room.state="unavailable".into();room.last_error=Some("Membership unavailable; paced room retry pending. Other rooms continue collecting.".into());}
+                                } else {rooms.remove(&channel);}
+                                publish_rooms(&status,&rooms,&sessions,desired.len()).await;
+                            }
+                            saved
+                        },
+                        Some(StreamEvent::Observations(events))=> {
+                            for event in &events {
+                                if matches!(event.kind.as_str(),"names"|"join") {
+                                    if let Some(room)=rooms.get_mut(&event.channel) {room.last_positive_at=Some(event.received_at.clone());}
+                                }
+                            }
+                            pending.extend(events);
+                            if pending.len()>=512 {flush_pending(&store,&sessions,&mut pending).await} else {Ok(())}
+                        },
                         None=>break,
                     }
-                }
+                },
+            };
+            if let Err(error) = outcome {
+                storage_failure = true;
+                reason = Some("storage_failure_collection_stopped".into());
+                let mut state = status.write().await;
+                state.state = "storage_error".into();
+                state.last_error=Some(format!("Storage failed; collection stopped; uncommitted observations may be missing. {error}"));
+                let _ = stop_tx.send(true);
+                break;
             }
         }
         if !storage_failure
-            && !pending.is_empty()
-            && store
-                .append(session, std::mem::take(&mut pending))
+            && flush_pending(&store, &sessions, &mut pending)
                 .await
                 .is_err()
         {
             storage_failure = true;
             reason = Some("storage_failure_collection_stopped".into());
-            let mut state = status.write().await;
-            state.state = "storage_error".into();
-            state.last_error = Some(
+            status.write().await.last_error = Some(
                 "Storage failed; collection stopped; uncommitted observations may be missing."
                     .into(),
             );
-            let _ = stop_tx.send(true);
         }
+        let _ = stop_tx.send(true);
         drop(events_rx);
-        let outcome = worker.await;
-        let worker_error = match outcome {
+        let worker_error = match worker.await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error.to_string()),
             Err(_) => Some("collector_worker_failed".into()),
         };
         let failed = worker_error.is_some();
         let end_reason = session_end_reason(reason, worker_error);
-        let record_error = store.end_session(session, end_reason.clone()).await.err();
+        for (_, id) in sessions {
+            if store.end_session(id, end_reason.clone()).await.is_err() {
+                storage_failure = true;
+            }
+        }
         {
             let mut state = status.write().await;
             state.active_session_id = None;
             state.connected_channels = 0;
-            if storage_failure || record_error.is_some() {
-                let previous = if storage_failure {
-                    state.last_error.take()
-                } else {
-                    None
-                };
-                storage_failure = true;
+            for room in &mut state.rooms {
+                room.state = "gap".into();
+            }
+            if storage_failure {
                 state.state = "storage_error".into();
-                state.last_error = Some(
-                    [
-                        previous,
-                        record_error.map(|error| format!("Failed to record session end: {error}")),
-                        Some(end_reason),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("; "),
-                );
+                state.last_error = Some(format!(
+                    "{} Session end: {end_reason}",
+                    state
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("Storage failed; session end may be missing.")
+                ));
             } else if failed {
                 state.last_error = Some(end_reason);
             }
@@ -223,13 +312,15 @@ async fn run_endpoint(
         let delay = Duration::from_secs((6u64.saturating_mul(1u64 << failures)).min(60))
             + Duration::from_millis(u64::from(jitter));
         status.write().await.state = "backoff".into();
-        // Configuration changes are coalesced while the minimum reconnect delay remains enforced.
-        tokio::select! { _=tokio::time::sleep(delay)=>{}, _=shutdown.changed()=>break }
+        tokio::select! {_=tokio::time::sleep(delay)=>{},_=shutdown.changed()=>break}
     }
     let mut state = status.write().await;
     state.state = "stopped".into();
     state.active_session_id = None;
     state.connected_channels = 0;
+    for room in &mut state.rooms {
+        room.state = "stopped".into();
+    }
 }
 
 fn session_end_reason(reason: Option<String>, worker_error: Option<String>) -> String {
@@ -266,6 +357,85 @@ mod tests {
         );
         assert_eq!(session_end_reason(None, Some(error.clone())), error);
         assert_eq!(session_end_reason(None, None), "connection_ended");
+    }
+
+    #[tokio::test]
+    async fn removing_one_channel_preserves_the_other_rooms_evidence_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("test.sqlite3")).await.unwrap();
+        store
+            .track(vec!["alpha".into(), "beta".into()], true)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (channels_tx, channels_rx) = watch::channel(vec!["alpha".into(), "beta".into()]);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await;
+            let _ = socket.next().await;
+            let nick = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let guest = nick.strip_prefix("NICK ").unwrap().trim();
+            socket.send(Message::text(format!(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 {guest} :Welcome\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("JOIN #alpha,#beta\r\n")
+            );
+            socket.send(Message::text(format!(":tmi.twitch.tv 366 {guest} #alpha :End\r\n:tmi.twitch.tv 366 {guest} #beta :End\r\n:alice!alice@alice.tmi.twitch.tv JOIN #alpha\r\n:alice!alice@alice.tmi.twitch.tv JOIN #beta\r\nPING :before-change\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PONG :before-change\r\n")
+            );
+            channels_tx.send(vec!["alpha".into()]).unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #beta\r\n")
+            );
+            socket
+                .send(Message::text(
+                    ":bob!bob@bob.tmi.twitch.tv JOIN #alpha\r\nPING :after-change\r\n",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PONG :after-change\r\n")
+            );
+            shutdown_tx.send(true).unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #alpha\r\n")
+            );
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        let health = status(&store);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_endpoint(store.clone(), channels_rx, shutdown_rx, health, endpoint),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let alpha = store.history("alpha".into(), None, 10).await.unwrap();
+        let beta = store.history("beta".into(), None, 10).await.unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(beta.len(), 1);
+        assert_eq!(alpha[0].end_reason.as_deref(), Some("shutdown"));
+        assert_eq!(beta[0].end_reason.as_deref(), Some("configuration_changed"));
+        let alice = store
+            .search(Some("alice".into()), Some("alpha".into()), None, 10)
+            .await
+            .unwrap();
+        let bob = store
+            .search(Some("bob".into()), Some("alpha".into()), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(alice[0].session_id, bob[0].session_id);
     }
 
     #[tokio::test]

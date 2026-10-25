@@ -14,6 +14,13 @@
   let renderedChannelsSignature = null;
   let searchQuery = null;
   let broadcastQuery = null;
+  let settings = null;
+  let settingsDirty = false;
+  let settingsSaving = false;
+  let settingsGeneration = 0;
+  let stopping = false;
+  let stopped = false;
+  let collectorStatus = null;
 
   function node(tag, text, className) {
     const result = document.createElement(tag);
@@ -76,6 +83,24 @@
       throw new Error("Use an exact login with 1–25 letters, digits, or underscores. Display names and URLs are not accepted.");
     }
     return result;
+  }
+
+  function localTime(id, required = false) {
+    const raw = $(id).value.trim();
+    if (!raw && !required) return "";
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(raw)) throw new Error("Enter a valid local date and time.");
+    const date = new Date(raw);
+    if (!Number.isFinite(date.getTime())) throw new Error("Enter a valid local date and time.");
+    const [year, month, day, hour, minute, second = 0] = raw.split(/[-T:]/).map(Number);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day || date.getHours() !== hour || date.getMinutes() !== minute || date.getSeconds() !== second) throw new Error("This local date and time does not exist. Check the date or daylight-saving transition.");
+    return date.toISOString();
+  }
+
+  function timeRange(prefix) {
+    const from = localTime(prefix + "-from");
+    const to = localTime(prefix + "-to");
+    if (from && to && Date.parse(to) <= Date.parse(from)) throw new Error("The end time must be later than the start time.");
+    return { from, to };
   }
 
   function url(path, parameters = {}) {
@@ -181,7 +206,9 @@
   }
 
   function renderChannels() {
-    const signature = JSON.stringify([channels, [...pendingChannels].sort()]);
+    const rooms = collectorStatus && Array.isArray(collectorStatus.rooms) ? collectorStatus.rooms : [];
+    const receiptFor = (channel) => { const room = rooms.find((item) => item.channel === channel.login); return room ? room.last_positive_at : channel.last_observed_at; };
+    const signature = JSON.stringify([channels, rooms, channels.map((channel) => receiptFor(channel) && Date.now() - Date.parse(receiptFor(channel)) >= 300000), metadata && metadata.channels, [...pendingChannels].sort(), settings, stopping]);
     if (signature === renderedChannelsSignature) return;
     renderedChannelsSignature = signature;
     const container = $("channels-results");
@@ -195,21 +222,39 @@
       return;
     }
     const ordered = [...channels].sort((a, b) => Number(b.tracked !== false) - Number(a.tracked !== false) || String(a.login).localeCompare(String(b.login)));
-    const content = table(["Channel", "Tracking", "Latest receipt", "Actions"], ordered, (channel) => {
+    const content = table(["Channel", "Broadcast", "Tracking / evidence quality", "Latest receipt", "Actions"], ordered, (channel) => {
       const row = node("tr");
       const historical = channel.tracked === false;
+      const room = rooms.find((item) => item.channel === channel.login);
+      const collectionState = room ? room.state : channel.collection_state;
       const collection = new Map([
         ["joining", ["Joining chat", "warning"]],
         ["collecting", ["Collecting chat", "good"]],
         ["unavailable", ["Membership unavailable", "bad"]],
-      ]).get(channel.collection_state);
+        ["policy_paused", ["Paused while offline", "neutral"]],
+        ["gap", ["Coverage gap", "warning"]],
+        ["stopped", ["Stopped", "neutral"]],
+      ]).get(collectionState);
       const state = node("div");
       state.append(historical ? badge("History only") : !channel.enabled ? badge("Paused", "warning") : collection ? badge(...collection) : channel.active_session_id != null ? badge("Session open", "good") : badge("Waiting for session", "warning"));
-      if (!historical && channel.enabled && channel.collection_error) state.append(node("span", channel.collection_error, "secondary-line"));
+      if (!historical && channel.enabled && (room && room.last_error || channel.collection_error)) state.append(node("span", room && room.last_error || channel.collection_error, "secondary-line"));
+      const report = metadata && Array.isArray(metadata.channels) ? metadata.channels.find((entry) => entry.channel === channel.login) : null;
+      const live = report && !report.stale && ["live", "offline"].includes(report.state) ? report.state : "unknown";
+      const policyPaused = !historical && channel.enabled && settings && settings.collection_mode === "live_only" && live === "offline";
+      if (policyPaused) state.replaceChildren(badge("Paused while offline"));
+      const liveState = node("div");
+      liveState.append(badge(label(live), live === "live" ? "good" : "neutral"));
+      if (report && report.checked_at) liveState.append(node("span", `${report.stale ? "Stale report" : "Checked"}: ${timestamp(report.checked_at).textContent}`, "secondary-line"));
+      if (live === "unknown" && settings && settings.collection_mode === "live_only" && channel.enabled) liveState.append(node("span", "Unknown: chat observation continues", "secondary-line"));
+      const evidenceReceipt = receiptFor(channel);
+      const receiptAge = evidenceReceipt ? Date.now() - Date.parse(evidenceReceipt) : NaN;
+      const quality = policyPaused ? "Current offline metadata pauses chat observation; metadata checks continue." : historical || !channel.enabled ? "Collection inactive; retained evidence only." : collectionState === "unavailable" ? "Membership evidence unavailable; completeness unknown." : collectionState === "gap" ? "Recorded collection gap; continuity is unknown." : !Number.isFinite(receiptAge) ? "No recent positive receipts; coverage unknown. Silence is inconclusive." : receiptAge >= 300000 ? "No recent positive receipts; silence is inconclusive. Completeness remains unknown." : "Recent receipt; membership completeness remains unknown.";
+      state.append(node("span", quality, "secondary-line"));
+      if (room && room.last_positive_at) state.append(node("span", `Latest positive receipt: ${timestamp(room.last_positive_at).textContent}`, "secondary-line"));
       const control = (text, action, handler, className = "secondary small") => {
         const result = button(text, handler, className);
         result.dataset.channelAction = JSON.stringify([channel.login, action]);
-        if (pendingChannels.has(channel.login) && !["history", "login"].includes(action)) result.setAttribute("aria-disabled", "true");
+        if ((pendingChannels.has(channel.login) || stopping) && !["history", "login"].includes(action)) result.setAttribute("aria-disabled", "true");
         return result;
       };
       const actions = node("div", null, "actions-inner");
@@ -222,7 +267,7 @@
         remove.title = "Stop tracking this channel and retain its stored history";
         actions.append(remove);
       }
-      row.append(cell(control(channel.login, "login", () => openHistory("", channel.login), "link-button")), cell(state), cell(timestamp(channel.last_observed_at), "time"), cell(actions, "actions"));
+      row.append(cell(control(channel.login, "login", () => openHistory("", channel.login), "link-button")), cell(liveState), cell(state), cell(timestamp(channel.last_observed_at), "time"), cell(actions, "actions"));
       return row;
     }, "Channels configured for collection and channels with retained history");
     content.dataset.channelAction = "table";
@@ -245,7 +290,7 @@
   }
 
   async function mutateChannel(name, action) {
-    if (pendingChannels.has(name)) return;
+    if (pendingChannels.has(name) || stopping) return;
     pendingChannels.add(name);
     renderChannels();
     message("channel-message", `Updating ${name}…`);
@@ -262,7 +307,7 @@
 
   async function addChannels(event) {
     event.preventDefault();
-    if ($("add-channels").disabled) return;
+    if ($("add-channels").disabled || stopping) return;
     const original = $("channel-logins").value;
     let names;
     try {
@@ -298,9 +343,11 @@
   }
 
   function renderHealth(status) {
+    collectorStatus = status;
     const tone = ["collecting", "connected", "running"].includes(status.state) ? "good" : ["error", "failed"].includes(status.state) ? "bad" : "warning";
     $("connection-status").textContent = label(status.state);
     $("connection-status").className = "badge " + tone;
+    if (stopping) { $("connection-status").textContent = "Stopping"; $("connection-status").className = "badge warning"; }
     const grid = node("div", null, "health-grid");
     const connected = Array.isArray(status.connected_channels) ? status.connected_channels.length : status.connected_channels;
     const enabled = Array.isArray(status.enabled_channels) ? status.enabled_channels.length : status.enabled_channels;
@@ -313,6 +360,9 @@
     detail(details, "Storage health", badge(label(status.storage_health), status.storage_health === "unavailable" ? "bad" : status.storage_health === "available" ? "good" : "neutral"));
     detail(details, "Latest collector error", status.last_error || "None reported");
     detail(details, "Evidence scope", status.evidence_scope || "Chat membership observations only; completeness unknown.");
+    detail(details, "Available disk space", bytes(status.disk_available_bytes));
+    $("storage-warning").hidden = !status.storage_warning;
+    $("storage-warning").textContent = status.storage_warning || "";
     $("health-results").replaceChildren(grid, details);
     healthLoaded = true;
     $("health-results").classList.remove("stale");
@@ -334,17 +384,36 @@
     else $("broadcast-message").textContent = "Unknown — no current broadcast metadata is available for this channel. Chat connections cannot establish whether a channel is live.";
   }
 
-  async function refreshStatus() {
+  async function refreshStatus(force = false) {
+    if (stopped && !force) return;
     if (refreshInProgress) return;
     refreshInProgress = true;
     $("refresh-status").setAttribute("aria-disabled", "true");
     $("refresh-status").setAttribute("aria-busy", "true");
-    const results = await Promise.allSettled([api("/api/status"), updateChannels(), api("/api/metadata/status")]);
+    const policyGeneration = settingsGeneration;
+    const results = await Promise.allSettled([api("/api/status"), updateChannels(), api("/api/metadata/status"), api("/api/settings")]);
     const errors = [];
-    if (results[0].status === "fulfilled") renderHealth(results[0].value);
+    if (results[0].status === "fulfilled") {
+      if (stopped) {
+        stopped = false; stopping = false;
+        $("stopped-message").hidden = true;
+        $("stop-app").disabled = false; $("confirm-stop").disabled = false; $("cancel-stop").disabled = false;
+        $("add-channels").disabled = false; $("save-settings").disabled = settingsSaving;
+        message("stop-message", "The local app is reachable again. Collection status is shown above.");
+      }
+      renderHealth(results[0].value);
+    }
     else {
+      collectorStatus = null;
+      if (stopping) {
+        stopped = true;
+        $("connection-status").textContent = "App unreachable after stop request";
+        $("connection-status").className = "badge neutral";
+        $("stopped-message").textContent = "Veylurk is no longer reachable after the stop request. Restart the app to resume collection. Stored history is retained.";
+      } else {
       $("connection-status").textContent = "Status unavailable";
       $("connection-status").className = "badge bad";
+      }
       if (!healthLoaded) $("health-results").replaceChildren(empty("Collection status is unavailable. Use Refresh status to retry."));
       $("health-results").classList.add("stale");
       errors.push("Collection status: " + failure(results[0].reason));
@@ -356,7 +425,14 @@
     }
     metadata = results[2].status === "fulfilled" ? results[2].value : null;
     renderMetadata();
-    $("app-message").hidden = !errors.length;
+    if (results[3].status === "fulfilled") {
+      if (policyGeneration === settingsGeneration) {
+        settings = results[3].value;
+        if (!settingsDirty && !settingsSaving) $("collection-mode").value = settings.collection_mode === "live_only" ? "live_only" : "all";
+      }
+    } else if (!settings) message("settings-message", "Collection policy is unavailable. " + failure(results[3].reason), "error");
+    renderChannels();
+    $("app-message").hidden = !errors.length || stopping;
     $("app-message").textContent = errors.length ? errors.join(" ") + " Previously loaded data may be stale. Use Refresh status to retry." : "";
     $("app-message").className = "notice error";
     $("channels-results").setAttribute("aria-busy", "false");
@@ -469,7 +545,7 @@
     }, `${count(relationships.length)} account/channel pairs on this page · includes only retained evidence`);
   }, true);
 
-  const sessionsView = pagedView("sessions", (query, before) => api(url("/api/channels/" + encodeURIComponent(query.channel) + "/history", { limit: query.limit, before })), (data) => {
+  const sessionsView = pagedView("sessions", (query, before) => api(url("/api/channels/" + encodeURIComponent(query.channel) + "/history", { limit: query.limit, from: query.from, to: query.to, before })), (data) => {
     const sessions = rows(data, "sessions");
     if (!sessions.length) return empty("No collection sessions are stored for this channel.");
     return table(["Session", "Collection started", "Collection ended", "End reason", "Stored events"], sessions, (session) => {
@@ -486,80 +562,271 @@
     }, "Separate collection sessions · interrupted end times are unknown · recovery times are labeled separately");
   });
 
+  function svgElement(tag, attributes = {}, text) {
+    const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+    if (text !== undefined) element.textContent = text;
+    return element;
+  }
+
+  function evidenceTimeline(item, start, end) {
+    const graphic = svgElement("svg", { viewBox: "0 0 260 30", width: "260", height: "30", "aria-hidden": "true", class: "evidence-timeline" });
+    const position = (value) => 10 + 240 * Math.max(0, Math.min(1, (Date.parse(value) - start) / Math.max(1, end - start)));
+    const first = position(item.first_observed_at);
+    const last = position(item.last_observed_at);
+    graphic.append(svgElement("line", { x1: first, y1: 15, x2: last, y2: 15, class: "evidence-span" }), svgElement("circle", { cx: first, cy: 15, r: 4, class: "positive-point" }), svgElement("circle", { cx: last, cy: 15, r: 4, class: "positive-point" }));
+    return graphic;
+  }
+
+  function visitTable(data) {
+    const visits = rows(data, "visits");
+    const wrapper = node("div");
+    wrapper.append(node("p", data.explanation || "Positive receipts support these separate chat visits. Their boundaries are uncertain; collection gaps end inference. No viewing duration is established.", "table-note"), node("p", "Visits overlap the selected time bounds or broadcast window. Full first/last positive receipt bounds are shown and can extend beyond that window.", "table-note"));
+    if (!visits.length) { wrapper.append(empty("No supported visits match this range. Missing evidence does not prove absence.")); return wrapper; }
+    const times = visits.flatMap((item) => [Date.parse(item.first_observed_at), Date.parse(item.last_observed_at)]).filter(Number.isFinite);
+    const start = Math.min(...times), end = Math.max(...times);
+    const supportedCount = visits.filter((item) => item.supported_visit !== false).length;
+    wrapper.append(table(["Account / channel", "First positive receipt", "Last positive receipt", "Evidence span", "Boundary / quality"], visits, (item) => {
+      const row = node("tr");
+      const identity = node("div");
+      identity.append(historyLink(item.account, item.account, item.channel), node("span", item.channel, "secondary-line"), node("span", `Session ${item.session_id}`, "secondary-line"));
+      identity.append(badge(item.supported_visit === false ? "Observation only — ambiguous" : "Supported visit — uncertain", item.supported_visit === false ? "warning" : "neutral"));
+      const span = node("div");
+      if (Number.isFinite(start) && Number.isFinite(end)) span.append(evidenceTimeline(item, start, end));
+      span.append(node("span", `${count(item.positive_observation_count)} positive receipts · uncertain continuity`, "secondary-line"));
+      const boundaries = node("div");
+      boundaries.append(badge("Uncertain boundaries", "warning"), node("span", `Start evidence: ${label(item.start_basis)}. End: ${label(item.end_basis)}${item.end_reason ? " (" + label(item.end_reason) + ")" : ""}.`, "secondary-line"));
+      if (item.supported_visit === false) boundaries.append(node("span", "Ambiguous receipt segment; no supported visit or continuity inference is established.", "secondary-line"));
+      if (item.end_observed_at) { const part = node("span", "PART received: ", "secondary-line"); part.append(timestamp(item.end_observed_at)); boundaries.append(part); }
+      if (item.duplicate_or_repeated) boundaries.append(node("span", "Repeated positive observations were combined.", "secondary-line"));
+      if (item.out_of_order) boundaries.append(node("span", "Out-of-order evidence limits inference.", "secondary-line"));
+      row.append(cell(identity), cell(timestamp(item.first_observed_at), "time"), cell(timestamp(item.last_observed_at), "time"), cell(span), cell(boundaries));
+      return row;
+    }, `${count(supportedCount)} separate supported visits · ${count(visits.length - supportedCount)} ambiguous observation segments · dots are first/last positive receipts on a shared page time scale · dotted spans are not measured attendance`));
+    return wrapper;
+  }
+
+  const visitsView = pagedView("visits", (query, before) => api(url("/api/history", { ...query, before })), visitTable);
+  const broadcastVisitsView = pagedView("broadcast-visits", (query, before) => api(url("/api/history", { ...query, before })), visitTable);
+  const presenceView = pagedView("presence", (query, offset) => api(url("/api/presence", { ...query, offset })), (data) => {
+    const accounts = rows(data, "accounts");
+    const result = node("div");
+    result.append(node("p", data.explanation || "Observed: a positive receipt at the selected instant. Inferred: earlier positive evidence in an unclosed supported visit. Unknown coverage cannot establish absence.", "table-note"));
+    if (!accounts.length) { result.append(empty("Unknown — no account evidence supports presence at this instant. This does not mean the channel was empty.")); return result; }
+    result.append(table(["Account", "Evidence at selected instant", "Supporting receipt", "Interpretation"], accounts, (item) => {
+      const row = node("tr");
+      const state = ["observed", "inferred"].includes(item.state) ? item.state : "unknown";
+      row.append(cell(historyLink(item.account, item.account, searchQuery.channel)), cell(badge(label(state), state === "observed" ? "good" : state === "inferred" ? "warning" : "neutral")), cell(timestamp(item.observed_at), "time"), cell(item.explanation || "Chat evidence only; viewing and continuous membership remain unknown."));
+      return row;
+    }, "Point-in-time chat evidence · presence is uncertain · unknown is not absence"));
+    return result;
+  }, true);
+
+  function metadataChart(observations) {
+    const samples = observations.filter((item) => item.state === "live" && Number.isFinite(item.viewer_count) && item.viewer_count >= 0 && Number.isFinite(Date.parse(item.checked_at)));
+    if (!samples.length) return null;
+    const start = Math.min(...samples.map((item) => Date.parse(item.checked_at)));
+    const end = Math.max(...samples.map((item) => Date.parse(item.checked_at)));
+    const maximum = Math.max(1, ...samples.map((item) => item.viewer_count));
+    const figure = node("figure", null, "metadata-chart");
+    const graphic = svgElement("svg", { viewBox: "0 0 720 180", role: "img", "aria-label": `Reported live viewer-count samples, from zero to ${count(maximum)}. Exact samples are in the following table. Unconnected points do not imply continuity.` });
+    graphic.append(svgElement("line", { x1: 45, y1: 140, x2: 700, y2: 140, class: "chart-axis" }), svgElement("text", { x: 8, y: 22, class: "chart-label" }, count(maximum)), svgElement("text", { x: 22, y: 145, class: "chart-label" }, "0"));
+    for (const sample of samples) {
+      const dot = svgElement("circle", { cx: 50 + 640 * (Date.parse(sample.checked_at) - start) / Math.max(1, end - start), cy: 140 - 120 * sample.viewer_count / maximum, r: 4, class: "positive-point" });
+      dot.append(svgElement("title", {}, `${timestamp(sample.checked_at).textContent}: ${count(sample.viewer_count)} reported viewers`));
+      graphic.append(dot);
+    }
+    graphic.append(svgElement("text", { x: 45, y: 170, class: "chart-label" }, clock.format(new Date(start))));
+    if (end !== start) graphic.append(svgElement("text", { x: 700, y: 170, "text-anchor": "end", class: "chart-label" }, clock.format(new Date(end))));
+    figure.append(graphic, node("figcaption", "Reported live viewer-count samples on this page. Points are not connected across gaps; exact times and values follow.", "table-note"));
+    return figure;
+  }
+
+  const metadataHistoryView = pagedView("metadata-history", (query, before) => api(url("/api/channels/" + encodeURIComponent(query.channel) + "/metadata/history", { from: query.from, to: query.to, limit: query.limit, before })), (data) => {
+    const observations = rows(data, "observations");
+    if (!observations.length) return empty("No metadata reports match this range. Titles, categories, and viewer counts remain unknown.");
+    const result = node("div");
+    const chart = metadataChart(observations);
+    if (chart) result.append(chart);
+    result.append(table(["Checked locally", "Reported state", "Title", "Category", "Reported viewers"], observations, (item) => {
+      const row = node("tr");
+      row.append(cell(timestamp(item.checked_at), "time"), cell(badge(label(item.state))), cell(item.title || "Not reported"), cell(item.game_name || "Not reported"), cell(item.state === "live" ? count(item.viewer_count) : "Not reported", "number"));
+      return row;
+    }, "Stored metadata samples · no interpolation across checks · newest checks first"));
+    return result;
+  });
+
   function startSearch(event) {
     if (event) event.preventDefault();
     try {
       const account = login($("search-account").value, true);
       const channel = login($("search-channel").value, true);
       if (!account && !channel) throw new Error("Enter an account or channel login to search history.");
-      searchQuery = { account, channel, limit: Number($("search-limit").value) };
+      searchQuery = { account, channel, limit: Number($("search-limit").value), ...timeRange("search") };
       $("search-account").value = account;
       $("search-channel").value = channel;
       $("relationships-section").hidden = false;
       eventsView.reset(searchQuery);
       relationshipsView.reset(searchQuery);
+      visitsView.reset(searchQuery);
+      presenceView.clear();
       $("channel-context").hidden = !channel;
       if (channel) {
         $("sessions-channel").textContent = `${channel} · sessions cover the channel, regardless of the account filter.`;
         sessionsView.reset(searchQuery);
-      } else sessionsView.clear();
+        metadataHistoryView.reset(searchQuery);
+      } else { sessionsView.clear(); metadataHistoryView.clear(); }
       renderMetadata();
     } catch (error) { message("search-message", failure(error), "error"); }
   }
 
-  const broadcastEventsView = pagedView("broadcast-events", (query, before) => api(url("/api/broadcasts/" + encodeURIComponent(query.id) + "/observations", { account: query.account, limit: 50, before })), (data) => {
+  const broadcastEventsView = pagedView("broadcast-events", (query, before) => api(url("/api/broadcasts/" + encodeURIComponent(query.id) + "/observations", { account: query.account, from: query.from, to: query.to, limit: 50, before })), (data) => {
     $("broadcast-evidence-scope").textContent = data.association_scope || "Chat events received in this channel during a confirmed broadcast window; not evidence of video watching.";
     return eventTable(data);
   });
 
-  function openBroadcast(item, account) {
+  const broadcastAccountsView = pagedView("broadcast-accounts", (query, offset) => api(url("/api/broadcasts/" + encodeURIComponent(query.id) + "/accounts", { account: query.account, from: query.from, to: query.to, limit: 50, offset })), (data) => {
+    const accounts = rows(data, "accounts");
+    const wrapper = node("div");
+    wrapper.append(node("h3", "Observed and inferred chat account associations"), node("p", data.explanation || "Positive receipts in the confirmed broadcast window are observed evidence. Earlier receipts can support separately labeled uncertain inferences. Neither establishes video watching or complete membership.", "table-note"));
+    if (data.summary) {
+      const summary = node("dl", null, "card detail-list");
+      if (data.summary.account_count !== undefined) detail(summary, "Associated accounts", count(data.summary.account_count));
+      if (data.summary.observed_account_count !== undefined) detail(summary, "Accounts observed in window", count(data.summary.observed_account_count));
+      if (data.summary.inferred_only_account_count !== undefined) detail(summary, "Inferred-only accounts", count(data.summary.inferred_only_account_count));
+      if (data.summary.visit_count !== undefined) detail(summary, "Supported visits", count(data.summary.visit_count));
+      if (data.summary.positive_observation_count !== undefined) detail(summary, "Positive receipts", count(data.summary.positive_observation_count));
+      wrapper.append(summary);
+    }
+    if (!accounts.length) { wrapper.append(empty("No matching chat association is supported for this broadcast. This does not prove nobody was present.")); return wrapper; }
+    wrapper.append(table(["Account", "Association evidence", "First positive receipt in window", "Last positive receipt in window", "Supported visits", "Positive receipts in window"], accounts, (item) => {
+      const row = node("tr");
+      const observed = item.state === "observed" || item.association_basis === "positive_receipts" || item.positive_observation_count > 0;
+      const basis = node("div");
+      basis.append(badge(observed ? "Observed" : "Inferred — uncertain", observed ? "good" : "warning"));
+      if (item.prior_observed_at) { const prior = node("span", "Supporting earlier receipt: ", "secondary-line"); prior.append(timestamp(item.prior_observed_at)); basis.append(prior); }
+      basis.append(node("span", item.explanation || (observed ? "Positive receipt within the confirmed window." : "Earlier positive receipt without a recorded departure or gap; continuous presence remains unknown."), "secondary-line"));
+      row.append(cell(historyLink(item.account, item.account, item.channel || data.broadcast && data.broadcast.channel || "")), cell(basis), cell(item.first_observed_at ? timestamp(item.first_observed_at) : "No positive receipt in window", "time"), cell(item.last_observed_at ? timestamp(item.last_observed_at) : "No positive receipt in window", "time"), cell(count(item.visit_count), "number"), cell(count(item.positive_observation_count), "number"));
+      return row;
+    }, "Account summaries within the selected broadcast and time bounds"));
+    return wrapper;
+  }, true);
+
+  function openBroadcast(item, query) {
     if (!Number.isSafeInteger(item.id) || item.id < 1) return;
     $("broadcast-evidence").hidden = false;
     $("broadcast-evidence-title").textContent = `${item.channel} · ${item.title || "Untitled broadcast"}`;
     $("broadcast-evidence-scope").textContent = "Loading chat evidence for this reported broadcast…";
-    broadcastEventsView.reset({ id: item.id, account });
+    broadcastEventsView.reset({ id: item.id, account: query.account, from: query.from, to: query.to });
+    broadcastAccountsView.reset({ id: item.id, account: query.account, from: query.from, to: query.to });
+    broadcastVisitsView.reset({ broadcast_id: item.id, account: query.account, from: query.from, to: query.to, limit: 50 });
     $("broadcast-evidence").scrollIntoView({ behavior: "auto", block: "start" });
   }
 
   const broadcastsView = pagedView("broadcasts", (query, before) => api(url("/api/broadcasts", { ...query, before })), (data, query) => {
     const broadcasts = rows(data, "broadcasts");
     if (!broadcasts.length) return empty("No matching broadcasts are stored. Metadata may be unavailable; chat collection and its history remain independent.");
-    return table(["Channel / title", "Reported start", "Last confirmed live", "First not-live report", "Chat evidence"], broadcasts, (item) => {
+    const result = node("div");
+    result.append(node("p", data.association_scope || "Account matches can use positive receipts in the confirmed window or separately labeled uncertain prior-connected inferences. Open the summary to inspect their basis.", "table-note"));
+    result.append(table(["Channel / title", "Reported start", "Last confirmed live", "First not-live report", "Chat evidence"], broadcasts, (item) => {
       const row = node("tr");
       const identity = node("div");
       identity.append(historyLink(item.channel, "", item.channel), node("p", item.title || "Untitled broadcast"), node("span", [item.game_name, item.language].filter(Boolean).join(" · ") || "Category not recorded", "secondary-line"));
-      const evidence = button("View events", () => openBroadcast(item, query.account));
+      const evidence = button("View summary / visits / events", () => openBroadcast(item, query));
       row.append(cell(identity), cell(timestamp(item.started_at), "time"), cell(timestamp(item.last_live_at), "time"), cell(timestamp(item.offline_observed_at), "time"), cell(evidence));
       return row;
-    }, `${count(broadcasts.length)} reported broadcasts on this page · missing not-live reports do not prove a broadcast is still live`);
+    }, `${count(broadcasts.length)} reported broadcasts on this page · missing not-live reports do not prove a broadcast is still live`));
+    return result;
   });
 
   function startBroadcastSearch(event) {
     if (event) event.preventDefault();
     try {
-      broadcastQuery = { channel: login($("broadcasts-channel").value, true), account: login($("broadcasts-account").value, true), limit: 50 };
+      broadcastQuery = { channel: login($("broadcasts-channel").value, true), account: login($("broadcasts-account").value, true), limit: 50, ...timeRange("broadcasts") };
       $("broadcasts-channel").value = broadcastQuery.channel;
       $("broadcasts-account").value = broadcastQuery.account;
       $("broadcast-evidence").hidden = true;
       broadcastEventsView.clear();
+      broadcastAccountsView.clear();
+      broadcastVisitsView.clear();
       broadcastsView.reset(broadcastQuery);
     } catch (error) { message("broadcasts-message", failure(error), "error"); }
   }
 
   $("add-channels-form").addEventListener("submit", addChannels);
+  $("collection-mode").addEventListener("change", () => { settingsDirty = true; message("settings-message", "Policy changed. Save to apply it.", "warning"); });
+  $("settings-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (settingsSaving || stopping) return;
+    settingsSaving = true;
+    settingsGeneration += 1;
+    $("save-settings").disabled = true;
+    const collection_mode = $("collection-mode").value;
+    message("settings-message", "Saving collection policy…");
+    try {
+      settings = await api("/api/settings", { method: "PATCH", body: { collection_mode } });
+      settingsDirty = $("collection-mode").value !== collection_mode;
+      message("settings-message", settingsDirty ? "Policy saved. Your newer selection is not saved yet." : "Collection policy saved. Unknown metadata keeps chat observation running.", settingsDirty ? "warning" : "success");
+      renderChannels(); refreshStatus();
+    } catch (error) { message("settings-message", failure(error), "error"); }
+    finally { settingsSaving = false; $("save-settings").disabled = false; }
+  });
+  $("presence-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    try {
+      if (!searchQuery || !searchQuery.channel) throw new Error("Search a channel before inspecting a time.");
+      presenceView.reset({ channel: searchQuery.channel, account: searchQuery.account, at: localTime("presence-at", true), limit: searchQuery.limit });
+    } catch (error) { message("presence-message", failure(error), "error"); }
+  });
+  $("presence-at").addEventListener("input", () => presenceView.markStale());
+  $("stop-app").addEventListener("click", () => {
+    if (stopping) return;
+    $("stop-confirmation").hidden = false;
+    $("confirm-stop").focus({ preventScroll: true });
+  });
+  $("cancel-stop").addEventListener("click", () => { $("stop-confirmation").hidden = true; $("stop-app").focus({ preventScroll: true }); });
+  $("confirm-stop").addEventListener("click", async () => {
+    if (stopping) return;
+    stopping = true;
+    $("confirm-stop").disabled = true;
+    $("cancel-stop").disabled = true;
+    message("stop-message", "Requesting graceful shutdown…");
+    try {
+      const response = await api("/api/shutdown", { method: "POST", body: {} });
+      if (response.state !== "stopping") throw new Error("The app did not acknowledge a shutdown request.");
+      $("stop-confirmation").hidden = true;
+      $("stop-app").disabled = true;
+      $("add-channels").disabled = true;
+      $("save-settings").disabled = true;
+      $("stopped-message").hidden = false;
+      $("stopped-message").textContent = "Veylurk accepted the stop request and is shutting down. Collection will stop; stored history is retained.";
+      $("connection-status").textContent = "Stopping";
+      $("connection-status").className = "badge warning";
+      message("stop-message", "Shutdown requested. Restart Veylurk to collect again.");
+      renderChannels();
+      $("stop-message").focus({ preventScroll: true });
+    } catch (error) {
+      stopping = false;
+      $("confirm-stop").disabled = false;
+      $("cancel-stop").disabled = false;
+      message("stop-message", failure(error) + " Shutdown was not confirmed.", "error");
+    }
+  });
   $("search-form").addEventListener("submit", startSearch);
   $("broadcasts-form").addEventListener("submit", startBroadcastSearch);
-  $("refresh-status").addEventListener("click", refreshStatus);
-  for (const id of ["search-account", "search-channel", "search-limit"]) $(id).addEventListener("input", () => {
-    eventsView.markStale(); relationshipsView.markStale(); sessionsView.markStale();
+  $("refresh-status").addEventListener("click", () => refreshStatus(true));
+  for (const id of ["search-account", "search-channel", "search-limit", "search-from", "search-to"]) $(id).addEventListener("input", () => {
+    eventsView.markStale(); relationshipsView.markStale(); sessionsView.markStale(); visitsView.markStale(); metadataHistoryView.markStale(); presenceView.markStale();
   });
-  for (const id of ["broadcasts-account", "broadcasts-channel"]) $(id).addEventListener("input", () => {
-    broadcastsView.markStale(); broadcastEventsView.markStale();
+  for (const id of ["broadcasts-account", "broadcasts-channel", "broadcasts-from", "broadcasts-to"]) $(id).addEventListener("input", () => {
+    broadcastsView.markStale(); broadcastEventsView.markStale(); broadcastAccountsView.markStale(); broadcastVisitsView.markStale();
   });
   $("open-channel-broadcasts").addEventListener("click", () => {
     if (!searchQuery || !searchQuery.channel) return;
     $("broadcasts-channel").value = searchQuery.channel;
     $("broadcasts-account").value = searchQuery.account;
+    $("broadcasts-from").value = $("search-from").value;
+    $("broadcasts-to").value = $("search-to").value;
     navigate("broadcasts"); startBroadcastSearch();
   });
   window.addEventListener("hashchange", showSection);

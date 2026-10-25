@@ -187,6 +187,19 @@ td.actions { min-width: 260px; }
 .broadcast-card { margin-top: 1rem; display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
 .broadcast-card p { font-size: .88rem; color: var(--muted); margin-bottom: 0; }
 .broadcast-search { margin-top: 1rem; }
+.collection-settings, .presence-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .5rem 1rem; align-items: end; margin-top: 1rem; }
+.collection-settings .inline-message { margin-bottom: 0; }
+.collection-settings select { max-width: 360px; }
+.stop-controls { margin-top: 1rem; }
+.stop-controls .actions-inner { margin-top: .7rem; }
+.stop-controls p { color: var(--muted); font-size: .9rem; }
+.metadata-chart { margin: 0 0 1rem; padding: 1rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
+.metadata-chart svg { display: block; width: 100%; max-height: 260px; }
+.chart-axis { stroke: var(--input-border); stroke-width: 1; }
+.chart-label { fill: var(--muted); font-size: 12px; }
+.positive-point { fill: var(--accent-strong); }
+.evidence-timeline { display: block; min-width: 200px; }
+.evidence-span { stroke: var(--accent-strong); stroke-width: 2; stroke-dasharray: 3 4; }
 .health-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
 .metric { min-height: 112px; }
 .metric h3 { font-size: .8rem; color: var(--muted); font-weight: 600; margin-bottom: .55rem; }
@@ -234,6 +247,7 @@ footer { max-width: 1240px; padding: 1rem 0; margin: 0 auto; border-top: 1px sol
   .add-form { display: block; }
   .add-form button { margin-top: .8rem; width: 100%; }
   .search-form { grid-template-columns: 1fr; }
+  .collection-settings, .presence-form { grid-template-columns: 1fr; }
   .search-form .page-size { max-width: none; }
   .health-grid { grid-template-columns: 1fr; }
   .detail-list { grid-template-columns: 1fr; gap: .25rem; }

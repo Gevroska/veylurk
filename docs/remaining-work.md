@@ -1,0 +1,93 @@
+# Requirements and remaining work
+
+Updated: 2026-10-25 (Europe/Paris).
+
+The owner has authorized implementation of the remaining features. The earlier review-only restriction and Astra-only allocation are superseded. Current AGENTS.md governs coordination: Sol High/XHigh handles implementation, testing, integration and delivery; Astra XHigh receives bounded complex scoping or critical analysis when justified.
+
+## Product scope and collection decision
+
+The application collects received public Twitch IRC membership evidence autonomously, with optional official broadcast metadata. It records chat-connected accounts, including some accounts that never post. Chat membership is a different population from video viewers. A connected socket, a NAMES terminator or a viewer-count total does not establish complete membership.
+
+The original Community-panel sampling requirement remains unmet. Historical direct HTTP and autonomous browser experiments did not produce a maintainable working source; the recorded CommunityTab request failed an integrity check. These probes are not a production collector. No integrity or authorization control is bypassed by this implementation.
+
+Official documentation checked on 2026-10-25 states that IRC JOIN/PART delivery is unavailable above 1,000 chat-room users. Get Chatters requires authorized broadcaster/moderator access and the relevant scope; app client credentials alone do not authorize arbitrary third-party channels. See [IRC membership limits](https://dev.twitch.tv/docs/chat/irc/#part-command) and [Get Chatters](https://dev.twitch.tv/docs/api/reference/#get-chatters).
+
+Therefore population-adaptive sampling, calibrated statistical absence, exact individual viewing periods and 100% viewer discovery cannot be claimed. The evidence model labels supported visits and observation-only ambiguous segments, with uncertain boundaries. Point-in-time candidates are either an exact positive receipt or an explicitly uncertain inference within source-supported boundaries. No result is a verified viewing duration.
+
+For independent uniform samples of size k from a fixed population N, the conditional chance of missing a continuously present account in m samples is (1-k/N)^m. This is not a probability of departure. The implementation does not apply that formula to IRC events, video-viewer counts or unvalidated correlated samples.
+
+## Requirement inventory
+
+| Original requirement | Implementation / remaining acceptance |
+| --- | --- |
+| Rust application on Windows | Implemented; standalone executable and embedded assets, packaged by Windows CI. |
+| Simple English localhost interface | Implemented; listener on 127.0.0.1 with Host/Origin/JSON checks. |
+| Enter a channel list | Implemented; bulk normalization, deduplication, pause/resume/removal, up to 50 tracked channels. History survives removal. |
+| Autonomous operation without Brave or extensions | Implemented with one IRC WebSocket. No browser runtime is needed for collection. |
+| Repeated Community-list samples | Source-blocked; historical probes do not fulfill this feature. |
+| Observe silent accounts | Partial source support: NAMES/JOIN/PART can expose nonposting chat-connected accounts; delivery and completeness are unknown. |
+| Discover 100% of video viewers | Unsupported by the available evidence and access rights. |
+| Population-adaptive request cadence | Source-blocked. Current IRC collection is event-driven; joins, retries, network backoff and metadata requests are paced. |
+| Detect live state and retain titles/details | Implemented using optional Helix credentials; retains stream identity, start, titles/category/language, viewer-count checks and observed offline checks. Failures and stale checks remain Unknown. |
+| Collect during live broadcasts | Implemented selectable All enabled channels / Live channels only policy, persisted in SQLite. Live-only pauses only after a fresh successful offline check. Unknown or stale metadata keeps observation enabled. |
+| First/last positive observations | Implemented per account/channel evidence visit and broadcast summaries; PART never extends the last positive receipt. |
+| Departure and later return | Evidence-supported visits split at PART and collection boundaries. Post-PART delayed NAMES become ambiguous observation-only segments until a JOIN supports a new visit. All boundaries remain uncertain. |
+| Statistical absence estimates | Source-blocked. Silence alone does not close a visit or prove absence. |
+| Search account to channels/broadcasts and reverse | Implemented exact-login filters, range queries and bounded pagination. Broadcast summaries distinguish positive receipts inside the window from uncertain earlier-connected candidates. |
+| Date/time searches | Implemented inclusive From / exclusive Until filters, normalized to UTC with validation. Broadcast intersections cannot leak disjoint time ranges. |
+| Who was present at an instant | Implemented evidence-only view: exact positive receipt / inferred candidate / unknown; future times are rejected, collection outages and departures are not bridged. |
+| Readable timelines | Implemented separate intervals with positive receipt bounds and uncertain ends. Timeline spans are not attendance measurements. |
+| Per-broadcast statistics | Implemented unique associated accounts, observed accounts, inferred-only accounts, supported visit count and positive receipt count; ambiguous segments are excluded from supported visits. |
+| Title/category/viewer-count history | Implemented paginated stored-check table and accessible unconnected viewer-count sample chart. No interpolation across missing checks. |
+| Visible current channel live state and quality | Implemented live/offline/unknown, per-room joining/collecting/unavailable/gap state, last positive receipt and unknown coverage labels. |
+| Individual unavailable-room recovery | Implemented paced retries with bounded backoff and a new evidence session per attempt. Healthy rooms retain their sessions; channel configuration changes do not require a global reconnect. |
+| Retain history indefinitely, no CSV | Implemented without automatic expiry or CSV. Disk use remains finite and visible. |
+| Lightweight dozens-of-channels operation | Architecture remains one socket, bounded queues and serialized SQLite. Synthetic 10/25/50-channel retained-history tests added; extended live scale acceptance remains pending. |
+| Continuous/background operation | Foreground plus optional hidden supervisor and opt-in per-user login task. Bounded crash retries are provided by Task Scheduler. No application startup task is installed merely by building or inspecting code. |
+| Graceful stop | Ctrl+C, guarded local shutdown endpoint and verified Stop-Veylurk.ps1. No arbitrary process termination. |
+| Safe backup/restore | Lock-protected offline backup, nonempty WAL refusal, hash manifest and fresh-directory restore. Existing history is never overwritten. Encrypted credentials remain encrypted. |
+| Storage failure and low disk | Available-byte status and low-space warning; stopped storage causes graceful process failure so the optional task can apply bounded retries. Lost/uncommitted evidence remains an explicit collection gap. |
+| Auto/Light/Dark and accessibility | Preserved persistent theme choices, keyboard focus, horizontal table scrolling and responsive layouts. |
+| Public repo, Unlicense, project name | Existing Gevroska/veylurk repository and Unlicense retained. No guarantee of exclusive name/trademark rights is asserted. |
+| Automatic compilation/tests | Windows workflow extended for new UI/Rust/PowerShell tests, scale fixtures and packaged background-stop/backup/restore lifecycle. |
+
+## Evidence model and preservation
+
+- Raw observations remain intact. Derived model version 1 is stored separately and can be recomputed from retained observations and recorded collection boundaries.
+- Positive NAMES/JOIN receipts support observations. PART is departure evidence and never a positive attendance extension.
+- Delayed roster entries after PART do not create a supported return. Backwards receipt clocks are flagged; uncertain boundaries do not infer continuity.
+- Collection sessions are per room/attempt. A room retry, removal, restart or connection outage cannot silently join visits across the gap. Older room gaps that were never recorded cannot be reconstructed retrospectively.
+- Prior-connected broadcast accounts are explicitly inferred and have no fabricated in-window positive timestamps. Account-to-broadcast and broadcast-to-account filters use the same selected interval.
+- SQL pages and storage jobs are bounded. The retained-history regression verifies an indexed lookup for new sessions rather than scanning all earlier room visits on every account receipt.
+
+## Validation and completion gates
+
+### Automated and fixture checks
+
+- Existing UI/theme tests plus range validation, visits/ambiguous segments, point-in-time states, metadata chart/table, broadcast summaries, policy, storage warning and graceful-stop controls.
+- Rust history tests for departure/return, PART-only evidence, repeated/delayed NAMES, backwards clocks, future instants, recorded gaps, recomputation, migration, ranges, pagination and broadcast association.
+- Dynamic IRC fixture for isolated room retry and configuration changes, plus collector fixture preserving another room's evidence session.
+- Windows PowerShell fixtures for DPAPI, locking/WAL refusal, hashes, restore preservation, startup task configuration and verified shutdown. Fixtures do not install tasks or contact Twitch.
+- Ignored synthetic workload tests run explicitly in CI for 10, 25 and 50 channels, 2,200 observations/channel, retained-history queries/reopen and metadata history. Synthetic dates are not elapsed live operation.
+- GitHub Windows MSVC CI must pass formatting, lint, ordinary/scale tests, release compilation, no-channel startup and real packaged background shutdown/backup/restore before accepting the downloadable candidate.
+
+### Pending machine/live acceptance
+
+- Pause before first launch of the new Internet-capable executable, as requested by the owner. Retry the same binary after firewall approval.
+- Preserve the existing database and DPAPI credentials, verify the copied history, then validate optional metadata on genuinely live channels.
+- Check both search directions, historical migration, separate visits, range filters, themes and collection policy on the real package.
+- Login startup/recovery needs an explicitly selected opt-in task on the intended Windows account. It is implemented but is not installed without that choice.
+- Real extended trials at 10/25/50 channels, resource/growth/query measurements and a 24-hour trial remain pending. See [performance evidence](performance.md). Short trials and CI cannot establish these results.
+- Reconsider Community sampling only if a reproducible, permitted autonomous source is demonstrated. Validate freshness, caching, selection bias, population identity and correlation before introducing statistical estimates or adapting sample cadence.
+
+## Current development evidence
+
+The starting source is 61ea988a06a75be693653bc1b3632fcfa25f3203; remote main was refreshed to 10960907f9f65141a40d552ce1e29b386d925d5f with the identical source tree. On 2026-10-25 no Veylurk process was running. Existing package data has not been modified or migrated during implementation.
+
+Local validation uses isolated fixtures. Rust execution is delegated to hosted Windows MSVC CI because the available local GNU toolchain lacks its native C build dependencies. Final CI/run/artifact identifiers and live validation belong to the candidate verification record; do not reuse the earlier two-channel acceptance as evidence for this revision.
+
+UI visual checks use a clearly marked fictional localhost fixture, without a collector or database. They establish interface rendering and interaction only. New live collection still requires the new executable's firewall approval.
+
+## Further constraints
+
+Windows, English source/UI/documentation, local credentials, indefinite retention and no CSV remain unchanged. Source limitations are outstanding original requirements rather than silently completed items. No routine stage-by-stage permission gate is imposed. The only planned interruption is the owner's new-executable firewall gate or a concrete product decision that cannot be resolved from existing authorization.

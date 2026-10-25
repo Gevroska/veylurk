@@ -28,6 +28,9 @@ jobs:
       - name: Test Windows PowerShell launcher without Twitch
         shell: powershell
         run: .\scripts\Test-VeylurkLauncher.ps1
+      - name: Test offline Windows operations without real startup tasks
+        shell: powershell
+        run: .\scripts\Test-VeylurkOperations.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -37,6 +40,8 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Exercise synthetic 10, 25 and 50 channel history workloads
+        run: cargo test --locked scale_workload -- --ignored --nocapture
       - name: Build release application and probes
         run: cargo build --release --locked
       - name: Smoke-check application help without Twitch
@@ -92,7 +97,53 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path app-package -ErrorAction Stop | Out-Null
           Copy-Item -LiteralPath target/release/veylurk.exe, README.md, LICENSE -Destination app-package -ErrorAction Stop
-          Copy-Item -LiteralPath scripts/Start-Veylurk.ps1, scripts/Setup-Twitch.ps1, scripts/Veylurk-Launcher.ps1 -Destination app-package -ErrorAction Stop
+          Get-ChildItem -LiteralPath scripts -Filter '*Veylurk*.ps1' -File | Copy-Item -Destination app-package -ErrorAction Stop
+          Copy-Item -LiteralPath scripts/Setup-Twitch.ps1 -Destination app-package -ErrorAction Stop
+          New-Item -ItemType Directory -Path app-package/docs -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md -Destination app-package/docs -ErrorAction Stop
+      - name: Verify packaged background shutdown and offline backup with actual SQLite
+        shell: powershell
+        run: |
+          Remove-Item Env:\VEYLURK_TWITCH_CLIENT_ID -ErrorAction SilentlyContinue
+          Remove-Item Env:\VEYLURK_TWITCH_CLIENT_SECRET -ErrorAction SilentlyContinue
+          $maintenancePackage = Join-Path $env:RUNNER_TEMP ('veylurk operations ' + [guid]::NewGuid().ToString('N'))
+          Copy-Item -LiteralPath app-package -Destination $maintenancePackage -Recurse -ErrorAction Stop
+          . (Join-Path $maintenancePackage 'Veylurk-Operations.ps1')
+          $reservation = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+          $reservation.Start()
+          $maintenancePort = $reservation.LocalEndpoint.Port
+          $reservation.Stop()
+          $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -File ' + (ConvertTo-VeylurkArgument (Join-Path $maintenancePackage 'Start-VeylurkBackground.ps1')) + ' -Port ' + $maintenancePort
+          $supervisor = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+          try {
+            $runtime = $null
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            while ([DateTime]::UtcNow -lt $deadline -and -not $supervisor.HasExited) {
+              try { $runtime = Get-VeylurkRuntime $maintenancePort } catch { $runtime = $null }
+              if ($runtime) { break }
+              Start-Sleep -Milliseconds 100
+            }
+            if (-not $runtime) { throw 'Packaged background startup did not become ready.' }
+            $null = Assert-VeylurkRuntime $maintenancePackage $maintenancePort $runtime
+            $backupDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-backup-' + [guid]::NewGuid().ToString('N'))
+            $rejected = $false
+            try { New-VeylurkOfflineBackup $maintenancePackage $backupDirectory } catch { $rejected = $true }
+            if (-not $rejected -or (Test-Path -LiteralPath $backupDirectory)) { throw 'Backup did not refuse an active Rust database lock.' }
+            Stop-VeylurkGracefully $maintenancePackage $maintenancePort 60
+            if (-not $supervisor.WaitForExit(10000) -or $supervisor.ExitCode -ne 0) { throw 'Background supervisor did not exit successfully after graceful shutdown.' }
+            New-VeylurkOfflineBackup $maintenancePackage $backupDirectory
+            $null = Test-VeylurkBackup $backupDirectory
+            $restoredData = Join-Path $env:RUNNER_TEMP ('veylurk-restored-' + [guid]::NewGuid().ToString('N'))
+            Restore-VeylurkOfflineBackup $backupDirectory $restoredData
+            $restoredHash = (Get-FileHash -LiteralPath (Join-Path $restoredData 'observations.sqlite3')).Hash
+            $originalHash = (Get-FileHash -LiteralPath (Join-Path $maintenancePackage 'data\observations.sqlite3')).Hash
+            if ($restoredHash -ne $originalHash) { throw 'Restored SQLite bytes differ.' }
+          } finally {
+            if (-not $supervisor.HasExited) {
+              try { Stop-VeylurkGracefully $maintenancePackage $maintenancePort 60 } catch { Write-Warning 'Graceful CI cleanup was unavailable; no process was killed.' }
+            }
+            $supervisor.Dispose()
+          }
       - name: Publish standalone Windows application artifact
         uses: actions/upload-artifact@v4
         with:

@@ -4,6 +4,7 @@ use tokio::sync::watch;
 use veylurk_probe::{
     app::{self, AppState},
     collector, metadata,
+    runtime::Runtime,
     store::Store,
 };
 
@@ -55,8 +56,12 @@ async fn run(args: Args) -> Result<(), String> {
     let (channel_tx, channel_rx) =
         watch::channel(store.enabled().await.map_err(|e| e.to_string())?);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (selected_tx, selected_rx) = watch::channel(Vec::new());
     let status = collector::status(&store);
     let metadata = metadata::initialize(store.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let runtime = Runtime::initialize(store.clone(), shutdown_tx.clone(), args.port)
         .await
         .map_err(|e| e.to_string())?;
     let router = app::router(
@@ -67,33 +72,59 @@ async fn run(args: Args) -> Result<(), String> {
             port: args.port,
             configuration: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         },
-        metadata.router(),
+        metadata.router().merge(runtime.router()),
     );
-    let collector_task = tokio::spawn(collector::run(
-        store.clone(),
+    let collector_store = store.clone();
+    let collector_shutdown = shutdown_rx.clone();
+    let collector_stop = shutdown_tx.clone();
+    let collector_task = tokio::spawn(async move {
+        collector::run(
+            collector_store,
+            selected_rx,
+            collector_shutdown,
+            status.clone(),
+        )
+        .await;
+        if status.read().await.state == "storage_error" {
+            // A stopped collector must not leave a healthy-looking unattended process.
+            // Graceful process failure lets the opt-in scheduler apply bounded retries.
+            collector_stop.send_replace(true);
+            Err("Collection stopped after a storage failure; uncommitted observations may be missing.")
+        } else {
+            Ok(())
+        }
+    });
+    let policy_task = tokio::spawn(runtime.run_policy(
+        metadata.clone(),
         channel_rx.clone(),
+        selected_tx,
         shutdown_rx.clone(),
-        status,
     ));
-    let metadata_task = tokio::spawn(metadata.run(channel_rx, shutdown_rx));
+    let metadata_task = tokio::spawn(metadata.run(channel_rx, shutdown_rx.clone()));
     println!(
         "Veylurk is available at http://127.0.0.1:{} . Press Ctrl+C to stop.",
         args.port
     );
     let shutdown = shutdown_tx.clone();
     let duration = args.run_for_seconds;
+    let mut api_shutdown = shutdown_rx;
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _=tokio::signal::ctrl_c()=>{},
+                _=api_shutdown.wait_for(|stop|*stop)=>{},
                 _=async {match duration {Some(seconds)=>tokio::time::sleep(std::time::Duration::from_secs(seconds)).await,None=>std::future::pending::<()>().await}}=>{},
             }
             let _ = shutdown.send(true);
         })
         .await;
     let _ = shutdown_tx.send(true);
-    collector_task.await.map_err(|_| "collector task failed")?;
+    let collector_result = collector_task.await.map_err(|_| "collector task failed")?;
     metadata_task.await.map_err(|_| "metadata task failed")?;
+    policy_task
+        .await
+        .map_err(|_| "collection policy task failed")?;
     store.checkpoint().await.map_err(|e| e.to_string())?;
+    collector_result?;
     server.map_err(|_| "local HTTP server failed".to_owned())
 }

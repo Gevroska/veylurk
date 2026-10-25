@@ -57,6 +57,7 @@ pub struct Observation {
     pub account: Option<String>,
     pub kind: String,
     pub received_at: String,
+    pub received_at_utc: Option<String>,
     pub source: &'static str,
 }
 
@@ -123,7 +124,7 @@ impl Store {
                 let lock_path=PathBuf::from(format!("{}.lock",worker_path.display()));
                 let lock=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path).map_err(|_|StoreError::Initialize)?;
                 lock.try_lock().map_err(|_|StoreError::Initialize)?;
-                let conn = Connection::open(&worker_path)?;
+                let mut conn = Connection::open(&worker_path)?;
                 conn.busy_timeout(Duration::from_secs(5))?;
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
                     CREATE TABLE IF NOT EXISTS channels(login TEXT PRIMARY KEY,tracked INTEGER NOT NULL,enabled INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
@@ -146,8 +147,10 @@ impl Store {
                 if version==0 {
                     conn.execute_batch("BEGIN; INSERT OR IGNORE INTO relationships SELECT channel,account,MIN(received_at),MAX(received_at),COUNT(*) FROM observations WHERE account IS NOT NULL GROUP BY channel,account; PRAGMA user_version=1; COMMIT;")?;
                 }
+                crate::history::initialize(&mut conn)?;
                 // A process restart closes any session that could not record its own end.
-                conn.execute("UPDATE sessions SET ended_at=COALESCE((SELECT MAX(received_at) FROM observations WHERE session_id=sessions.id),started_at),end_reason='process_interrupted',end_uncertain=1,closed_recorded_at=?1 WHERE ended_at IS NULL", [now()])?;
+                conn.execute("UPDATE sessions SET ended_at=COALESCE((SELECT MAX(received_at_utc) FROM observations WHERE session_id=sessions.id),started_at),end_reason='process_interrupted',end_uncertain=1,closed_recorded_at=?1 WHERE ended_at IS NULL", [now()])?;
+                conn.execute("UPDATE history_visits SET end_basis='session_end',end_reason='process_interrupted',closed_at=(SELECT ended_at FROM sessions WHERE id=history_visits.session_id) WHERE end_basis IS NULL AND EXISTS(SELECT 1 FROM sessions WHERE id=history_visits.session_id AND ended_at IS NOT NULL)",[])?;
                 Ok((conn,lock))
             };
             match init() {
@@ -273,10 +276,14 @@ impl Store {
 
     pub async fn end_session(&self, id: i64, reason: String) -> Result<(), StoreError> {
         self.call(move |conn| {
-            conn.execute(
+            let tx=conn.transaction()?;
+            let stamp=now();
+            tx.execute(
                 "UPDATE sessions SET ended_at=?1,closed_recorded_at=?1,end_reason=?2 WHERE id=?3 AND ended_at IS NULL",
-                params![now(), reason, id],
+                params![stamp, reason, id],
             )?;
+            tx.execute("UPDATE history_visits SET end_basis='session_end',end_reason=?1,closed_at=?2 WHERE session_id=?3 AND end_basis IS NULL",params![reason,stamp,id])?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -289,9 +296,12 @@ impl Store {
         ready: bool,
     ) -> Result<(), StoreError> {
         self.call(move |conn| {
+            let tx=conn.transaction()?;
             let state=if ready {"collecting"} else {"unavailable"};
             let error=if ready {None} else {Some("Membership unavailable for this room; healthy rooms continue collecting.")};
-            conn.execute("UPDATE session_channels SET collection_state=?1,collection_error=?2 WHERE session_id=?3 AND channel=?4",params![state,error,session_id,channel])?;
+            tx.execute("UPDATE session_channels SET collection_state=?1,collection_error=?2 WHERE session_id=?3 AND channel=?4",params![state,error,session_id,channel])?;
+            if !ready {crate::history::gap(&tx,session_id,&channel,"membership_unavailable")?;}
+            tx.commit()?;
             Ok(())
         }).await
     }
@@ -309,11 +319,16 @@ impl Store {
             let open: bool=tx.query_row("SELECT ended_at IS NULL FROM sessions WHERE id=?1",[session_id],|r|r.get(0))?;
             if !open { return Err(StoreError::Invalid); }
             let count=observations.len() as i64;
-            { let mut stmt=tx.prepare_cached("INSERT INTO observations(session_id,channel,account,kind,received_at) VALUES (?1,?2,?3,?4,?5)")?;
+            { let mut stmt=tx.prepare_cached("INSERT INTO observations(session_id,channel,account,kind,received_at,received_at_utc) VALUES (?1,?2,?3,?4,?5,?6)")?;
               let mut relationship=tx.prepare_cached("INSERT INTO relationships(channel,account,first_observed_at,last_observed_at,observation_count) VALUES (?1,?2,?3,?3,1) ON CONFLICT(channel,account) DO UPDATE SET first_observed_at=MIN(first_observed_at,excluded.first_observed_at),last_observed_at=MAX(last_observed_at,excluded.last_observed_at),observation_count=observation_count+1")?;
               for event in observations {
-                  stmt.execute(params![session_id,event.channel,event.account,event.kind,event.received_at])?;
-                  if let Some(account)=event.account {relationship.execute(params![event.channel,account,event.received_at])?;}
+                  let stamp=crate::history::utc(&event.received_at)?;
+                  let channel=normalize(&event.channel)?;
+                  let account=event.account.as_deref().map(normalize).transpose()?;
+                  stmt.execute(params![session_id,channel,account,event.kind,event.received_at,stamp])?;
+                  let id=tx.last_insert_rowid();
+                  if let Some(ref account)=account {crate::history::derive(&tx,id,session_id,&channel,account,&event.kind,&stamp)?;}
+                  if let Some(account)=account {relationship.execute(params![channel,account,stamp])?;}
               } }
             tx.execute("UPDATE collection_totals SET observation_count=observation_count+?1 WHERE id=1",[count])?;
             tx.commit()?; Ok(())
@@ -327,16 +342,36 @@ impl Store {
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<Observation>, StoreError> {
+        self.search_range(
+            account,
+            channel,
+            before,
+            limit,
+            crate::history::TimeRange::default(),
+        )
+        .await
+    }
+
+    pub async fn search_range(
+        &self,
+        account: Option<String>,
+        channel: Option<String>,
+        before: Option<i64>,
+        limit: usize,
+        range: crate::history::TimeRange,
+    ) -> Result<Vec<Observation>, StoreError> {
         let account = account.map(|a| normalize(&a)).transpose()?;
         let channel = channel.map(|c| normalize(&c)).transpose()?;
         self.call(move |conn| {
-            let mut sql="SELECT id,session_id,channel,account,kind,received_at FROM observations WHERE id<?".to_owned();
+            let mut sql="SELECT id,session_id,channel,account,kind,received_at,received_at_utc FROM observations WHERE id<?".to_owned();
             let mut values=vec![rusqlite::types::Value::Integer(before.unwrap_or(i64::MAX))];
             if let Some(account)=account {sql.push_str(" AND account=?");values.push(account.into());}
             if let Some(channel)=channel {sql.push_str(" AND channel=?");values.push(channel.into());}
+            if let Some(from)=range.from {sql.push_str(" AND received_at_utc>=?");values.push(from.into());}
+            if let Some(to)=range.to {sql.push_str(" AND received_at_utc<?");values.push(to.into());}
             sql.push_str(" ORDER BY id DESC LIMIT ?");values.push((limit.min(501) as i64).into());
             let mut stmt=conn.prepare(&sql)?;
-            let rows=stmt.query_map(rusqlite::params_from_iter(values),|r|Ok(Observation {id:r.get(0)?,session_id:r.get(1)?,channel:r.get(2)?,account:r.get(3)?,kind:r.get(4)?,received_at:r.get(5)?,source:"twitch_irc"}))?;
+            let rows=stmt.query_map(rusqlite::params_from_iter(values),|r|Ok(Observation {id:r.get(0)?,session_id:r.get(1)?,channel:r.get(2)?,account:r.get(3)?,kind:r.get(4)?,received_at:r.get(5)?,received_at_utc:r.get(6)?,source:"twitch_irc"}))?;
             Ok(rows.collect::<Result<Vec<_>,_>>()?)
         }).await
     }
@@ -347,10 +382,20 @@ impl Store {
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<Session>, StoreError> {
+        self.history_range(channel, before, limit, crate::history::TimeRange::default())
+            .await
+    }
+    pub async fn history_range(
+        &self,
+        channel: String,
+        before: Option<i64>,
+        limit: usize,
+        range: crate::history::TimeRange,
+    ) -> Result<Vec<Session>, StoreError> {
         let channel = normalize(&channel)?;
         self.call(move |conn| {
-            let mut stmt=conn.prepare("SELECT s.id,sc.channel,s.started_at,s.ended_at,s.end_reason,(SELECT COUNT(*) FROM observations o WHERE o.session_id=s.id AND o.channel=sc.channel),s.end_uncertain,s.closed_recorded_at FROM sessions s JOIN session_channels sc ON s.id=sc.session_id WHERE sc.channel=?1 AND s.id<?2 ORDER BY s.id DESC LIMIT ?3")?;
-            let rows=stmt.query_map(params![channel,before.unwrap_or(i64::MAX),limit.min(501) as i64],|r|Ok(Session{id:r.get(0)?,channel:r.get(1)?,started_at:r.get(2)?,ended_at:r.get(3)?,end_reason:r.get(4)?,observation_count:r.get(5)?,end_uncertain:r.get(6)?,closed_recorded_at:r.get(7)?}))?;
+            let mut stmt=conn.prepare("SELECT s.id,sc.channel,s.started_at,s.ended_at,s.end_reason,(SELECT COUNT(*) FROM observations o WHERE o.session_id=s.id AND o.channel=sc.channel),s.end_uncertain,s.closed_recorded_at FROM sessions s JOIN session_channels sc ON s.id=sc.session_id WHERE sc.channel=?1 AND s.id<?2 AND (?4 IS NULL OR COALESCE(s.ended_at,'9999')>?4) AND (?5 IS NULL OR s.started_at<?5) ORDER BY s.id DESC LIMIT ?3")?;
+            let rows=stmt.query_map(params![channel,before.unwrap_or(i64::MAX),limit.min(501) as i64,range.from,range.to],|r|Ok(Session{id:r.get(0)?,channel:r.get(1)?,started_at:r.get(2)?,ended_at:r.get(3)?,end_reason:r.get(4)?,observation_count:r.get(5)?,end_uncertain:r.get(6)?,closed_recorded_at:r.get(7)?}))?;
             Ok(rows.collect::<Result<Vec<_>,_>>()?)
         }).await
     }
@@ -362,13 +407,34 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Relationship>, StoreError> {
+        self.relationships_range(
+            account,
+            channel,
+            offset,
+            limit,
+            crate::history::TimeRange::default(),
+        )
+        .await
+    }
+    pub async fn relationships_range(
+        &self,
+        account: Option<String>,
+        channel: Option<String>,
+        offset: usize,
+        limit: usize,
+        range: crate::history::TimeRange,
+    ) -> Result<Vec<Relationship>, StoreError> {
         let account = account.map(|a| normalize(&a)).transpose()?;
         let channel = channel.map(|c| normalize(&c)).transpose()?;
         self.call(move |conn| {
-            let mut sql="SELECT channel,account,first_observed_at,last_observed_at,observation_count FROM relationships WHERE 1=1".to_owned();
+            let filtered=range.from.is_some()||range.to.is_some();
+            let mut sql=if filtered {"SELECT channel,account,MIN(received_at_utc),MAX(received_at_utc),COUNT(*) FROM observations WHERE account IS NOT NULL"}else{"SELECT channel,account,first_observed_at,last_observed_at,observation_count FROM relationships WHERE 1=1"}.to_owned();
             let mut values=Vec::<rusqlite::types::Value>::new();
             if let Some(account)=account {sql.push_str(" AND account=?");values.push(account.into());}
             if let Some(channel)=channel {sql.push_str(" AND channel=?");values.push(channel.into());}
+            if let Some(from)=range.from {sql.push_str(" AND received_at_utc>=?");values.push(from.into());}
+            if let Some(to)=range.to {sql.push_str(" AND received_at_utc<?");values.push(to.into());}
+            if filtered {sql.push_str(" GROUP BY channel,account");}
             sql.push_str(" ORDER BY channel,account LIMIT ? OFFSET ?");values.push((limit.min(501) as i64).into());values.push((offset.min(1_000_000) as i64).into());
             let mut stmt=conn.prepare(&sql)?;
             let rows=stmt.query_map(rusqlite::params_from_iter(values),|r|Ok(Relationship{channel:r.get(0)?,account:r.get(1)?,first_observed_at:r.get(2)?,last_observed_at:r.get(3)?,observation_count:r.get(4)?}))?;
