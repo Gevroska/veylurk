@@ -42,7 +42,9 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked -- --skip collector::buffer_tests::fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls
+      - name: Verify fixed-time buffered storage recovery in isolation
+        run: cargo test --locked --lib collector::buffer_tests::fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls -- --exact --nocapture --test-threads=1
       - name: Exercise synthetic 10, 25 and 50 channel history workloads
         run: cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
       - name: Build release application and probes

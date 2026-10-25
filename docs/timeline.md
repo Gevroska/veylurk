@@ -40,3 +40,5 @@ Sources: [NIST binomial distribution](https://www.itl.nist.gov/div898/handbook/e
 ## Preservation and resource bounds
 
 The endpoint is read-only and uses existing observations, visits and session boundaries. It neither changes collection cadence nor rewrites history. Response size, page size, date range and query execution are bounded. The chart uses embedded SVG and existing theme styles; collection requires no chart library or browser runtime.
+
+The Windows workflow runs ordinary tests and the fixed-time 50-room buffered storage recovery fixture in separate test processes. The recovery fixture retains its debug profile, workload, four Tokio workers, PONG checks, durability assertions and original deadlines. Isolation removes overlapping storage workers from other tests; it does not establish why an earlier recovery deadline was missed or constitute extended live-capacity evidence.
