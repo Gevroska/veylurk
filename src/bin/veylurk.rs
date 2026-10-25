@@ -3,7 +3,9 @@ use std::{path::PathBuf, process::ExitCode};
 use tokio::sync::watch;
 use veylurk_probe::{
     app::{self, AppState},
-    collector, metadata,
+    collector,
+    diagnostics::Diagnostics,
+    metadata,
     runtime::Runtime,
     store::Store,
 };
@@ -31,7 +33,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    match run(args).await {
+    let diagnostics = Diagnostics::new(&args.database);
+    let result = run(args, diagnostics.clone()).await;
+    // Never join the writer indefinitely on a failing filesystem. Persistence status distinguishes
+    // acknowledged writes from pending or failed attempts while the application is running.
+    let _ = diagnostics.flush(std::time::Duration::from_millis(500));
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("Veylurk failed: {message}");
@@ -40,11 +47,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Args) -> Result<(), String> {
+async fn run(args: Args, diagnostics: Diagnostics) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.port))
         .await
         .map_err(|_| "loopback port is unavailable")?;
-    let store = Store::open(&args.database)
+    let store = Store::open_with_diagnostics(&args.database, diagnostics.clone())
         .await
         .map_err(|e| e.to_string())?;
     if !args.channel.is_empty() {
@@ -107,14 +114,23 @@ async fn run(args: Args) -> Result<(), String> {
     );
     let shutdown = shutdown_tx.clone();
     let duration = args.run_for_seconds;
-    let mut api_shutdown = shutdown_rx;
+    let api_shutdown = shutdown_rx;
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            tokio::select! {
-                _=tokio::signal::ctrl_c()=>{},
-                _=api_shutdown.wait_for(|stop|*stop)=>{},
-                _=async {match duration {Some(seconds)=>tokio::time::sleep(std::time::Duration::from_secs(seconds)).await,None=>std::future::pending::<()>().await}}=>{},
-            }
+            veylurk_probe::shutdown::wait(
+                tokio::signal::ctrl_c(),
+                api_shutdown,
+                async {
+                    match duration {
+                        Some(seconds) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                },
+                diagnostics,
+            )
+            .await;
             let _ = shutdown.send(true);
         })
         .await;

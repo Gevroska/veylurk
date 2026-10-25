@@ -75,7 +75,10 @@ async fn flush_pending(
     for event in std::mem::take(pending) {
         let id = *sessions
             .get(&event.channel)
-            .ok_or(crate::store::StoreError::Invalid)?;
+            .ok_or(crate::store::StoreError::Invalid)
+            .inspect_err(|error| {
+                store.record_failure(crate::diagnostics::Operation::Append, error)
+            })?;
         grouped.entry(id).or_default().push(event);
         count += 1;
         if count == 512 {
@@ -216,7 +219,10 @@ async fn run_endpoint(
                                     }
                                     saved
                                 },
-                                None=>Err(crate::store::StoreError::Invalid),
+                                None=>{
+                                    store.record_failure(crate::diagnostics::Operation::RoomState, &crate::store::StoreError::Invalid);
+                                    Err(crate::store::StoreError::Invalid)
+                                },
                             }
                         },
                         StreamEvent::RoomUnavailable(channel)|StreamEvent::RoomLeft(channel)=> {
@@ -356,6 +362,10 @@ fn session_end_reason(reason: Option<String>, worker_error: Option<String>) -> S
         (None, None) => "connection_ended".into(),
     }
 }
+
+#[cfg(test)]
+#[path = "collector_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {

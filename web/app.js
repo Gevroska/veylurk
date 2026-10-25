@@ -11,6 +11,7 @@
   let channelsGeneration = 0;
   let channelsLoaded = false;
   let healthLoaded = false;
+  let healthDiagnostics = null;
   let renderedChannelsSignature = null;
   let searchQuery = null;
   let broadcastQuery = null;
@@ -342,7 +343,40 @@
     list.append(description);
   }
 
+  function diagnosticDetails(diagnostics) {
+    if (!diagnostics || typeof diagnostics !== "object") return null;
+    const panel = node("details", null, "card");
+    panel.append(node("summary", "Local fault diagnostics"));
+    panel.append(node("p", "Fault records describe program errors. They do not establish that missing observations were recovered.", "quiet"));
+    const persistence = diagnostics.persistence || {};
+    const fields = node("dl", null, "detail-list");
+    detail(fields, "Diagnostic file status", label(persistence.state || "unknown"));
+    detail(fields, "Diagnostic write failures", count(persistence.failure_count));
+    detail(fields, "Diagnostic records not queued", count(persistence.dropped_count));
+    panel.append(fields);
+    const first = diagnostics.first_failure || diagnostics.latest;
+    if (!first) panel.append(node("p", "No fault recorded in this application run."));
+    const records = first ? [[diagnostics.first_failure ? "First storage failure" : "Latest recorded fault", first]] : [];
+    if (diagnostics.latest && diagnostics.latest.sequence !== first?.sequence) records.push(["Latest recorded fault", diagnostics.latest]);
+    for (const [heading, record] of records) {
+      const fault = node("dl", null, "detail-list");
+      panel.append(node("h3", heading));
+      detail(fault, "Recorded", timestamp(record.occurred_at_utc));
+      detail(fault, "Operation", label(record.operation));
+      detail(fault, "Category", label(record.category));
+      detail(fault, "Elapsed milliseconds", count(record.elapsed_ms));
+      detail(fault, "SQLite primary code", record.sqlite_primary_code);
+      detail(fault, "SQLite extended code", record.sqlite_extended_code);
+      detail(fault, "Deadline interruption requested", record.progress_interrupt_requested === true ? "Yes" : record.progress_interrupt_requested === false ? "No" : "Unknown");
+      detail(fault, "SQLite transaction active after operation", record.autocommit_after === true ? "No" : record.autocommit_after === false ? "Yes" : "Unknown");
+      panel.append(fault);
+    }
+    return panel;
+  }
+
   function renderHealth(status) {
+    const diagnosticsOpen = healthDiagnostics?.open === true;
+    const diagnosticsFocused = healthDiagnostics && healthDiagnostics.contains(document.activeElement);
     collectorStatus = status;
     const tone = ["collecting", "connected", "running"].includes(status.state) ? "good" : ["error", "failed"].includes(status.state) ? "bad" : "warning";
     $("connection-status").textContent = label(status.state);
@@ -364,6 +398,13 @@
     $("storage-warning").hidden = !status.storage_warning;
     $("storage-warning").textContent = status.storage_warning || "";
     $("health-results").replaceChildren(grid, details);
+    const diagnostics = diagnosticDetails(status.diagnostics);
+    healthDiagnostics = diagnostics;
+    if (diagnostics) {
+      diagnostics.open = diagnosticsOpen;
+      $("health-results").append(diagnostics);
+      if (diagnosticsFocused) diagnostics.children[0].focus({ preventScroll: true });
+    }
     healthLoaded = true;
     $("health-results").classList.remove("stale");
     $("status-updated").textContent = "Updated " + clock.format(new Date());

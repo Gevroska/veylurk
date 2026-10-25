@@ -47,6 +47,8 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Graceful stop | Ctrl+C, guarded local shutdown endpoint and verified Stop-Veylurk.ps1. No arbitrary process termination. |
 | Safe backup/restore | Lock-protected offline backup, nonempty WAL refusal, hash manifest and fresh-directory restore. Existing history is never overwritten. Encrypted credentials remain encrypted. |
 | Storage failure and low disk | Available-byte status and low-space warning; stopped storage causes graceful process failure so the optional task can apply bounded retries. Lost/uncommitted evidence remains an explicit collection gap. |
+| Diagnose unattended failures | Bounded typed sidecar independent of SQLite, first storage failure retained separately from later cleanup, numeric error codes and actual progress-interruption flag. Persistence is best-effort and visible in Collection health. See [diagnostics](diagnostics.md). |
+| Measure an unattended trial | Read-only finite localhost measurement, exact process identity, explicit replacement/API gaps, actual CPU denominator and bounded reports. See [measurement](measurement.md). Extended acceptance still requires elapsed real operation. |
 | Auto/Light/Dark and accessibility | Preserved persistent theme choices, keyboard focus, horizontal table scrolling and responsive layouts. |
 | Public repo, Unlicense, project name | Existing Gevroska/veylurk repository and Unlicense retained. No guarantee of exclusive name/trademark rights is asserted. |
 | Automatic compilation/tests | Windows workflow extended for new UI/Rust/PowerShell tests, scale fixtures and packaged background-stop/backup/restore lifecycle. |
@@ -68,6 +70,8 @@ For independent uniform samples of size k from a fixed population N, the conditi
 - Rust history tests for departure/return, PART-only evidence, repeated/delayed NAMES, backwards clocks, future instants, recorded gaps, recomputation, migration, ranges, pagination and broadcast association.
 - Dynamic IRC fixture for isolated room retry and configuration changes, plus collector fixture preserving another room's evidence session.
 - Windows PowerShell fixtures for DPAPI, locking/WAL refusal, hashes, restore preservation, startup task configuration and verified shutdown. Fixtures do not install tasks or contact Twitch.
+- Deterministic SQLite progress interruption inside the real append transaction, raw/derived/totals rollback, fresh next-job budget, explicit collector failure boundary, bounded diagnostic persistence and signal-registration error handling.
+- Measurement fixtures cover exact process ownership, replacement, API failure, actual CPU timing, redaction and finite output bounds. Packaged CI also checks a finite hidden liveness interval and actual local measurement without channels.
 - Ignored synthetic workload tests run explicitly in CI for 10, 25 and 50 channels, 2,200 observations/channel, retained-history queries/reopen and metadata history. Synthetic dates are not elapsed live operation.
 - GitHub Windows MSVC CI must pass formatting, lint, ordinary/scale tests, release compilation, no-channel startup and real packaged background shutdown/backup/restore before accepting the downloadable candidate.
 
@@ -82,11 +86,13 @@ For independent uniform samples of size k from a fixed population N, the conditi
 
 ## Current development evidence
 
-The starting source is 61ea988a06a75be693653bc1b3632fcfa25f3203; remote main was refreshed to 10960907f9f65141a40d552ce1e29b386d925d5f with the identical source tree. On 2026-10-25 no Veylurk process was running. Existing package data has not been modified or migrated during implementation.
+The history/runtime increment at `4cb1c257` passed Windows CI, including 95 Rust tests counting the three explicit scale cases, 25 JavaScript tests and packaged operations. Its subsequent short live trial verified two genuinely live channels, both search directions, broadcast associations, themes, policy persistence and graceful stop. All 8,538 original raw observations and eight original session boundaries were verified unchanged; original rollback data and encrypted credentials were preserved.
+
+Two initial starts of that revision stopped with generic storage errors; later foreground and hidden background runs were healthy. The earlier error's underlying SQLite code was not retained, so its cause remains unresolved. The current reliability increment adds bounded safe diagnostics, deterministic interruption tests, signal-result handling and measurement tooling. It does not increase the write deadline, retry partial flushes, relax durability or claim the earlier cause is fixed.
 
 Local validation uses isolated fixtures. Rust execution is delegated to hosted Windows MSVC CI because the available local GNU toolchain lacks its native C build dependencies. Final CI/run/artifact identifiers and live validation belong to the candidate verification record; do not reuse the earlier two-channel acceptance as evidence for this revision.
 
-UI visual checks use a clearly marked fictional localhost fixture, without a collector or database. They establish interface rendering and interaction only. New live collection still requires the new executable's firewall approval.
+UI visual checks use a clearly marked fictional localhost fixture, without a collector or database. They establish interface rendering and interaction only. The already approved application may keep collecting during development; each newly built executable still requires its own firewall launch approval before live validation. Short trials of the earlier revision are not acceptance of the new binary.
 
 ## Further constraints
 

@@ -421,6 +421,51 @@ test("disk warning remains visible and shutdown needs explicit confirmation with
   assert.equal(app.get("stop-app").disabled, false);
 });
 
+test("fault details preserve the first cause, distinguish callback interruption, and render text literally", async () => {
+  const hostile = '<img src=x onerror="injected()">';
+  const app = createApp((target) => {
+    if (target.pathname === "/api/status") return {
+      state: "storage_error", storage_health: "unavailable",
+      diagnostics: {
+        first_failure: { sequence: 1, occurred_at_utc: received, operation: "append", category: hostile, elapsed_ms: 5010, sqlite_primary_code: 9, sqlite_extended_code: 9, progress_interrupt_requested: true, autocommit_after: true },
+        latest: { sequence: 2, occurred_at_utc: received, operation: "checkpoint", category: "checkpoint_busy", elapsed_ms: 2, sqlite_primary_code: null, sqlite_extended_code: null, progress_interrupt_requested: false, autocommit_after: null },
+        persistence: { state: "failed", failure_count: 1, dropped_count: 2 },
+      },
+    };
+  });
+  await settle();
+  const health = app.get("health-results");
+  assert.match(health.textContent, /First storage failure/);
+  assert.match(health.textContent, /Latest recorded fault/);
+  assert.ok(health.textContent.indexOf("Append") < health.textContent.indexOf("Checkpoint"));
+  assert.match(health.textContent, /Deadline interruption requestedYes/);
+  assert.match(health.textContent, /Deadline interruption requestedNo/);
+  assert.match(health.textContent, /transaction active after operationNo/);
+  assert.match(health.textContent, /transaction active after operationUnknown/);
+  assert.ok(health.textContent.includes(hostile));
+  assert.equal(descendants(health).some((element) => element.tagName === "IMG"), false);
+  assert.match(health.textContent, /Diagnostic records not queued2/);
+  assert.doesNotMatch(health.textContent, /successfully recovered|rolled back/);
+});
+
+test("health refresh keeps fault details expanded and preserves keyboard focus", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/status") return {
+      state: "collecting",
+      diagnostics: { first_failure: null, latest: null, persistence: { state: "not_attempted", failure_count: 0, dropped_count: 0 } },
+    };
+  });
+  await settle();
+  const original = descendants(app.get("health-results")).find((element) => element.tagName === "DETAILS");
+  original.open = true;
+  original.children[0].focus();
+  await app.get("refresh-status").dispatch("click"); await settle();
+  const refreshed = descendants(app.get("health-results")).find((element) => element.tagName === "DETAILS");
+  assert.equal(refreshed.open, true);
+  assert.equal(app.document.activeElement, refreshed.children[0]);
+  assert.match(refreshed.textContent, /No fault recorded in this application run/);
+});
+
 test("per-room health overrides an open session and never equates recent receipts with completeness", async () => {
   const app = createApp((target) => {
     if (target.pathname === "/api/status") return { state: "membership_unavailable", rooms: [{ channel: "sample_channel", state: "unavailable", last_positive_at: received, last_error: "Room response deadline elapsed", coverage: "unknown" }] };

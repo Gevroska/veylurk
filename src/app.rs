@@ -199,6 +199,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
             value["session_count"] = Value::Null;
         }
     }
+    value["diagnostics"] = json!(state.store.diagnostics());
     Ok(Json(value))
 }
 async fn channels(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -593,6 +594,67 @@ mod tests {
             app.oneshot(request).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    #[tokio::test]
+    async fn status_keeps_first_failure_and_exposes_codes_without_sql_error_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("diagnostics.sqlite3"))
+            .await
+            .unwrap();
+        const PRIVATE: &str = "private SQL account credential marker";
+        let result = store
+            .call(|_| {
+                Err::<(), crate::store::StoreError>(crate::store::StoreError::Sqlite(
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                        Some(PRIVATE.to_owned()),
+                    ),
+                ))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(store
+            .call(|_| Err::<(), crate::store::StoreError>(crate::store::StoreError::Invalid))
+            .await
+            .is_err());
+        let status = crate::collector::status(&store);
+        let (channels, _) = watch::channel(Vec::new());
+        let app = router(
+            AppState {
+                store,
+                status,
+                channels,
+                port: 8794,
+                configuration: Arc::new(Mutex::new(())),
+            },
+            Router::new(),
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/status")
+                    .header("host", "127.0.0.1:8794")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 32768)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(PRIVATE));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let first = &value["diagnostics"]["first_failure"];
+        let latest = &value["diagnostics"]["latest"];
+        assert_eq!(
+            first["sqlite_primary_code"],
+            rusqlite::ffi::SQLITE_INTERRUPT
+        );
+        assert_eq!(first["progress_interrupt_requested"], false);
+        assert!(first["sequence"].as_u64().unwrap() < latest["sequence"].as_u64().unwrap());
+        assert!(value["diagnostics"]["persistence"]["state"].is_string());
     }
 
     #[tokio::test]

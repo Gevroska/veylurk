@@ -31,6 +31,9 @@ jobs:
       - name: Test offline Windows operations without real startup tasks
         shell: powershell
         run: .\scripts\Test-VeylurkOperations.ps1
+      - name: Test bounded local measurement without a collector
+        shell: powershell
+        run: .\scripts\Test-VeylurkMeasurement.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -100,7 +103,7 @@ jobs:
           Get-ChildItem -LiteralPath scripts -Filter '*Veylurk*.ps1' -File | Copy-Item -Destination app-package -ErrorAction Stop
           Copy-Item -LiteralPath scripts/Setup-Twitch.ps1 -Destination app-package -ErrorAction Stop
           New-Item -ItemType Directory -Path app-package/docs -ErrorAction Stop | Out-Null
-          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md -Destination app-package/docs -ErrorAction Stop
+          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md -Destination app-package/docs -ErrorAction Stop
       - name: Verify packaged background shutdown and offline backup with actual SQLite
         shell: powershell
         run: |
@@ -125,6 +128,16 @@ jobs:
             }
             if (-not $runtime) { throw 'Packaged background startup did not become ready.' }
             $null = Assert-VeylurkRuntime $maintenancePackage $maintenancePort $runtime
+            # Readiness alone must not hide an immediate signal-registration exit.
+            foreach ($check in 1..3) {
+              Start-Sleep -Seconds 2
+              $stillRunning = Get-VeylurkRuntime $maintenancePort
+              if ($supervisor.HasExited -or $stillRunning.instance_id -cne $runtime.instance_id) { throw 'Hidden packaged startup did not remain live.' }
+            }
+            . (Join-Path $maintenancePackage 'Measure-Veylurk.ps1')
+            $measurementDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-measurement-' + [guid]::NewGuid().ToString('N'))
+            $measurement = Invoke-VeylurkMeasurement -PackageDirectory $maintenancePackage -Port $maintenancePort -DurationSeconds 60 -IntervalSeconds 2 -OutputDirectory $measurementDirectory -MaxSamples 3
+            if ($measurement.samples -ne 3 -or $measurement.sample_outcomes.ok -ne 3) { throw 'Packaged local measurement did not retain three valid samples.' }
             $backupDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-backup-' + [guid]::NewGuid().ToString('N'))
             $rejected = $false
             try { New-VeylurkOfflineBackup $maintenancePackage $backupDirectory } catch { $rejected = $true }

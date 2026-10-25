@@ -1,10 +1,14 @@
 //! Serialized SQLite access. Account logins are observations, not permanent account IDs.
+use crate::diagnostics::{Diagnostics, Operation};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -22,6 +26,10 @@ const WAL_RETAINED_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
+
+#[cfg(test)]
+#[path = "store_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -46,6 +54,9 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 pub struct Store {
     sender: mpsc::Sender<Job>,
     path: Arc<PathBuf>,
+    diagnostics: Diagnostics,
+    #[cfg(test)]
+    append_expiry: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,10 +165,20 @@ fn close_session(
 
 impl Store {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let diagnostics = Diagnostics::new(path.as_ref());
+        Self::open_with_diagnostics(path, diagnostics).await
+    }
+
+    pub async fn open_with_diagnostics(
+        path: impl AsRef<Path>,
+        diagnostics: Diagnostics,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
         let (sender, mut receiver) = mpsc::channel::<Job>(64);
         let (ready_tx, ready_rx) = oneshot::channel();
         let worker_path = path.clone();
+        let worker_diagnostics = diagnostics.clone();
+        let initializing = std::time::Instant::now();
         std::thread::Builder::new().name("veylurk-storage".into()).spawn(move || {
             let init = || -> Result<(Connection,std::fs::File), StoreError> {
                 if let Some(parent) = worker_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -201,20 +222,37 @@ impl Store {
                 Ok((mut conn,_lock)) => {
                     if ready_tx.send(Ok(())).is_err() { return; }
                     while let Some(job) = receiver.blocking_recv() {
-                        let deadline=std::time::Instant::now()+Duration::from_secs(5);
-                        conn.progress_handler(10_000,Some(move ||std::time::Instant::now()>=deadline));
                         job(&mut conn);
-                        conn.progress_handler(0,None::<fn()->bool>);
                     }
-                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                    if let Err(error) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                        worker_diagnostics.storage_failure(Operation::Checkpoint, &error.into(), Duration::ZERO, false, Some(conn.is_autocommit()));
+                    }
                 }
-                Err(error) => { let _ = ready_tx.send(Err(error)); }
+                Err(error) => {
+                    worker_diagnostics.storage_failure(Operation::Initialize, &error, initializing.elapsed(), false, None);
+                    let _ = ready_tx.send(Err(error));
+                }
             }
-        }).map_err(|_| StoreError::Initialize)?;
-        ready_rx.await.map_err(|_| StoreError::Unavailable)??;
+        }).map_err(|_| {
+            diagnostics.storage_failure(Operation::Initialize, &StoreError::Initialize, initializing.elapsed(), false, None);
+            StoreError::Initialize
+        })?;
+        ready_rx.await.map_err(|_| {
+            diagnostics.storage_failure(
+                Operation::Initialize,
+                &StoreError::Unavailable,
+                initializing.elapsed(),
+                false,
+                None,
+            );
+            StoreError::Unavailable
+        })??;
         Ok(Self {
             sender,
             path: Arc::new(path),
+            diagnostics,
+            #[cfg(test)]
+            append_expiry: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -222,19 +260,86 @@ impl Store {
         &self.path
     }
 
+    pub fn diagnostics(&self) -> crate::diagnostics::Snapshot {
+        self.diagnostics.snapshot()
+    }
+
+    pub(crate) fn record_failure(&self, operation: Operation, error: &StoreError) {
+        self.diagnostics
+            .storage_failure(operation, error, Duration::ZERO, false, None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_next_append_for_test(&self) {
+        *self.append_expiry.lock().unwrap() = Some(Arc::new(AtomicBool::new(false)));
+    }
+
     pub async fn call<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
+        self.call_named(Operation::Generic, operation).await
+    }
+
+    async fn call_named<T, F>(&self, name: Operation, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    {
         let (tx, rx) = oneshot::channel();
-        self.sender
+        let diagnostics = self.diagnostics.clone();
+        #[cfg(test)]
+        let fake_expiry = if name == Operation::Append {
+            self.append_expiry.lock().unwrap().take()
+        } else {
+            None
+        };
+        let sent = self
+            .sender
             .send(Box::new(move |conn| {
-                let _ = tx.send(operation(conn));
+                let started = std::time::Instant::now();
+                let deadline = started + Duration::from_secs(5);
+                let interrupted = Arc::new(AtomicBool::new(false));
+                let callback_interrupted = interrupted.clone();
+                conn.progress_handler(
+                    10_000,
+                    Some(move || {
+                        let expired = std::time::Instant::now() >= deadline;
+                        #[cfg(test)]
+                        let expired = expired
+                            || fake_expiry
+                                .as_ref()
+                                .is_some_and(|clock| clock.load(Ordering::Relaxed));
+                        if expired {
+                            callback_interrupted.store(true, Ordering::Relaxed);
+                        }
+                        expired
+                    }),
+                );
+                let result = operation(conn);
+                conn.progress_handler(0, None::<fn() -> bool>);
+                if let Err(error) = &result {
+                    diagnostics.storage_failure(
+                        name,
+                        error,
+                        started.elapsed(),
+                        interrupted.load(Ordering::Relaxed),
+                        Some(conn.is_autocommit()),
+                    );
+                }
+                // Publish failure evidence before the collector can react to this result.
+                let _ = tx.send(result);
             }))
-            .await
-            .map_err(|_| StoreError::Unavailable)?;
-        rx.await.map_err(|_| StoreError::Unavailable)?
+            .await;
+        if sent.is_err() {
+            self.record_failure(name, &StoreError::Unavailable);
+            return Err(StoreError::Unavailable);
+        }
+        rx.await.map_err(|_| {
+            self.record_failure(name, &StoreError::Unavailable);
+            StoreError::Unavailable
+        })?
     }
 
     pub async fn channels(&self) -> Result<Vec<Channel>, StoreError> {
@@ -307,8 +412,9 @@ impl Store {
         channels: Vec<String>,
         at: String,
     ) -> Result<i64, StoreError> {
-        let at = crate::history::utc(&at)?;
-        self.call(move |conn| {
+        let at = crate::history::utc(&at)
+            .inspect_err(|error| self.record_failure(Operation::SessionBegin, error))?;
+        self.call_named(Operation::SessionBegin, move |conn| {
             let tx = conn.transaction()?;
             tx.execute("INSERT INTO sessions(started_at) VALUES (?1)", [at])?;
             let id = tx.last_insert_rowid();
@@ -339,16 +445,21 @@ impl Store {
         reason: String,
         at: String,
     ) -> Result<(), StoreError> {
-        let at = crate::history::utc(&at)?;
-        self.call(move |conn| close_session(conn, id, &reason, Some(at), false))
-            .await
+        let at = crate::history::utc(&at)
+            .inspect_err(|error| self.record_failure(Operation::SessionEnd, error))?;
+        self.call_named(Operation::SessionEnd, move |conn| {
+            close_session(conn, id, &reason, Some(at), false)
+        })
+        .await
     }
 
     /// Fallback only when a failed transport cannot provide its terminal receipt clock.
     /// The last retained receipt (or start for an empty session) is an uncertain cutoff.
     pub async fn end_session_uncertain(&self, id: i64, reason: String) -> Result<(), StoreError> {
-        self.call(move |conn| close_session(conn, id, &reason, None, true))
-            .await
+        self.call_named(Operation::SessionEnd, move |conn| {
+            close_session(conn, id, &reason, None, true)
+        })
+        .await
     }
 
     pub async fn room_state(
@@ -357,7 +468,7 @@ impl Store {
         channel: String,
         ready: bool,
     ) -> Result<(), StoreError> {
-        self.call(move |conn| {
+        self.call_named(Operation::RoomState, move |conn| {
             let tx=conn.transaction()?;
             let state=if ready {"collecting"} else {"unavailable"};
             let error=if ready {None} else {Some("Membership unavailable for this room; healthy rooms continue collecting.")};
@@ -394,14 +505,18 @@ impl Store {
         let count = sessions
             .iter()
             .try_fold(0usize, |count, (_, rows)| count.checked_add(rows.len()))
-            .ok_or(StoreError::Invalid)?;
+            .ok_or(StoreError::Invalid)
+            .inspect_err(|error| self.record_failure(Operation::Append, error))?;
         if count > 10_000 {
+            self.record_failure(Operation::Append, &StoreError::Invalid);
             return Err(StoreError::Invalid);
         }
         if sessions.is_empty() {
             return Ok((Duration::ZERO, Duration::ZERO));
         }
-        self.call(move |conn| {
+        #[cfg(test)]
+        let fake_expiry = self.append_expiry.lock().unwrap().clone();
+        self.call_named(Operation::Append, move |conn| {
             let started=std::time::Instant::now();
             let tx=conn.transaction()?;
             { let mut stmt=tx.prepare_cached("INSERT INTO observations(session_id,channel,account,kind,received_at,received_at_utc) VALUES (?1,?2,?3,?4,?5,?6)")?;
@@ -420,6 +535,13 @@ impl Store {
                   if let Some(account)=account {relationship.execute(params![channel,account,stamp])?;}
               } } }
             tx.execute("UPDATE collection_totals SET observation_count=observation_count+?1 WHERE id=1",[count as i64])?;
+            #[cfg(test)]
+            if let Some(clock) = &fake_expiry {
+                // Advance only after real raw, derived and aggregate writes in the append transaction.
+                // Enough SQL work then reaches the actual production callback without sleeping.
+                clock.store(true, Ordering::Relaxed);
+                tx.query_row("WITH RECURSIVE work(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM work WHERE x<100000) SELECT SUM(x) FROM work", [], |row| row.get::<_, i64>(0))?;
+            }
             let sql_time=started.elapsed();let committing=std::time::Instant::now();
             tx.commit()?; Ok((sql_time,committing.elapsed()))
         }).await
@@ -558,7 +680,7 @@ impl Store {
     }
 
     pub async fn checkpoint(&self) -> Result<(), StoreError> {
-        self.call(|conn| {
+        self.call_named(Operation::Checkpoint, |conn| {
             let state: (i64, i64, i64) =
                 conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))

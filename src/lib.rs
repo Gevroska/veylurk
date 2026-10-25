@@ -5,10 +5,12 @@ use std::collections::{BTreeMap, HashSet};
 pub mod app;
 pub mod browser;
 pub mod collector;
+pub mod diagnostics;
 pub mod history;
 pub mod irc;
 pub mod metadata;
 pub mod runtime;
+pub mod shutdown;
 pub mod store;
 
 pub const COMMUNITY_TAB_HASH: &str =

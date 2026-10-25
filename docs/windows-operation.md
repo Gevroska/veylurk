@@ -18,7 +18,7 @@ To run without a console window, from the extracted package:
 Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -NonInteractive -WindowStyle Hidden -File "C:\Apps\Veylurk\Start-VeylurkBackground.ps1"'
 ```
 
-Replace the example path with your package's absolute path. Add `-Port 9123` inside the argument string to use another port. The supervisor starts the exact executable beside its script with an absolute `data\observations.sqlite3` path, then waits for it. It drains and discards application output and records only UTC start/stop events and numeric exit codes in `data\background.log`. The log rotates after approximately 256 KiB, retaining one previous file. It contains no application output, credentials or request URLs. A hidden launch error might produce no visible window; use the foreground launcher to diagnose configuration or credential problems.
+Replace the example path with your package's absolute path. Add `-Port 9123` inside the argument string to use another port. The supervisor starts the exact executable beside its script with an absolute `data\observations.sqlite3` path, then waits for it. It drains and discards application output and records only UTC start/stop events and numeric exit codes in `data\background.log`. The log rotates after approximately 256 KiB, retaining one previous file. It contains no application output, credentials or request URLs. The application separately writes a bounded fault journal beside the database; see [local diagnostics](diagnostics.md). A hidden launch error might produce no visible window; inspect those operational records or use the foreground launcher to diagnose configuration or credential problems.
 
 Stop the selected package gracefully:
 

@@ -77,6 +77,7 @@ cargo test --locked
 node --test web/app.test.cjs web/theme.test.cjs
 powershell.exe -NoProfile -File scripts/Test-VeylurkLauncher.ps1
 powershell.exe -NoProfile -File scripts/Test-VeylurkOperations.ps1
+powershell.exe -NoProfile -File scripts/Test-VeylurkMeasurement.ps1
 cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
 cargo build --release --locked --bin veylurk
 ```
@@ -86,6 +87,10 @@ Node.js is used only for the interface's development tests. The Windows workflow
 An earlier application revision completed two live, 120-second runs on two channels with clean exits. The first retained 691 observations; the restart loaded those same 691 records and reached 2,083. Account-to-channel and channel-to-account searches passed, and the real interface successfully paused and resumed collection. Peak working set was approximately 18.1 MB across those runs. This is bounded evidence for two channels in that environment, not a guarantee for long histories or dozens of channels.
 
 Synthetic 10/25/50-channel workload tests exercise historical queries and restart retention separately from live collection. A real extended live scale trial and login/reboot acceptance remain pending; see [capacity evidence and trial procedure](docs/performance.md).
+
+Use the [bounded local measurement tool](docs/measurement.md) to record an actual unattended trial. It samples the running instance without changing its channels, database, or collection policy. A replacement process or unavailable API is reported as a measurement gap.
+
+[Local fault diagnostics](docs/diagnostics.md) retain fixed operation identifiers and numeric error codes independently of SQLite. Collection health distinguishes the first storage failure from later cleanup errors. Diagnostic persistence is bounded and best-effort; records never include SQL, account logins or credentials.
 
 ## Bounded and historical probes
 
