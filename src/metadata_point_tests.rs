@@ -166,14 +166,43 @@ fn inconsistent_history_is_unknown_and_duplicate_timestamps_choose_highest_id() 
     assert_eq!(point(&conn, "07:01:00").check.unwrap().id, 3);
     conn.execute("DELETE FROM metadata_checks WHERE id=3", [])
         .unwrap();
+    // Deliberately corrupt only this transaction to exercise legacy dangling history.
+    // Keep foreign keys enabled and roll back before the separate clock-corruption case.
+    conn.execute_batch("PRAGMA foreign_keys=ON; BEGIN; PRAGMA defer_foreign_keys=ON;")
+        .unwrap();
     conn.execute("UPDATE metadata_checks SET broadcast_id=99 WHERE id=1", [])
         .unwrap();
     assert_eq!(
         point(&conn, "07:01:30").reason,
         Some("inconsistent_history")
     );
-    conn.execute("UPDATE metadata_checks SET broadcast_id=1 WHERE id=1", [])
-        .unwrap();
+    conn.execute_batch("ROLLBACK;").unwrap();
+    assert_eq!(
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.pragma_query_value(None, "defer_foreign_keys", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT broadcast_id FROM metadata_checks WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let mut foreign_key_check = conn.prepare("PRAGMA foreign_key_check").unwrap();
+    assert!(foreign_key_check
+        .query([])
+        .unwrap()
+        .next()
+        .unwrap()
+        .is_none());
     conn.execute(
         "UPDATE metadata_broadcasts SET first_seen_at=?1 WHERE id=1",
         [stamp_at("08:10:00")],
