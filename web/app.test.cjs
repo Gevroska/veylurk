@@ -9,6 +9,7 @@ const { test } = require("node:test");
 
 const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 const script = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+const stylesheet = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
 const received = "2026-10-23T12:00:00Z";
 
 class Element {
@@ -16,6 +17,7 @@ class Element {
     this.tagName = tag.toUpperCase(); this.children = []; this.listeners = new Map();
     this.attributes = {}; this.dataset = {}; this.className = ""; this.value = "";
     this.hidden = false; this.disabled = false; this._text = ""; this.scrollLeft = 0;
+    this.capturedPointers = new Set(); this.screenMatrix = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
     this.classList = {
       add: (name) => this.classList.toggle(name, true),
       remove: (name) => this.classList.toggle(name, false),
@@ -50,6 +52,14 @@ class Element {
   setAttribute(key, value) { this.attributes[key] = String(value); if (key === "class") this.className = String(value); }
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(name, callback) { this.listeners.set(name, [...(this.listeners.get(name) || []), callback]); }
+  setPointerCapture(pointerId) { this.capturedPointers.add(pointerId); }
+  hasPointerCapture(pointerId) { return this.capturedPointers.has(pointerId); }
+  releasePointerCapture(pointerId) { this.capturedPointers.delete(pointerId); }
+  getScreenCTM() {
+    const { a, b, c, d, e, f } = this.screenMatrix;
+    return { inverse() { const determinant = a * d - b * c; return { a: d / determinant, b: -b / determinant, c: -c / determinant, d: a / determinant, e: (c * f - d * e) / determinant, f: (b * e - a * f) / determinant }; } };
+  }
+  createSVGPoint() { return { x: 0, y: 0, matrixTransform(matrix) { return { x: this.x * matrix.a + this.y * matrix.c + matrix.e, y: this.x * matrix.b + this.y * matrix.d + matrix.f }; } }; }
   async dispatch(name, details = {}) {
     const event = { type: name, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...details };
     await Promise.all((this.listeners.get(name) || []).map((callback) => callback(event)));
@@ -535,6 +545,341 @@ function timelineVisit(extra = {}) {
     markers: [{ observation_id: 10, at: "2026-10-23T11:00:00Z", kind: "first_positive", basis: "join" }, { observation_id: 11, at: received, kind: "last_positive", basis: "positive_receipt" }, { observation_id: 12, at: "2026-10-23T13:00:00Z", kind: "part", basis: "part_receipt" }], ...extra,
   };
 }
+
+function timelineElement(app, className, prefix = "timeline") { return descendants(app.get(prefix + "-results")).find((item) => item.classList.contains(className)); }
+function timelineChart(app, prefix = "timeline") { return descendants(app.get(prefix + "-results")).find((item) => item.tagName === "SVG"); }
+function timelineButton(app, text, prefix = "timeline") { return descendants(app.get(prefix + "-results")).find((item) => item.tagName === "BUTTON" && item.textContent === text); }
+function mouseAt(x, y = 78, extra = {}) { return { clientX: x, clientY: y, pointerId: 1, pointerType: "mouse", button: 0, isPrimary: true, ...extra }; }
+async function searchTimeline(app) { await settle(); app.get("search-account").value = "sample_account"; await app.get("search-form").dispatch("submit"); await settle(); }
+function metadataAt(extra = {}) {
+  return { channel: "sample_channel", at: received, basis: "last_reported", reason: null,
+    check: { id: 5, checked_at: "2026-10-23T11:55:00Z", state: "live", broadcast_id: 9 },
+    next_check: { id: 6, checked_at: "2026-10-23T12:05:00Z", state: "live", broadcast_id: 9 },
+    broadcast: { id: 9, channel: "sample_channel", started_at: timelineFrom, first_seen_at: timelineFrom, last_live_at: timelineTo, offline_observed_at: null },
+    title: { title: "Stored broadcast title", seen_at: "2026-10-23T11:50:00Z", game_name: "Stored category", language: "en" }, ...extra };
+}
+
+test("timeline receipt hover debounces exact positive times and keeps historical titles and metadata times distinct", async () => {
+  const hostile = '<img src=x onerror="injected()">';
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()]);
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt({ title: { title: hostile, seen_at: "2026-10-23T11:50:00Z" } });
+  });
+  await searchTimeline(app); app.navigate("history");
+  const point = descendants(timelineChart(app)).filter((item) => item.tagName === "CIRCLE").at(-1);
+  await point.dispatch("pointerenter", mouseAt(580));
+  await point.dispatch("pointermove", mouseAt(581)); await app.advance(179);
+  assert.equal(app.calls.some((item) => item.target.pathname.endsWith("/metadata/at")), false);
+  await app.advance(1);
+  const request = app.calls.find((item) => item.target.pathname.endsWith("/metadata/at"));
+  assert.equal(request.target.pathname, "/api/channels/sample_channel/metadata/at");
+  assert.equal(request.target.searchParams.get("at"), new Date(received).toISOString());
+  assert.equal(request.target.searchParams.has("broadcast_id"), false);
+  const hover = timelineElement(app, "timeline-hover");
+  assert.match(hover.textContent, /selected time:.*2026-10-23T12:00:00.000Z/);
+  assert.match(hover.textContent, /Last reported title: <img src=x/);
+  assert.match(hover.textContent, /Metadata checked:.*2026-10-23T11:55:00.000Z/);
+  assert.match(hover.textContent, /Title first recorded:.*2026-10-23T11:50:00.000Z/);
+  assert.match(hover.textContent, /does not establish continuity or video viewing/);
+  assert.equal(descendants(app.get("timeline-results")).some((item) => item.tagName === "IMG"), false);
+  assert.equal(hover.attributes.role, "status");
+  assert.equal(point.attributes.tabindex, "0"); assert.equal(point.attributes["aria-describedby"], "timeline-hover");
+});
+
+test("timeline metadata reserves a bounded scrollable panel and keeps completed long results readable without replacing the chart", async () => {
+  const hoverRule = stylesheet.match(/\.timeline-hover\s*\{([^}]+)\}/)[1];
+  const styles = new Map(hoverRule.split(";").filter((declaration) => declaration.includes(":")).map((declaration) => declaration.split(":").map((part) => part.trim())));
+  assert.match(styles.get("height"), /^\d+(?:\.\d+)?rem$/);
+  assert.ok(parseFloat(styles.get("height")) >= 6 && parseFloat(styles.get("height")) <= 12);
+  assert.equal(styles.has("min-height"), false);
+  assert.equal(styles.get("overflow-y"), "auto"); assert.equal(styles.get("overflow-wrap"), "anywhere");
+  assert.equal(styles.get("min-width"), "0"); assert.equal(styles.get("max-width"), "100%");
+  assert.equal(styles.get("scrollbar-gutter"), "stable");
+  const stale = deferred(), missing = deferred(), failed = deferred(); let requestNumber = 0;
+  const longTitle = "UnbrokenHistoricalTitle".repeat(300);
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()]);
+    if (target.pathname.endsWith("/metadata/at")) return [stale.promise, metadataAt({ title: { title: longTitle, seen_at: received } }), missing.promise, failed.promise][requestNumber++];
+  });
+  await searchTimeline(app); app.navigate("history");
+  const chart = timelineChart(app), hover = timelineElement(app, "timeline-hover");
+  const viewportText = timelineElement(app, "timeline-viewport").textContent;
+  const stable = () => { assert.equal(timelineChart(app), chart); assert.equal(timelineElement(app, "timeline-hover"), hover); assert.equal(timelineElement(app, "timeline-viewport").textContent, viewportText); };
+  stable(); assert.match(hover.textContent, /Hover or focus/);
+  const points = descendants(chart).filter((item) => item.tagName === "CIRCLE");
+  await points[0].dispatch("pointerenter", mouseAt(380)); await app.advance(180);
+  stable(); assert.match(hover.textContent, /Loading stored broadcast metadata/);
+  const staleRequest = app.calls.find((item) => item.target.pathname.endsWith("/metadata/at"));
+  points[1].focus(); await app.advance(180);
+  assert.equal(staleRequest.options.signal.aborted, true);
+  stable(); assert.ok(hover.textContent.includes(longTitle));
+  hover.scrollTop = 70;
+  hover.focus(); await settle(); await chart.dispatch("pointerleave");
+  assert.equal(app.document.activeElement, hover); assert.equal(hover.tabIndex, 0);
+  assert.match(hover.attributes["aria-label"], /scroll for full details/);
+  assert.ok(hover.textContent.includes(longTitle)); assert.equal(hover.scrollTop, 70);
+  stale.resolve(metadataAt({ title: { title: "STALE OVER RETAINED TITLE", seen_at: received } })); await settle();
+  stable(); assert.ok(hover.textContent.includes(longTitle)); assert.doesNotMatch(hover.textContent, /STALE OVER RETAINED TITLE/);
+  const inference = timelineElement(app, "timeline-inference");
+  await inference.dispatch("pointerenter", mouseAt(600)); await app.advance(180);
+  stable(); assert.match(hover.textContent, /Loading stored broadcast metadata/); assert.equal(hover.scrollTop, 0);
+  missing.resolve(metadataAt({ basis: "unavailable", reason: "no_history", title: null })); await settle();
+  await inference.dispatch("pointerleave"); stable(); assert.match(hover.textContent, /Unknown broadcast title.*No stored metadata history/);
+  await inference.dispatch("pointerenter", mouseAt(650)); await app.advance(180);
+  failed.resolve({ httpStatus: 500, error: { message: "Metadata unavailable" } }); await settle();
+  await inference.dispatch("pointerleave"); stable(); assert.match(hover.textContent, /Unknown broadcast title.*could not be loaded/);
+  await inference.dispatch("keydown", { key: "Escape" }); stable(); assert.match(hover.textContent, /Hover or focus/);
+});
+
+test("timeline inference hover maps transformed times, clamps the exclusive right edge and never queries PART or unknown background", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit({ inference_to: timelineTo })]);
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt({ basis: "exact_check", check: { id: 5, state: "live", checked_at: received, broadcast_id: 9 }, title: { title: "", seen_at: received } });
+  });
+  await searchTimeline(app); app.navigate("history");
+  const chart = timelineChart(app); chart.screenMatrix = { a: .9, b: 0, c: 0, d: .9, e: -200, f: 50 };
+  const inference = timelineElement(app, "timeline-inference");
+  await inference.dispatch("pointerenter", mouseAt(575 * .9 - 200, 78 * .9 + 50)); await app.advance(180);
+  let request = app.calls.filter((item) => item.target.pathname.endsWith("/metadata/at")).at(-1);
+  assert.equal(request.target.searchParams.get("at"), new Date(received).toISOString());
+  assert.match(timelineElement(app, "timeline-hover").textContent, /Uncertain chat inference; continuous presence is unknown/);
+  assert.match(timelineElement(app, "timeline-hover").textContent, /Reported title: Empty reported title/);
+  assert.doesNotMatch(timelineElement(app, "timeline-hover").textContent, /Last reported title/);
+  await inference.dispatch("pointermove", mouseAt(970 * .9 - 200, 78 * .9 + 50)); await app.advance(180);
+  request = app.calls.filter((item) => item.target.pathname.endsWith("/metadata/at")).at(-1);
+  assert.equal(request.target.searchParams.get("at"), "2026-10-23T13:59:59.999Z");
+  assert.equal(descendants(chart).find((item) => item.attributes.fill === "url(#timeline-hatch)").attributes["pointer-events"], "none");
+  await inference.dispatch("pointerleave");
+  const requests = app.calls.length;
+  await timelineElement(app, "timeline-unknown").dispatch("pointerenter", mouseAt(200));
+  await timelineElement(app, "timeline-departure").dispatch("pointerenter", mouseAt(772.5)); await app.advance(200);
+  assert.equal(app.calls.length, requests);
+});
+
+test("timeline hover explains unavailable history without using the current broadcast title", async () => {
+  for (const [reason, expected] of [["no_history", /No stored metadata history/], ["polling_gap", /polling gap/], ["missing_title_history", /No historical title/], ["metadata_unknown", /metadata state is unknown/], ["offline_report", /reported the channel offline/], ["transition_ambiguous", /transition is ambiguous/], ["broadcast_mismatch", /does not match/], ["outside_broadcast_window", /outside the recorded/], ["inconsistent_history", /history is inconsistent/]]) {
+    const app = createApp((target) => {
+      if (target.pathname === "/api/timeline") return timeline([timelineVisit()], { broadcast: { id: 9, title: "DO NOT BACKFILL CURRENT TITLE", started_at: timelineFrom, last_live_at: timelineTo } });
+      if (target.pathname.endsWith("/metadata/at")) return metadataAt({ basis: "unavailable", reason, title: null });
+    });
+    await searchTimeline(app); app.navigate("history");
+    const point = descendants(timelineChart(app)).find((item) => item.tagName === "CIRCLE"); point.focus(); await app.advance(180);
+    const request = app.calls.find((item) => item.target.pathname.endsWith("/metadata/at"));
+    assert.equal(request.target.searchParams.get("broadcast_id"), "9");
+    const text = timelineElement(app, "timeline-hover").textContent;
+    assert.match(text, /Unknown broadcast title/); assert.match(text, expected);
+    assert.doesNotMatch(text, /DO NOT BACKFILL CURRENT TITLE/);
+    assert.match(text, /does not establish absence or video viewing/);
+    await point.dispatch("keydown", { key: "Escape" });
+    assert.match(timelineElement(app, "timeline-hover").textContent, /Hover or focus/);
+  }
+});
+
+test("moving timeline hover aborts pending lookups and rejects late successes and errors", async () => {
+  const old = deferred(), newer = deferred(); let requestCount = 0;
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()]);
+    if (target.pathname.endsWith("/metadata/at")) return ++requestCount === 1 ? old.promise : newer.promise;
+  });
+  await searchTimeline(app); app.navigate("history");
+  const inference = timelineElement(app, "timeline-inference");
+  await inference.dispatch("pointerenter", mouseAt(500)); await app.advance(180);
+  const first = app.calls.find((item) => item.target.pathname.endsWith("/metadata/at"));
+  await inference.dispatch("pointermove", mouseAt(600));
+  assert.equal(first.options.signal.aborted, true); await app.advance(180);
+  old.resolve(metadataAt({ title: { title: "STALE TITLE", seen_at: received } })); await settle();
+  assert.doesNotMatch(timelineElement(app, "timeline-hover").textContent, /STALE TITLE/);
+  newer.resolve({ httpStatus: 500, error: { message: '<img src=x onerror="injected()">' } }); await settle();
+  assert.match(timelineElement(app, "timeline-hover").textContent, /Unknown broadcast title.*could not be loaded/);
+  assert.doesNotMatch(timelineElement(app, "timeline-hover").textContent, /<img/);
+  await inference.dispatch("pointerleave");
+  assert.match(timelineElement(app, "timeline-hover").textContent, /Unknown broadcast title.*could not be loaded/);
+});
+
+test("timeline hover cancels debounces and in-flight requests on drag, leave, zoom, filters, paging, navigation and hidden pages", async () => {
+  for (const action of ["drag", "leave", "zoom", "filters", "page", "new-search", "navigation", "hidden"]) {
+    const pending = deferred();
+    const app = createApp((target) => {
+      if (target.pathname === "/api/timeline") return timeline([timelineVisit()], { has_more: true, next_before: 10 });
+      if (target.pathname.endsWith("/metadata/at")) return pending.promise;
+    });
+    await searchTimeline(app); app.navigate("history");
+    let point = descendants(timelineChart(app)).find((item) => item.tagName === "CIRCLE");
+    await point.dispatch("pointerenter", mouseAt(400));
+    await point.dispatch("pointerleave"); await app.advance(180);
+    assert.equal(app.calls.some((item) => item.target.pathname.endsWith("/metadata/at")), false);
+    await point.dispatch("pointerenter", mouseAt(400)); await app.advance(180);
+    const request = app.calls.find((item) => item.target.pathname.endsWith("/metadata/at"));
+    if (action === "drag") await timelineChart(app).dispatch("pointerdown", mouseAt(400));
+    if (action === "leave") await point.dispatch("pointerleave");
+    if (action === "zoom") await timelineButton(app, "Zoom in").dispatch("click");
+    if (action === "filters") await app.get("search-channel").dispatch("input");
+    if (action === "page") { await app.get("timeline-next").dispatch("click"); await settle(); }
+    if (action === "new-search") { await app.get("search-form").dispatch("submit"); await settle(); }
+    if (action === "navigation") app.navigate("broadcasts");
+    if (action === "hidden") app.visibility(true);
+    assert.equal(request.options.signal.aborted, true, action);
+    pending.resolve(action === "leave" ? { httpStatus: 500, error: { message: "STALE AFTER leave" } } : metadataAt({ title: { title: "STALE AFTER " + action, seen_at: received } })); await settle();
+    assert.doesNotMatch(timelineElement(app, "timeline-hover").textContent, /STALE AFTER/);
+    assert.match(timelineElement(app, "timeline-hover").textContent, /Hover or focus/);
+  }
+});
+
+test("broadcast timeline hover requests the selected broadcast and keyboard focus inspects inference midpoint", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/broadcasts") return { broadcasts: [{ id: 9, channel: "sample_channel", title: "Current title", started_at: timelineFrom, last_live_at: timelineTo }], next_before: null };
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()], { broadcast: { id: 9, channel: "sample_channel", started_at: timelineFrom, last_live_at: timelineTo } });
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt();
+  });
+  await settle(); app.navigate("broadcasts"); app.get("broadcasts-account").value = "sample_account";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  await descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events").dispatch("click"); await settle();
+  const inference = timelineElement(app, "timeline-inference", "broadcast-timeline");
+  inference.focus(); await app.advance(180);
+  const request = app.calls.find((item) => item.target.pathname.endsWith("/metadata/at"));
+  assert.equal(request.target.searchParams.get("broadcast_id"), "9");
+  assert.equal(request.target.searchParams.get("at"), new Date(received).toISOString());
+  assert.match(timelineElement(app, "timeline-hover", "broadcast-timeline").textContent, /Last reported title: Stored broadcast title/);
+  inference.blur(); assert.match(timelineElement(app, "timeline-hover", "broadcast-timeline").textContent, /Last reported title: Stored broadcast title/);
+});
+
+test("timeline zoom buttons clip only loaded evidence, keep the query fixed and reset without fetching", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()], { has_more: true, next_before: 10 }) : undefined);
+  await searchTimeline(app);
+  const requests = app.calls.length;
+  const reset = timelineButton(app, "Reset zoom");
+  assert.equal(reset.disabled, true); assert.equal(timelineButton(app, "Zoom out").disabled, true);
+  const zoomIn = timelineButton(app, "Zoom in"); zoomIn.focus(); await zoomIn.dispatch("click");
+  assert.equal(app.document.activeElement, zoomIn);
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T11:00:00.000Z.*2026-10-23T13:00:00.000Z/);
+  assert.match(timelineElement(app, "timeline-period").textContent, /query period.*2026-10-23T10:00:00.000Z.*2026-10-23T14:00:00.000Z/);
+  assert.match(app.get("timeline-results").textContent, /additional evidence.*other pages/);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "CIRCLE").length, 2);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "POLYGON").length, 0);
+  assert.equal(timelineElement(app, "timeline-inference").attributes.width, "790");
+  assert.ok(descendants(timelineChart(app)).some((item) => item.attributes.fill === "url(#timeline-hatch)"));
+  assert.equal(reset.disabled, false);
+  await timelineButton(app, "Zoom out").dispatch("click");
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T10:00:00.000Z.*2026-10-23T14:00:00.000Z/);
+  await zoomIn.dispatch("click"); await reset.dispatch("click");
+  assert.equal(reset.disabled, true);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "POLYGON").length, 1);
+  assert.equal(app.calls.length, requests);
+});
+
+test("timeline reverse selection uses transformed screen coordinates and never fabricates clipped endpoint dots", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()]) : undefined);
+  await searchTimeline(app);
+  const requests = app.calls.length, chart = timelineChart(app);
+  // A responsive chart after horizontal scrolling: local coordinates are scaled and translated on screen.
+  chart.screenMatrix = { a: .9, b: 0, c: 0, d: .9, e: -150, f: 100 };
+  const screen = (x) => mouseAt(x * .9 - 150, 78 * .9 + 100);
+  const down = await chart.dispatch("pointerdown", screen(673.75));
+  assert.equal(down.defaultPrevented, true); assert.equal(chart.hasPointerCapture(1), true);
+  await chart.dispatch("pointermove", screen(476.25));
+  const selection = timelineElement(app, "timeline-selection");
+  assert.equal(selection.attributes.visibility, "visible");
+  assert.ok(Math.abs(Number(selection.attributes.x) - 476.25) < .001);
+  assert.ok(Math.abs(Number(selection.attributes.width) - 197.5) < .001);
+  await chart.dispatch("pointerleave", screen(476.25));
+  assert.equal(chart.hasPointerCapture(1), true);
+  await chart.dispatch("pointerup", screen(476.25));
+  assert.equal(chart.hasPointerCapture(1), false);
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T11:30:00.000Z.*2026-10-23T12:30:00.000Z/);
+  const points = descendants(timelineChart(app)).filter((item) => item.tagName === "CIRCLE");
+  assert.equal(points.length, 1); assert.equal(points[0].attributes.cx, "575");
+  assert.equal(timelineElement(app, "timeline-inference").attributes.x, "180");
+  assert.equal(timelineElement(app, "timeline-inference").attributes.width, "790");
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "POLYGON").length, 0);
+  assert.match(app.get("timeline-results").textContent, /Unknown.*unloaded evidence/);
+  assert.equal(app.calls.length, requests);
+});
+
+test("timeline drag clamps outside endpoints, handles both directions and ignores other pointer identities", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()]) : undefined);
+  await searchTimeline(app);
+  let chart = timelineChart(app);
+  await chart.dispatch("pointerdown", mouseAt(575));
+  await chart.dispatch("pointerup", mouseAt(1300, 78, { pointerId: 2 }));
+  assert.equal(chart.hasPointerCapture(1), true);
+  await chart.dispatch("pointermove", mouseAt(1300));
+  assert.equal(timelineElement(app, "timeline-selection").attributes.width, "395");
+  await chart.dispatch("pointerup", mouseAt(1300));
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T12:00:00.000Z.*2026-10-23T14:00:00.000Z/);
+  const point = descendants(timelineChart(app)).find((item) => item.tagName === "CIRCLE");
+  assert.equal(point.attributes.cx, "180"); assert.match(point.textContent, /Last positive/);
+  await timelineButton(app, "Reset zoom").dispatch("click"); chart = timelineChart(app);
+  await chart.dispatch("pointerdown", mouseAt(575)); await chart.dispatch("pointerup", mouseAt(30));
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T10:00:00.000Z.*2026-10-23T12:00:00.000Z/);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "CIRCLE").length, 1);
+});
+
+test("timeline canceled, hidden, navigated, lost, tiny and non-mouse drags leave the viewport unchanged and scrolling available", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()]) : undefined);
+  await searchTimeline(app);
+  const original = timelineElement(app, "timeline-viewport").textContent;
+  const chart = timelineChart(app);
+  for (const rejected of [mouseAt(100), mouseAt(500, 30), mouseAt(500, 78, { pointerType: "touch" }), mouseAt(500, 78, { button: 2 }), mouseAt(500, 78, { isPrimary: false })]) {
+    assert.equal((await chart.dispatch("pointerdown", rejected)).defaultPrevented, false);
+    assert.equal(chart.hasPointerCapture(1), false);
+  }
+  for (const cancel of ["pointercancel", "lostpointercapture", "pointerleave", "navigation", "hidden"]) {
+    await chart.dispatch("pointerdown", mouseAt(400)); await chart.dispatch("pointermove", mouseAt(800));
+    assert.equal(chart.hasPointerCapture(1), true);
+    if (cancel === "pointerleave") chart.capturedPointers.delete(1);
+    if (cancel === "navigation") app.navigate("broadcasts");
+    else if (cancel === "hidden") app.visibility(true);
+    else await chart.dispatch(cancel, mouseAt(800));
+    assert.equal(chart.hasPointerCapture(1), false);
+    await chart.dispatch("pointerup", mouseAt(800));
+    assert.equal(timelineElement(app, "timeline-selection").attributes.visibility, "hidden");
+    assert.equal(chart.hasPointerCapture(1), false);
+    assert.equal(timelineElement(app, "timeline-viewport").textContent, original);
+    if (cancel === "navigation") app.navigate("history");
+    if (cancel === "hidden") { app.visibility(false); await settle(); }
+  }
+  await chart.dispatch("pointerdown", mouseAt(400)); await chart.dispatch("pointerup", mouseAt(404));
+  assert.equal(timelineElement(app, "timeline-viewport").textContent, original);
+  chart.screenMatrix = { a: 0, b: 0, c: 0, d: 0, e: 0, f: 0 };
+  assert.equal((await chart.dispatch("pointerdown", mouseAt(500))).defaultPrevented, false);
+  assert.equal(timelineElement(app, "timeline-viewport").textContent, original);
+});
+
+test("timeline pages retain zoom and fixed query bounds while a new search resets the viewport", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()], { has_more: !target.searchParams.has("before"), next_before: target.searchParams.has("before") ? null : 10 }) : undefined);
+  await searchTimeline(app);
+  await timelineButton(app, "Zoom in").dispatch("click");
+  await app.get("timeline-next").dispatch("click"); await settle();
+  assert.equal(timelineButton(app, "Reset zoom").disabled, false);
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T11:00:00.000Z.*2026-10-23T13:00:00.000Z/);
+  let request = app.calls.filter((item) => item.target.pathname === "/api/timeline").at(-1);
+  assert.equal(request.target.searchParams.get("from"), timelineFrom); assert.equal(request.target.searchParams.get("to"), timelineTo);
+  await app.get("timeline-previous").dispatch("click"); await settle();
+  assert.equal(timelineButton(app, "Reset zoom").disabled, false);
+  assert.match(timelineElement(app, "timeline-viewport").textContent, /2026-10-23T11:00:00.000Z.*2026-10-23T13:00:00.000Z/);
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(timelineButton(app, "Reset zoom").disabled, true);
+  request = app.calls.filter((item) => item.target.pathname === "/api/timeline").at(-1);
+  assert.equal(request.target.searchParams.has("from"), false); assert.equal(request.target.searchParams.has("to"), false);
+});
+
+test("broadcast search keeps account first and omits an empty optional channel when listing account associations", async () => {
+  const accountLabel = html.indexOf('<label for="broadcasts-account">Viewer / account login</label>');
+  const channelLabel = html.indexOf('<label for="broadcasts-channel">Channel login (optional)</label>');
+  assert.ok(accountLabel >= 0 && channelLabel > accountLabel);
+  assert.match(html, /Leave Channel login blank to list this account across all channels/);
+  const app = createApp(); await settle();
+  app.get("broadcasts-account").value = "sample_account";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  let request = app.calls.filter((item) => item.target.pathname === "/api/broadcasts").at(-1);
+  assert.equal(request.target.searchParams.get("account"), "sample_account");
+  assert.equal(request.target.searchParams.has("channel"), false);
+  app.get("broadcasts-channel").value = "sample_channel";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  request = app.calls.filter((item) => item.target.pathname === "/api/broadcasts").at(-1);
+  assert.equal(request.target.searchParams.get("account"), "sample_account");
+  assert.equal(request.target.searchParams.get("channel"), "sample_channel");
+});
 
 test("account timeline queries exact account, optional channel, and a bounded evidence page while retaining existing tables", async () => {
   const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit(), timelineVisit({ id: 5, channel: "another_channel", session_id: 2 })]) : undefined);

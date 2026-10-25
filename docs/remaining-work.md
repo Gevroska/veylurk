@@ -1,6 +1,6 @@
 # Requirements and remaining work
 
-Updated: 2026-10-25 (Europe/Paris).
+Updated: 2026-10-26 (Europe/Paris).
 
 The owner has authorized implementation of the remaining features. The earlier review-only restriction and Astra-only allocation are superseded. Current AGENTS.md governs coordination: Sol High/XHigh handles implementation, testing, integration and delivery; Astra XHigh receives bounded complex scoping or critical analysis when justified.
 
@@ -34,10 +34,11 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Departure and later return | Evidence-supported visits split at PART and collection boundaries. Post-PART delayed NAMES become ambiguous observation-only segments until a JOIN supports a new visit. All boundaries remain uncertain. |
 | Statistical absence estimates | Source-blocked. Silence alone does not close a visit or prove absence. |
 | Search account to channels/broadcasts and reverse | Implemented exact-login filters, range queries and bounded pagination. Broadcast summaries distinguish positive receipts inside the window from uncertain earlier-connected candidates. |
-| Suggest known account and channel logins while typing | Current increment: bounded prefix suggestions from stored names beneath the history and broadcast search fields, with mouse and keyboard selection. Suggestions never query Twitch or change collection settings. Source, automated, packaged and live acceptance remain separate. |
+| Suggest known account and channel logins while typing | Implemented at `b93c8078`, with bounded local prefix suggestions and mouse/keyboard selection. Windows checks and an owner-approved test rollout passed; existing production was preserved. Suggestions never query Twitch or change collection settings. |
 | Date/time searches | Implemented inclusive From / exclusive Until filters, normalized to UTC with validation. Broadcast intersections cannot leak disjoint time ranges. |
 | Who was present at an instant | Implemented evidence-only view: exact positive receipt / inferred candidate / unknown; future times are rejected, collection outages and departures are not bridged. |
 | Readable timelines | Separate visits retain positive receipt bounds and uncertain ends. The account chart compares channels on a shared axis and clips an account's chart to a selected broadcast. Direct receipt points, patterned inference, departures and unknown periods remain distinct. Automated validation and live rollout are separate gates. See [timeline interpretation](timeline.md). |
+| Historical titles on hover and drag zoom | Current increment adds local historical metadata lookup on evidence hover, with sampled/unknown titles distinguished, plus mouse selection and keyboard zoom/reset. Zoom preserves pinned search bounds and never invents evidence. Broadcast search presents the viewer first and makes the channel restriction optional. Native and live acceptance remain separate gates. |
 | Account graph with 99% presence/absence certainty | The owner accepted patterned inferred intervals alongside unknown periods. A calibrated 99% presence/absence claim remains unsupported by the current source; missing observations never become verified absence. |
 | Per-broadcast statistics | Implemented unique associated accounts, observed accounts, inferred-only accounts, supported visit count and positive receipt count; ambiguous segments are excluded from supported visits. |
 | Title/category/viewer-count history | Implemented paginated stored-check table and accessible unconnected viewer-count sample chart. No interpolation across missing checks. |
@@ -83,7 +84,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 - Preserve the existing database and DPAPI credentials, verify the copied history, then validate optional metadata on genuinely live channels.
 - Check both search directions, historical migration, separate visits, range filters, themes and collection policy on the real package.
 - Login startup/recovery needs an explicitly selected opt-in task on the intended Windows account. It is implemented but is not installed without that choice.
-- The short performance increment passed Windows CI at `88a72ba0`; its owner-approved local rollout preserved history and credentials. Long reliability trials remain owner-managed. See [performance evidence](performance.md). Short trials and CI do not establish long-run reliability. The current interface increment adds stored-login suggestions; validate it separately from the earlier release.
+- The short performance increment passed Windows CI at `88a72ba0`; its owner-approved local rollout preserved history and credentials. Long reliability trials remain owner-managed. See [performance evidence](performance.md). Short trials and CI do not establish long-run reliability. The current interface increment adds historical title inspection and timeline zoom; validate it separately from the earlier releases.
 - Reconsider Community sampling only if a reproducible, permitted autonomous source is demonstrated. Validate freshness, caching, selection bias, population identity and correlation before introducing statistical estimates or adapting sample cadence.
 
 ## Current development evidence

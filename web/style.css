@@ -234,6 +234,11 @@ td.actions { min-width: 260px; }
 .timeline-key.window { border: 2px dashed var(--link); }
 .timeline-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; scrollbar-color: var(--input-border) var(--panel); }
 .timeline-scroll svg { display: block; width: 100%; min-width: 900px; height: auto; }
+.timeline-zoom-controls { display: flex; flex-wrap: wrap; gap: .5rem; margin: .8rem 0; }
+.timeline-viewport { font-size: .84rem; }
+.timeline-selection { fill: var(--link); fill-opacity: .18; stroke: var(--link); stroke-width: 1.5; pointer-events: none; }
+.timeline-hover { height: 8rem; min-width: 0; max-width: 100%; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; overscroll-behavior: contain; padding: .6rem .8rem; border: 1px solid var(--border); border-radius: 5px; font-size: .84rem; overflow-wrap: anywhere; }
+.timeline-inference[tabindex]:focus, .timeline-scroll .positive-point[tabindex]:focus { outline: 2px solid var(--link); outline-offset: 3px; }
 .timeline-unknown { fill: var(--table-heading); stroke: var(--border); stroke-width: 1; }
 .timeline-inference { fill: var(--warning); stroke: var(--warning-text); stroke-width: 1.5; stroke-dasharray: 4 3; }
 .timeline-hatch { stroke: var(--warning-text); stroke-width: 1; }

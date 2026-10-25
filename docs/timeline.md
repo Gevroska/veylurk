@@ -6,11 +6,17 @@ An account timeline shows received Twitch chat evidence on a shared time axis. I
 
 In **Observation history**, enter an exact account login and search. Leave the channel field empty to compare channels, or enter a channel to inspect that pair. The existing From and Until controls select the time window.
 
-In **Broadcasts**, search with an exact account login and open a broadcast's evidence summary. Its account timeline is restricted to the intersection of the selected dates and the broadcast's reported start through its last confirmed live check. An offline check does not extend that window.
+In **Broadcasts**, enter the viewer's exact login in **Viewer / account login** and leave **Channel login (optional)** empty to list associated broadcasts across all channels. Add a channel only to restrict that account's results to one streamer. Open a broadcast's evidence summary for its account timeline, restricted to the intersection of the selected dates and the broadcast's reported start through its last confirmed live check. An offline check does not extend that window.
 
 The default window is seven days, with a maximum of 31 days per query. Choose narrower date bounds when inspecting older history. The chart displays the effective dates returned by the server. Broadcasts shorter than the selected window use their own reported bounds.
 
-Each page contains at most 25 timeline records in the interface. The API accepts up to 100. Use the page controls to inspect more evidence. The axis stays fixed while changing pages, but collection can update derived visits between requests; pages are not an immutable snapshot. A partial page is labelled as partial: evidence outside the displayed page must not be interpreted as missing from the database.
+Each page contains at most 25 timeline records in the interface. The API accepts up to 100. Use the page controls to inspect more evidence. The full search period stays fixed while changing pages, but collection can update derived visits between requests; pages are not an immutable snapshot. A partial page is labelled as partial: evidence outside the displayed page must not be interpreted as missing from the database.
+
+Hold the primary mouse button inside the plot and drag horizontally between two times to zoom into that interval. Either direction works. **Zoom in**, **Zoom out** and **Reset zoom** also work from the keyboard. Zoom changes the visible portion of the loaded evidence, keeps the search dates and page cursors intact, and persists while paging through the same search. A new search or selected broadcast resets it. Clipped intervals do not create receipt markers at the zoom edges, and unloaded time remains unknown.
+
+Hover over a positive receipt point or a patterned interval, or focus a supported shape with the keyboard, to inspect the recorded broadcast title for that channel and time. A point uses its exact receipt timestamp; a patterned interval uses the selected horizontal position. The details distinguish the selected time, the metadata check time and the first recorded time of that title. Between metadata checks, **Last reported title** is a historical snapshot, not a verified title change time.
+
+The lookup never fills older periods with a broadcast's current title. Missing title history, unknown/offline reports, conflicting transitions, times outside the confirmed broadcast window and metadata gaps produce an unavailable explanation. Nonexact lookups across checks more than 150 seconds apart are conservatively unavailable; this is a display policy, not a confidence calculation. Stored historical titles remain available without current Twitch credentials. Hovering reads local history and makes no Twitch request.
 
 ## Read the evidence
 

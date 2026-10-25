@@ -24,6 +24,8 @@ use tokio::sync::{watch, RwLock};
 const ASSOCIATION: &str = "Positive chat receipts between the reported broadcast start and last confirmed live check are observed evidence. Earlier positive receipts in the same session without a recorded departure or gap are separately labelled uncertain prior-connected inferences. Receipt time is not event occurrence time; no result proves video watching or continuous presence. Collection gaps remain unknown.";
 const MAX_STREAM_PAGES: usize = 4;
 const MAX_CURSOR_BYTES: usize = 4096;
+#[path = "metadata_point.rs"]
+mod point;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metadata_broadcasts (
  id INTEGER PRIMARY KEY, stream_id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL,
@@ -192,6 +194,7 @@ impl Metadata {
         Router::new()
             .route("/api/metadata/status", get(status))
             .route("/api/broadcasts", get(broadcasts))
+            .route("/api/channels/{login}/metadata/at", get(point::at))
             .route(
                 "/api/broadcasts/{id}/observations",
                 get(broadcast_observations),

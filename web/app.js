@@ -26,6 +26,7 @@
   let stopping = false;
   let stopped = false;
   let collectorStatus = null;
+  let activeTimelineCancel = null;
 
   function node(tag, text, className) {
     const result = document.createElement(tag);
@@ -315,6 +316,7 @@
   }
 
   function showSection() {
+    if (activeTimelineCancel) activeTimelineCancel();
     const requested = location.hash.slice(1);
     const section = ["channels", "history", "broadcasts", "health"].includes(requested) ? requested : "channels";
     for (const suggestions of loginSuggestions) if (suggestions.section !== section) suggestions.dismiss();
@@ -618,7 +620,7 @@
 
   // Each view owns its cursor and generation so late replies cannot replace a newer search.
   function pagedView(prefix, fetchPage, renderPage, offsetMode = false) {
-    const state = { query: null, positions: [offsetMode ? 0 : null], index: 0, next: null, generation: 0, loading: false, loaded: false, dirty: false };
+    const state = { query: null, positions: [offsetMode ? 0 : null], index: 0, next: null, generation: 0, loading: false, loaded: false, dirty: false, cancelPending: null };
     const result = $(prefix + "-results");
     const pagination = $(prefix + "-pagination");
     const previous = $(prefix + "-previous");
@@ -630,6 +632,7 @@
       $(prefix + "-page").textContent = `Page ${state.index + 1}`;
     }
     async function load(index, position) {
+      if (state.cancelPending) state.cancelPending();
       const generation = ++state.generation;
       const query = state.query;
       state.loading = true;
@@ -642,6 +645,7 @@
         const data = await fetchPage(query, position);
         if (generation !== state.generation) return;
         const content = renderPage(data, query);
+        state.cancelPending = typeof content.cancelPending === "function" ? content.cancelPending : null;
         const candidate = offsetMode ? (data.has_more ? data.next_offset : null) : data.next_before;
         state.next = Number.isSafeInteger(candidate) && candidate >= 0 && (position === null || candidate !== position) ? candidate : null;
         state.index = index;
@@ -672,12 +676,14 @@
         return load(0, state.positions[0]);
       },
       clear() {
+        if (state.cancelPending) state.cancelPending();
+        state.cancelPending = null;
         state.generation += 1; state.query = null; state.loaded = false; state.loading = false;
         state.next = null; state.index = 0; state.dirty = false;
         result.replaceChildren(); result.setAttribute("aria-busy", "false"); result.classList.remove("stale");
         message(prefix + "-message", ""); controls();
       },
-      markStale() { if (state.query) { state.dirty = true; result.classList.add("stale"); message(prefix + "-message", "Filters changed. Submit the search to update these results.", "warning"); controls(); } },
+      markStale() { if (state.query) { if (state.cancelPending) state.cancelPending(); state.dirty = true; result.classList.add("stale"); message(prefix + "-message", "Filters changed. Submit the search to update these results.", "warning"); controls(); } },
     };
   }
 
@@ -772,16 +778,19 @@
   function timelinePage(data, query, prefix) {
     const intervals = rows(data, "intervals");
     if (intervals.length > 100) throw new Error("The local app returned too much timeline evidence for one page.");
-    const start = Date.parse(data.effective_range.from), end = Date.parse(data.effective_range.to);
+    const loadedStart = Date.parse(data.effective_range.from), loadedEnd = Date.parse(data.effective_range.to);
+    const savedViewport = query.timelineViewport;
+    const hasSavedViewport = savedViewport && savedViewport.from >= loadedStart && savedViewport.to <= loadedEnd && savedViewport.to > savedViewport.from;
+    let start = hasSavedViewport ? savedViewport.from : loadedStart, end = hasSavedViewport ? savedViewport.to : loadedEnd;
     const result = node("div");
     const period = node("p", null, "timeline-period");
     period.id = prefix + "-summary";
-    period.append(node("strong", `${data.account || query.account} · visible period (local): `), node("span", `${timelineText(data.effective_range.from)} inclusive — ${timelineText(data.effective_range.to)} exclusive`));
+    period.append(node("strong", `${data.account || query.account} · query period (local): `), node("span", `${timelineText(data.effective_range.from)} inclusive — ${timelineText(data.effective_range.to)} exclusive`));
     result.append(period);
     if (data.broadcast) result.append(node("p", `Broadcast metadata window: ${timelineText(data.broadcast.started_at)} — ${timelineText(data.broadcast.last_live_at)}. This identifies the reported broadcast window, not account attendance.`, "table-note"));
     result.append(node("p", "Dots show actual first / last positive receipt endpoints for each segment, not every received event. Patterned spans are uncertain inferences. Unknown background establishes neither presence nor absence. No confidence percentage is calibrated.", "table-note"));
-    result.append(node("p", "The fixed time axis is not a frozen snapshot: stored evidence can change between page requests.", "table-note"));
-    if (data.has_more || query.timelineBefore != null) result.append(node("p", "Partial evidence page: additional evidence is on other pages and is not drawn here. The time axis stays fixed. Unmarked areas remain unknown; they are not evidence of absence.", "timeline-warning"));
+    result.append(node("p", "The query period is not a frozen snapshot: stored evidence can change between page requests.", "table-note"));
+    if (data.has_more || query.timelineBefore != null) result.append(node("p", "Partial evidence page: additional evidence is on other pages and is not drawn here. The query period stays fixed. Zoom uses only this loaded page. Unmarked areas remain unknown; they are not evidence of absence.", "timeline-warning"));
     if (data.empty || end <= start) {
       result.append(empty("No overlapping timeline period is available for these bounds and broadcast metadata. Account presence remains unknown."));
       return result;
@@ -800,81 +809,238 @@
     const channelNames = [...new Set(intervals.map((item) => String(item.channel || "Unknown channel")))].sort((a, b) => a.localeCompare(b));
     if (!channelNames.length) channelNames.push(data.channel || query.channel || "No recorded channel");
     const height = 95 + channelNames.length * 58;
-    const graphic = svgElement("svg", { id: prefix + "-chart", viewBox: `0 0 1000 ${height}`, width: 1000, height, role: "img", "aria-labelledby": prefix + "-chart-title " + prefix + "-chart-description" });
-    graphic.append(svgElement("title", { id: prefix + "-chart-title" }, `IRC evidence for ${data.account || query.account}, grouped by channel on a shared time axis`), svgElement("desc", { id: prefix + "-chart-description" }, `Visible period ${timelineText(data.effective_range.from)} inclusive to ${timelineText(data.effective_range.to)} exclusive. Actual receipt endpoint dots and PART diamonds are separate from patterned uncertain inference. Unmarked and unloaded evidence is unknown. Exact times and evidence basis follow in a table.`));
-    const defs = svgElement("defs");
-    const pattern = svgElement("pattern", { id: prefix + "-hatch", width: 7, height: 7, patternUnits: "userSpaceOnUse" });
-    pattern.append(svgElement("path", { d: "M-2 2L2 -2M0 7L7 0M5 9L9 5", class: "timeline-hatch" })); defs.append(pattern); graphic.append(defs);
-    const x = (at) => 180 + 790 * (at - start) / (end - start);
-    for (let tick = 0; tick <= 4; tick += 1) {
-      const at = start + (end - start) * tick / 4;
-      const position = x(at);
-      const anchor = tick === 0 ? "start" : tick === 4 ? "end" : "middle";
-      graphic.append(svgElement("line", { x1: position, y1: 47, x2: position, y2: height - 20, class: "chart-axis" }), svgElement("text", { x: position, y: 18, "text-anchor": anchor, class: "timeline-axis-label" }, timelineDay.format(new Date(at))), svgElement("text", { x: position, y: 35, "text-anchor": anchor, class: "timeline-axis-label" }, timelineTime.format(new Date(at))));
+    const minimumSpan = Math.min(1000, loadedEnd - loadedStart);
+    const controls = node("div", null, "timeline-zoom-controls");
+    controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Timeline zoom");
+    const zoomIn = button("Zoom in", () => resizeViewport((end - start) / 2));
+    const zoomOut = button("Zoom out", () => resizeViewport((end - start) * 2));
+    const reset = button("Reset zoom", () => setViewport(loadedStart, loadedEnd));
+    controls.append(zoomIn, zoomOut, reset);
+    const viewport = node("p", null, "timeline-period timeline-viewport");
+    viewport.id = prefix + "-viewport"; viewport.setAttribute("role", "status"); viewport.setAttribute("aria-live", "polite");
+    result.append(controls, viewport, node("p", "Drag horizontally between two positions inside the plot with a mouse to zoom. Zoom controls also work with a keyboard. Zoom uses only the current evidence page and keeps the viewport when paging. A new search resets zoom. Scroll horizontally to reach the rest of the chart on a narrow screen.", "table-note"));
+    const hover = node("p", null, "timeline-hover");
+    hover.id = prefix + "-hover"; hover.tabIndex = 0;
+    hover.setAttribute("role", "status"); hover.setAttribute("aria-live", "polite");
+    hover.setAttribute("aria-label", "Stored broadcast metadata; scroll for full details");
+    result.append(hover);
+    const hoverPrompt = "Hover or focus a positive receipt or uncertain patterned span to inspect stored broadcast title metadata. Metadata does not establish account viewing.";
+    let hoverTimer = null, hoverController = null, hoverGeneration = 0, hoverKey = null, cancelDrag = null, hoverComplete = false;
+    function cancelHover(keepResult = false) {
+      hoverGeneration += 1; hoverKey = null;
+      if (hoverTimer !== null) clearTimeout(hoverTimer);
+      if (hoverController) hoverController.abort();
+      hoverTimer = null; hoverController = null;
+      if (!keepResult || !hoverComplete) { hover.textContent = hoverPrompt; hover.scrollTop = 0; hoverComplete = false; }
     }
-    for (const [index, channel] of channelNames.entries()) {
-      const y = 62 + index * 58;
-      const channelLabel = channel.length > 16 ? channel.slice(0, 15) + "…" : channel;
-      const channelAttributes = { x: 12, y: y + 17, class: "timeline-channel" };
-      // Leave a 12px gutter before the plot, even for wide valid login glyphs.
-      if (channel.length > 12) { channelAttributes.textLength = 156; channelAttributes.lengthAdjust = "spacingAndGlyphs"; }
-      const channelText = svgElement("text", channelAttributes, channelLabel);
-      channelText.append(svgElement("title", {}, channel));
-      graphic.append(channelText, svgElement("rect", { x: 180, y, width: 790, height: 32, class: "timeline-unknown" }));
-      if (data.broadcast) graphic.append(svgElement("rect", { x: 180, y: y - 3, width: 790, height: 38, class: "timeline-window" }));
+    function cancelPending() {
+      cancelHover(); if (cancelDrag) cancelDrag();
+      if (activeTimelineCancel === cancelPending) activeTimelineCancel = null;
     }
-    for (const item of intervals) {
-      const y = 78 + channelNames.indexOf(String(item.channel || "Unknown channel")) * 58;
-      const inferenceFrom = Date.parse(item.inference_from), inferenceTo = Date.parse(item.inference_to);
-      if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(inferenceFrom) && Number.isFinite(inferenceTo)) {
-        const left = Math.max(start, inferenceFrom), right = Math.min(end, inferenceTo);
-        if (right > left) {
-          const attributes = { x: x(left), y: y - 9, width: x(right) - x(left), height: 18, class: "timeline-inference" };
-          const span = svgElement("rect", attributes);
-          span.append(svgElement("title", {}, `${item.channel}: uncertain inference ${timelineText(new Date(left).toISOString())} — ${timelineText(new Date(right).toISOString())}; ${label(item.inference_end_basis)}. Continuous presence is unknown.`));
-          graphic.append(span, svgElement("rect", { x: x(left), y: y - 9, width: x(right) - x(left), height: 18, fill: `url(#${prefix}-hatch)`, "aria-hidden": "true" }));
+    result.cancelPending = cancelPending;
+    function currentHover(generation) {
+      return generation === hoverGeneration && !document.hidden && !$("section-" + (prefix === "timeline" ? "history" : "broadcasts")).hidden && $(prefix + "-results").contains(result) && !$(prefix + "-results").classList.contains("stale");
+    }
+    function scheduleHover(channel, at, evidence) {
+      if (!Number.isFinite(at)) return;
+      const selectedAt = new Date(Math.max(start, Math.min(end - 1, Math.floor(at)))).toISOString();
+      const key = `${channel}:${selectedAt}:${evidence}`;
+      if (key === hoverKey) return;
+      if (activeTimelineCancel && activeTimelineCancel !== cancelPending) activeTimelineCancel();
+      cancelHover(); activeTimelineCancel = cancelPending; hoverKey = key;
+      const generation = hoverGeneration;
+      hoverTimer = setTimeout(async () => {
+        hoverTimer = null;
+        if (!currentHover(generation)) { cancelHover(); return; }
+        const selectedText = `${channel} · selected time: ${timelineText(selectedAt)}. ${evidence}. `;
+        hover.textContent = selectedText + "Loading stored broadcast metadata…";
+        const controller = new AbortController(); hoverController = controller;
+        try {
+          const context = await api(url("/api/channels/" + encodeURIComponent(channel) + "/metadata/at", { at: selectedAt, broadcast_id: data.broadcast ? data.broadcast.id : query.broadcast_id }), { signal: controller.signal });
+          if (!currentHover(generation)) return;
+          const checkAt = context.check && context.check.checked_at;
+          const title = context.title;
+          if (["exact_check", "last_reported"].includes(context.basis) && title && typeof title.title === "string" && Number.isFinite(Date.parse(checkAt)) && Number.isFinite(Date.parse(title.seen_at))) {
+            const reported = title.title === "" ? "Empty reported title" : title.title;
+            hover.textContent = selectedText + `${context.basis === "exact_check" ? "Reported title" : "Last reported title"}: ${reported}. Metadata checked: ${timelineText(checkAt)}. Title first recorded: ${timelineText(title.seen_at)}. This metadata sample does not establish continuity or video viewing.`;
+          } else {
+            const reasons = { no_history: "No stored metadata history", metadata_unknown: "The stored metadata state is unknown", offline_report: "The stored check reported the channel offline", polling_gap: "The metadata polling gap leaves this time unknown", outside_broadcast_window: "The selected time is outside the recorded broadcast window", broadcast_mismatch: "The stored report does not match the selected broadcast", transition_ambiguous: "The broadcast transition is ambiguous", missing_title_history: "No historical title was stored for this time", inconsistent_history: "Stored metadata history is inconsistent" };
+            hover.textContent = selectedText + `Unknown broadcast title — ${reasons[context.reason] || "No usable stored title metadata"}.` + (Number.isFinite(Date.parse(checkAt)) ? ` Metadata checked: ${timelineText(checkAt)}.` : "") + " Missing metadata does not establish absence or video viewing.";
+          }
+          hoverComplete = true;
+        } catch (_) {
+          if (currentHover(generation)) { hover.textContent = selectedText + "Unknown broadcast title — stored metadata could not be loaded. Chat evidence is unchanged."; hoverComplete = true; }
+        } finally {
+          if (generation === hoverGeneration) hoverController = null;
+        }
+      }, 180);
+    }
+    const display = node("div"); result.append(display);
+    let previousScroll = 0, detailsOpen = false;
+    function setViewport(from, to) {
+      start = Math.max(loadedStart, Math.round(from)); end = Math.min(loadedEnd, Math.round(to));
+      query.timelineViewport = { from: start, to: end };
+      renderViewport();
+    }
+    function resizeViewport(span) {
+      const width = Math.max(minimumSpan, Math.min(loadedEnd - loadedStart, span));
+      const from = Math.max(loadedStart, Math.min(loadedEnd - width, (start + end - width) / 2));
+      setViewport(from, from + width);
+    }
+    function renderViewport() {
+      cancelHover();
+      if (cancelDrag) cancelDrag();
+      viewport.textContent = `Visible viewport (local): ${timelineText(new Date(start).toISOString())} inclusive — ${timelineText(new Date(end).toISOString())} exclusive. Current loaded evidence page only.`;
+      zoomIn.disabled = end - start <= minimumSpan;
+      zoomOut.disabled = reset.disabled = start === loadedStart && end === loadedEnd;
+      const priorScroll = display.children[0], priorDetails = display.children[display.children.length - 1];
+      if (priorScroll) previousScroll = priorScroll.scrollLeft;
+      if (priorDetails && priorDetails.tagName === "DETAILS") detailsOpen = priorDetails.open;
+      display.replaceChildren();
+      const graphic = svgElement("svg", { id: prefix + "-chart", viewBox: `0 0 1000 ${height}`, width: 1000, height, role: "img", "aria-labelledby": prefix + "-chart-title " + prefix + "-chart-description" });
+      graphic.append(svgElement("title", { id: prefix + "-chart-title" }, `IRC evidence for ${data.account || query.account}, grouped by channel on a shared time axis`), svgElement("desc", { id: prefix + "-chart-description" }, `Visible viewport ${timelineText(new Date(start).toISOString())} inclusive to ${timelineText(new Date(end).toISOString())} exclusive. Actual receipt endpoint dots and PART diamonds are separate from patterned uncertain inference. Unmarked and unloaded evidence is unknown. Exact times and evidence basis follow in a table.`));
+      const defs = svgElement("defs");
+      const pattern = svgElement("pattern", { id: prefix + "-hatch", width: 7, height: 7, patternUnits: "userSpaceOnUse" });
+      pattern.append(svgElement("path", { d: "M-2 2L2 -2M0 7L7 0M5 9L9 5", class: "timeline-hatch" })); defs.append(pattern); graphic.append(defs);
+      const x = (at) => 180 + 790 * (at - start) / (end - start);
+      for (let tick = 0; tick <= 4; tick += 1) {
+        const at = start + (end - start) * tick / 4;
+        const position = x(at);
+        const anchor = tick === 0 ? "start" : tick === 4 ? "end" : "middle";
+        graphic.append(svgElement("line", { x1: position, y1: 47, x2: position, y2: height - 20, class: "chart-axis" }), svgElement("text", { x: position, y: 18, "text-anchor": anchor, class: "timeline-axis-label" }, timelineDay.format(new Date(at))), svgElement("text", { x: position, y: 35, "text-anchor": anchor, class: "timeline-axis-label" }, timelineTime.format(new Date(at))));
+      }
+      for (const [index, channel] of channelNames.entries()) {
+        const y = 62 + index * 58;
+        const channelLabel = channel.length > 16 ? channel.slice(0, 15) + "…" : channel;
+        const channelAttributes = { x: 12, y: y + 17, class: "timeline-channel" };
+        // Leave a 12px gutter before the plot, even for wide valid login glyphs.
+        if (channel.length > 12) { channelAttributes.textLength = 156; channelAttributes.lengthAdjust = "spacingAndGlyphs"; }
+        const channelText = svgElement("text", channelAttributes, channelLabel);
+        channelText.append(svgElement("title", {}, channel));
+        graphic.append(channelText, svgElement("rect", { x: 180, y, width: 790, height: 32, class: "timeline-unknown" }));
+        if (data.broadcast) graphic.append(svgElement("rect", { x: 180, y: y - 3, width: 790, height: 38, class: "timeline-window" }));
+      }
+      for (const item of intervals) {
+        const y = 78 + channelNames.indexOf(String(item.channel || "Unknown channel")) * 58;
+        const inferenceFrom = Date.parse(item.inference_from), inferenceTo = Date.parse(item.inference_to);
+        if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(inferenceFrom) && Number.isFinite(inferenceTo)) {
+          const left = Math.max(start, inferenceFrom), right = Math.min(end, inferenceTo);
+          if (right > left) {
+            const attributes = { x: x(left), y: y - 9, width: x(right) - x(left), height: 18, class: "timeline-inference" };
+            const span = svgElement("rect", attributes);
+            span.append(svgElement("title", {}, `${item.channel}: uncertain inference ${timelineText(new Date(left).toISOString())} — ${timelineText(new Date(right).toISOString())}; ${label(item.inference_end_basis)}. Continuous presence is unknown.`));
+            bindHover(span, item.channel, null, "Uncertain chat inference; continuous presence is unknown", left + Math.floor((right - left) / 2));
+            graphic.append(span, svgElement("rect", { x: x(left), y: y - 9, width: x(right) - x(left), height: 18, fill: `url(#${prefix}-hatch)`, "aria-hidden": "true", "pointer-events": "none" }));
+          }
+        }
+        const seen = new Set();
+        for (const marker of Array.isArray(item.markers) ? item.markers.slice(0, 3) : []) {
+          const at = Date.parse(marker.at);
+          if (!Number.isFinite(at) || at < start || at >= end || !["first_positive", "last_positive", "part"].includes(marker.kind) || seen.has(`${marker.kind}:${at}`)) continue;
+          seen.add(`${marker.kind}:${at}`);
+          const position = x(at);
+          const shape = marker.kind === "part" ? svgElement("polygon", { points: `${position},${y - 6} ${position + 6},${y} ${position},${y + 6} ${position - 6},${y}`, class: "timeline-departure" }) : svgElement("circle", { cx: position, cy: y, r: 4.5, class: "positive-point" });
+          shape.append(svgElement("title", {}, `${item.channel}: ${label(marker.kind)} received ${timelineText(marker.at)}; ${label(marker.basis)}. Stored event ${marker.observation_id}.`));
+          if (marker.kind !== "part") bindHover(shape, item.channel, at, "Actual positive chat receipt", at);
+          graphic.append(shape);
         }
       }
-      const seen = new Set();
-      for (const marker of Array.isArray(item.markers) ? item.markers.slice(0, 3) : []) {
-        const at = Date.parse(marker.at);
-        if (!Number.isFinite(at) || at < start || at >= end || !["first_positive", "last_positive", "part"].includes(marker.kind) || seen.has(`${marker.kind}:${at}`)) continue;
-        seen.add(`${marker.kind}:${at}`);
-        const position = x(at);
-        const shape = marker.kind === "part" ? svgElement("polygon", { points: `${position},${y - 6} ${position + 6},${y} ${position},${y + 6} ${position - 6},${y}`, class: "timeline-departure" }) : svgElement("circle", { cx: position, cy: y, r: 4.5, class: "positive-point" });
-        shape.append(svgElement("title", {}, `${item.channel}: ${label(marker.kind)} received ${timelineText(marker.at)}; ${label(marker.basis)}. Stored event ${marker.observation_id}.`));
-        graphic.append(shape);
+      const scroll = node("div", null, "timeline-scroll");
+      scroll.tabIndex = 0; scroll.setAttribute("role", "region"); scroll.setAttribute("aria-label", "Scrollable account evidence timeline; exact values are in the following evidence table"); scroll.append(graphic); display.append(scroll); scroll.scrollLeft = previousScroll;
+      if (!intervals.length) display.append(node("p", "No matching evidence is loaded in this period. The entire visible period remains unknown; this does not establish absence.", "table-note"));
+      const details = node("details", null, "timeline-details");
+      details.append(node("summary", `Exact times and evidence basis (${count(intervals.length)} segments on this page)`));
+      details.append(table(["Channel / session", "Evidence quality", "Actual positive endpoint receipts", "Uncertain inference shown", "Actual PART receipts / boundary"], intervals, (item) => {
+        const row = node("tr");
+        const identity = node("div", item.channel); identity.append(node("span", `Session ${item.session_id} · ${item.kind === "departure" ? "PART only" : "Segment " + item.id}`, "secondary-line"));
+        const quality = node("div", item.kind === "departure" ? "Departure receipt only" : item.supported_visit && !item.out_of_order ? "Supported segment · continuity uncertain" : "Ambiguous observation only · no inference");
+        quality.append(node("span", `Start: ${label(item.start_basis)}. End: ${label(item.end_basis)}${item.end_reason ? " (" + label(item.end_reason) + ")" : ""}.`, "secondary-line"));
+        if (item.out_of_order) quality.append(node("span", "Out-of-order evidence; no inference drawn.", "secondary-line"));
+        if (item.session_end_uncertain) quality.append(node("span", "Collection session end is uncertain.", "secondary-line"));
+        const endpoints = node("div");
+        if (item.first_observed_at) { endpoints.append(node("span", "First endpoint: "), exactTime(item.first_observed_at)); }
+        if (item.last_observed_at && item.last_observed_at !== item.first_observed_at) endpoints.append(node("span", "Last endpoint: ", "secondary-line"), exactTime(item.last_observed_at));
+        if (!item.first_observed_at) endpoints.append(node("span", "No positive receipt endpoint"));
+        endpoints.append(node("span", "Only actual markers inside the visible period are drawn; endpoints can be outside it.", "secondary-line"));
+        const inference = node("div");
+        const left = Math.max(start, Date.parse(item.inference_from)), right = Math.min(end, Date.parse(item.inference_to));
+        if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(left) && Number.isFinite(right) && right > left) inference.append(exactTime(new Date(left).toISOString()), node("span", "Until (exclusive): ", "secondary-line"), exactTime(new Date(right).toISOString()), node("span", `Basis: earlier positive receipt; end: ${label(item.inference_end_basis)}. Patterned interval is uncertain.`, "secondary-line"));
+        else inference.append(node("span", "None · unknown between receipts"));
+        const boundary = node("div");
+        const parts = (Array.isArray(item.markers) ? item.markers : []).filter((marker) => marker.kind === "part");
+        for (const part of parts) boundary.append(node("span", "PART received: "), exactTime(part.at), node("span", `Basis: ${label(part.basis)}; event ${part.observation_id}. Departure time is unverified.`, "secondary-line"));
+        if (item.boundary_at) boundary.append(node("span", `Boundary (${label(item.boundary_basis)}): `, "secondary-line"), exactTime(item.boundary_at));
+        if (!parts.length && !item.boundary_at) boundary.append(node("span", "No recorded boundary"));
+        row.append(cell(identity), cell(quality), cell(endpoints), cell(inference), cell(boundary)); return row;
+      }, "Equivalent timeline evidence · exact local receipt times and UTC · IRC observations only · unknown is not absence"));
+      details.open = detailsOpen; display.append(details);
+      const plotTop = 62, plotBottom = 62 + (channelNames.length - 1) * 58 + 32;
+      const selection = svgElement("rect", { x: 180, y: plotTop, width: 0, height: plotBottom - plotTop, class: "timeline-selection", visibility: "hidden", "aria-hidden": "true" });
+      graphic.append(selection);
+      let drag = null;
+      function plotPosition(event) {
+        if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+        try {
+          const matrix = graphic.getScreenCTM();
+          if (!matrix) return null;
+          const point = graphic.createSVGPoint(); point.x = event.clientX; point.y = event.clientY;
+          const local = point.matrixTransform(matrix.inverse());
+          return Number.isFinite(local.x) && Number.isFinite(local.y) ? local : null;
+        } catch (_) { return null; }
       }
+      function bindHover(shape, channel, exactAt, evidence, focusAt) {
+        shape.setAttribute("tabindex", "0"); shape.setAttribute("aria-describedby", hover.id);
+        shape.setAttribute("aria-label", `${channel}: ${evidence}. Focus inspects metadata at ${timelineText(new Date(focusAt).toISOString())}.`);
+        function inspect(event) {
+          if (drag || event.pointerType === "touch") return;
+          const position = exactAt === null ? plotPosition(event) : null;
+          if (exactAt !== null || position) scheduleHover(channel, exactAt === null ? start + (end - start) * (position.x - 180) / 790 : exactAt, evidence);
+        }
+        shape.addEventListener("pointerenter", inspect); shape.addEventListener("pointermove", inspect);
+        shape.addEventListener("pointerleave", () => cancelHover(true));
+        shape.addEventListener("focus", () => { if (!drag) scheduleHover(channel, focusAt, evidence); });
+        shape.addEventListener("blur", () => cancelHover(true));
+        shape.addEventListener("keydown", (event) => { if (event.key === "Escape") cancelHover(); });
+      }
+      function finishDrag() {
+        const pointerId = drag && drag.pointerId; drag = null;
+        selection.setAttribute("visibility", "hidden");
+        if (pointerId !== null && pointerId !== undefined && graphic.hasPointerCapture(pointerId)) graphic.releasePointerCapture(pointerId);
+      }
+      cancelDrag = finishDrag;
+      graphic.addEventListener("pointerdown", (event) => {
+        if (drag || event.pointerType !== "mouse" || event.button !== 0 || event.isPrimary === false) return;
+        const position = plotPosition(event);
+        if (!position || position.x < 180 || position.x > 970 || position.y < plotTop || position.y > plotBottom) return;
+        if (activeTimelineCancel && activeTimelineCancel !== cancelPending) activeTimelineCancel();
+        cancelHover();
+        try { graphic.setPointerCapture(event.pointerId); } catch (_) { return; }
+        drag = { pointerId: event.pointerId, x: position.x, clientX: event.clientX };
+        activeTimelineCancel = cancelPending;
+        selection.setAttribute("x", position.x); selection.setAttribute("width", 0); selection.setAttribute("visibility", "visible");
+        event.preventDefault();
+      });
+      graphic.addEventListener("pointermove", (event) => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        const position = plotPosition(event); if (!position) { finishDrag(); return; }
+        const last = Math.max(180, Math.min(970, position.x));
+        selection.setAttribute("x", Math.min(drag.x, last)); selection.setAttribute("width", Math.abs(last - drag.x));
+      });
+      graphic.addEventListener("pointerup", (event) => {
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        const position = plotPosition(event), first = drag.x, distance = Math.abs(event.clientX - drag.clientX);
+        finishDrag();
+        if (!position || distance < 6) return;
+        const last = Math.max(180, Math.min(970, position.x));
+        const from = start + (end - start) * (Math.min(first, last) - 180) / 790;
+        const to = start + (end - start) * (Math.max(first, last) - 180) / 790;
+        if (to - from >= minimumSpan) setViewport(from, to);
+      });
+      graphic.addEventListener("pointercancel", (event) => { cancelHover(); if (drag && event.pointerId === drag.pointerId) finishDrag(); });
+      graphic.addEventListener("lostpointercapture", (event) => { if (drag && event.pointerId === drag.pointerId) finishDrag(); });
+      graphic.addEventListener("pointerleave", () => { cancelHover(true); if (drag && !graphic.hasPointerCapture(drag.pointerId)) finishDrag(); });
     }
-    const scroll = node("div", null, "timeline-scroll");
-    scroll.tabIndex = 0; scroll.setAttribute("role", "region"); scroll.setAttribute("aria-label", "Scrollable account evidence timeline; exact values are in the following evidence table"); scroll.append(graphic); result.append(scroll);
-    if (!intervals.length) result.append(node("p", "No matching evidence is loaded in this period. The entire visible period remains unknown; this does not establish absence.", "table-note"));
-    const details = node("details", null, "timeline-details");
-    details.append(node("summary", `Exact times and evidence basis (${count(intervals.length)} segments on this page)`));
-    details.append(table(["Channel / session", "Evidence quality", "Actual positive endpoint receipts", "Uncertain inference shown", "Actual PART receipts / boundary"], intervals, (item) => {
-      const row = node("tr");
-      const identity = node("div", item.channel); identity.append(node("span", `Session ${item.session_id} · ${item.kind === "departure" ? "PART only" : "Segment " + item.id}`, "secondary-line"));
-      const quality = node("div", item.kind === "departure" ? "Departure receipt only" : item.supported_visit && !item.out_of_order ? "Supported segment · continuity uncertain" : "Ambiguous observation only · no inference");
-      quality.append(node("span", `Start: ${label(item.start_basis)}. End: ${label(item.end_basis)}${item.end_reason ? " (" + label(item.end_reason) + ")" : ""}.`, "secondary-line"));
-      if (item.out_of_order) quality.append(node("span", "Out-of-order evidence; no inference drawn.", "secondary-line"));
-      if (item.session_end_uncertain) quality.append(node("span", "Collection session end is uncertain.", "secondary-line"));
-      const endpoints = node("div");
-      if (item.first_observed_at) { endpoints.append(node("span", "First endpoint: "), exactTime(item.first_observed_at)); }
-      if (item.last_observed_at && item.last_observed_at !== item.first_observed_at) endpoints.append(node("span", "Last endpoint: ", "secondary-line"), exactTime(item.last_observed_at));
-      if (!item.first_observed_at) endpoints.append(node("span", "No positive receipt endpoint"));
-      endpoints.append(node("span", "Only actual markers inside the visible period are drawn; endpoints can be outside it.", "secondary-line"));
-      const inference = node("div");
-      const left = Math.max(start, Date.parse(item.inference_from)), right = Math.min(end, Date.parse(item.inference_to));
-      if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(left) && Number.isFinite(right) && right > left) inference.append(exactTime(new Date(left).toISOString()), node("span", "Until (exclusive): ", "secondary-line"), exactTime(new Date(right).toISOString()), node("span", `Basis: earlier positive receipt; end: ${label(item.inference_end_basis)}. Patterned interval is uncertain.`, "secondary-line"));
-      else inference.append(node("span", "None · unknown between receipts"));
-      const boundary = node("div");
-      const parts = (Array.isArray(item.markers) ? item.markers : []).filter((marker) => marker.kind === "part");
-      for (const part of parts) boundary.append(node("span", "PART received: "), exactTime(part.at), node("span", `Basis: ${label(part.basis)}; event ${part.observation_id}. Departure time is unverified.`, "secondary-line"));
-      if (item.boundary_at) boundary.append(node("span", `Boundary (${label(item.boundary_basis)}): `, "secondary-line"), exactTime(item.boundary_at));
-      if (!parts.length && !item.boundary_at) boundary.append(node("span", "No recorded boundary"));
-      row.append(cell(identity), cell(quality), cell(endpoints), cell(inference), cell(boundary)); return row;
-    }, "Equivalent timeline evidence · exact local receipt times and UTC · IRC observations only · unknown is not absence"));
-    result.append(details);
+    renderViewport();
     return result;
   }
 
@@ -1159,7 +1325,7 @@
     navigate("broadcasts"); startBroadcastSearch();
   });
   window.addEventListener("hashchange", showSection);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); else dismissLoginSuggestions(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); else { dismissLoginSuggestions(); if (activeTimelineCancel) activeTimelineCancel(); } });
   showSection();
   refreshStatus();
   setInterval(() => { if (!document.hidden) refreshStatus(); }, 15000);
