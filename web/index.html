@@ -58,10 +58,17 @@
         <button id="search-submit" type="submit">Search history</button>
         <div class="field"><label for="search-from">From (local time, inclusive)</label><input id="search-from" type="datetime-local" step="1" aria-describedby="time-range-help"></div>
         <div class="field"><label for="search-to">Until (local time, exclusive)</label><input id="search-to" type="datetime-local" step="1" aria-describedby="time-range-help"></div>
-        <p id="time-range-help" class="help full-width">Optional time bounds are converted to UTC. Leave blank for all retained time. The end must be later than the start.</p>
+        <p id="time-range-help" class="help full-width">Times are converted to UTC. The account timeline defaults to the latest 7 days, with a maximum of 31 days. Its exact visible period appears below. Other history tables search all retained time when bounds are blank.</p>
         <p id="search-help" class="help full-width">Enter at least one exact login. Use both fields to inspect one account in one channel. Times below are local receipt times, not event occurrence times.</p>
       </form>
       <p id="search-message" class="inline-message" role="status" aria-live="polite"></p>
+      <section id="timeline-panel" class="timeline-panel" aria-labelledby="timeline-title">
+        <h3 id="timeline-title">Account chat evidence timeline</h3>
+        <p class="table-note">One shared time axis across channels. IRC evidence does not establish video viewing, continuous attendance, or a calibrated probability of presence.</p>
+        <p id="timeline-message" class="inline-message" role="status" aria-live="polite"></p>
+        <div id="timeline-results" aria-busy="false"><p class="empty">Enter an exact account login to show its timeline. A channel filter is optional.</p></div>
+        <div id="timeline-pagination" class="pagination" hidden><button id="timeline-previous" class="secondary" type="button">Previous evidence page</button><span id="timeline-page" class="quiet"></span><button id="timeline-next" class="secondary" type="button">Next evidence page</button></div>
+      </section>
       <div id="relationships-section" hidden>
         <h3 class="result-heading">Accounts and channels in retained evidence</h3>
         <p class="table-note">First and latest receipts bound stored evidence only. They do not measure time spent in a channel.</p>
@@ -101,6 +108,7 @@
       <div id="broadcasts-pagination" class="pagination" hidden><button id="broadcasts-previous" class="secondary" type="button">Newer page</button><span id="broadcasts-page" class="quiet"></span><button id="broadcasts-next" class="secondary" type="button">Older page</button></div>
       <section id="broadcast-evidence" class="context-section" aria-labelledby="broadcast-evidence-title" hidden>
         <h3 id="broadcast-evidence-title">Broadcast chat evidence</h3><p id="broadcast-evidence-scope" class="table-note"></p>
+        <section id="broadcast-timeline-panel" class="timeline-panel" aria-labelledby="broadcast-timeline-title"><h3 id="broadcast-timeline-title">Account timeline in this broadcast</h3><p class="table-note">Evidence is clipped to the selected broadcast metadata window and time bounds. IRC records do not establish video viewing or a calibrated probability of presence.</p><p id="broadcast-timeline-message" class="inline-message" role="status" aria-live="polite"></p><div id="broadcast-timeline-results" aria-busy="false"><p class="empty">Search broadcasts with an exact account login, then open a summary to show its timeline.</p></div><div id="broadcast-timeline-pagination" class="pagination" hidden><button id="broadcast-timeline-previous" class="secondary" type="button">Previous evidence page</button><span id="broadcast-timeline-page" class="quiet"></span><button id="broadcast-timeline-next" class="secondary" type="button">Next evidence page</button></div></section>
         <p id="broadcast-accounts-message" class="inline-message" role="status" aria-live="polite"></p><div id="broadcast-accounts-results" aria-busy="false"></div><div id="broadcast-accounts-pagination" class="pagination" hidden><button id="broadcast-accounts-previous" class="secondary" type="button">Previous accounts</button><span id="broadcast-accounts-page" class="quiet"></span><button id="broadcast-accounts-next" class="secondary" type="button">Next accounts</button></div>
         <h3 class="result-heading">Visit evidence during this broadcast</h3><p id="broadcast-visits-message" class="inline-message" role="status" aria-live="polite"></p><div id="broadcast-visits-results" aria-busy="false"></div><div id="broadcast-visits-pagination" class="pagination" hidden><button id="broadcast-visits-previous" class="secondary" type="button">Previous visits</button><span id="broadcast-visits-page" class="quiet"></span><button id="broadcast-visits-next" class="secondary" type="button">Next visits</button></div>
         <h3 class="result-heading">Received events</h3>

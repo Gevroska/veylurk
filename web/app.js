@@ -2,7 +2,10 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const clock = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
+  const clock = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "medium" });
+  const timelineClock = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "long" });
+  const timelineDay = new Intl.DateTimeFormat("en", { month: "short", day: "numeric" });
+  const timelineTime = new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const numbers = new Intl.NumberFormat();
   const pendingChannels = new Set();
   let channels = [];
@@ -530,8 +533,8 @@
         }
       }
     }
-    previous.addEventListener("click", () => { if (!state.loading && state.index > 0) load(state.index - 1, state.positions[state.index - 1]); });
-    next.addEventListener("click", () => { if (!state.loading && state.next !== null) load(state.index + 1, state.next); });
+    previous.addEventListener("click", () => { if (!state.loading && !state.dirty && state.index > 0) load(state.index - 1, state.positions[state.index - 1]); });
+    next.addEventListener("click", () => { if (!state.loading && !state.dirty && state.next !== null) load(state.index + 1, state.next); });
     return {
       reset(query) {
         state.query = { ...query };
@@ -611,12 +614,156 @@
     return element;
   }
 
+  function exactTime(value) {
+    const result = node("span");
+    result.append(timestamp(value));
+    const date = new Date(value);
+    if (value && Number.isFinite(date.getTime())) result.append(node("span", date.toISOString(), "timeline-exact-time"));
+    return result;
+  }
+
+  function timelineText(value) {
+    const date = new Date(value);
+    return value && Number.isFinite(date.getTime()) ? `${timelineClock.format(date)} (${date.toISOString()})` : "Unknown time";
+  }
+
+  async function fetchTimeline(query, before) {
+    if (query.from && query.to && Date.parse(query.to) - Date.parse(query.from) > 31 * 86400000) throw new Error("The account timeline supports a maximum of 31 days. Narrow the From / Until range and search again.");
+    const data = await api(url("/api/timeline", { account: query.account, channel: query.channel, broadcast_id: query.broadcast_id, from: query.from, to: query.to, limit: 25, before }));
+    const range = data.effective_range;
+    if (!range || !Number.isFinite(Date.parse(range.from)) || !Number.isFinite(Date.parse(range.to)) || Date.parse(range.to) < Date.parse(range.from)) throw new Error("The local app returned an invalid timeline period.");
+    if (query.timelineRangeFixed && (Date.parse(query.from) !== Date.parse(range.from) || Date.parse(query.to) !== Date.parse(range.to))) throw new Error("The timeline period changed unexpectedly. Search again to refresh its axis.");
+    // Keep the same axis on every page, including when the first query used default bounds.
+    query.from = range.from; query.to = range.to;
+    query.timelineRangeFixed = true;
+    query.timelineBefore = before;
+    return data;
+  }
+
+  function timelinePage(data, query, prefix) {
+    const intervals = rows(data, "intervals");
+    if (intervals.length > 100) throw new Error("The local app returned too much timeline evidence for one page.");
+    const start = Date.parse(data.effective_range.from), end = Date.parse(data.effective_range.to);
+    const result = node("div");
+    const period = node("p", null, "timeline-period");
+    period.id = prefix + "-summary";
+    period.append(node("strong", `${data.account || query.account} · visible period (local): `), node("span", `${timelineText(data.effective_range.from)} inclusive — ${timelineText(data.effective_range.to)} exclusive`));
+    result.append(period);
+    if (data.broadcast) result.append(node("p", `Broadcast metadata window: ${timelineText(data.broadcast.started_at)} — ${timelineText(data.broadcast.last_live_at)}. This identifies the reported broadcast window, not account attendance.`, "table-note"));
+    result.append(node("p", "Dots show actual first / last positive receipt endpoints for each segment, not every received event. Patterned spans are uncertain inferences. Unknown background establishes neither presence nor absence. No confidence percentage is calibrated.", "table-note"));
+    result.append(node("p", "The fixed time axis is not a frozen snapshot: stored evidence can change between page requests.", "table-note"));
+    if (data.has_more || query.timelineBefore != null) result.append(node("p", "Partial evidence page: additional evidence is on other pages and is not drawn here. The time axis stays fixed. Unmarked areas remain unknown; they are not evidence of absence.", "timeline-warning"));
+    if (data.empty || end <= start) {
+      result.append(empty("No overlapping timeline period is available for these bounds and broadcast metadata. Account presence remains unknown."));
+      return result;
+    }
+    const legend = node("ul", null, "timeline-legend");
+    for (const [key, text] of [["positive", "Actual positive endpoint receipt"], ["inferred", "Uncertain inference"], ["departure", "PART receipt · departure unverified"], ["unknown", "Unknown / unloaded evidence"]]) {
+      const item = node("li");
+      const swatch = node("span", null, "timeline-key " + key); swatch.setAttribute("aria-hidden", "true");
+      item.append(swatch, node("span", text)); legend.append(item);
+    }
+    if (data.broadcast) {
+      const item = node("li"); const swatch = node("span", null, "timeline-key window"); swatch.setAttribute("aria-hidden", "true");
+      item.append(swatch, node("span", "Broadcast metadata window (clipped)")); legend.append(item);
+    }
+    result.append(legend);
+    const channelNames = [...new Set(intervals.map((item) => String(item.channel || "Unknown channel")))].sort((a, b) => a.localeCompare(b));
+    if (!channelNames.length) channelNames.push(data.channel || query.channel || "No recorded channel");
+    const height = 95 + channelNames.length * 58;
+    const graphic = svgElement("svg", { id: prefix + "-chart", viewBox: `0 0 1000 ${height}`, width: 1000, height, role: "img", "aria-labelledby": prefix + "-chart-title " + prefix + "-chart-description" });
+    graphic.append(svgElement("title", { id: prefix + "-chart-title" }, `IRC evidence for ${data.account || query.account}, grouped by channel on a shared time axis`), svgElement("desc", { id: prefix + "-chart-description" }, `Visible period ${timelineText(data.effective_range.from)} inclusive to ${timelineText(data.effective_range.to)} exclusive. Actual receipt endpoint dots and PART diamonds are separate from patterned uncertain inference. Unmarked and unloaded evidence is unknown. Exact times and evidence basis follow in a table.`));
+    const defs = svgElement("defs");
+    const pattern = svgElement("pattern", { id: prefix + "-hatch", width: 7, height: 7, patternUnits: "userSpaceOnUse" });
+    pattern.append(svgElement("path", { d: "M-2 2L2 -2M0 7L7 0M5 9L9 5", class: "timeline-hatch" })); defs.append(pattern); graphic.append(defs);
+    const x = (at) => 180 + 790 * (at - start) / (end - start);
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const at = start + (end - start) * tick / 4;
+      const position = x(at);
+      const anchor = tick === 0 ? "start" : tick === 4 ? "end" : "middle";
+      graphic.append(svgElement("line", { x1: position, y1: 47, x2: position, y2: height - 20, class: "chart-axis" }), svgElement("text", { x: position, y: 18, "text-anchor": anchor, class: "timeline-axis-label" }, timelineDay.format(new Date(at))), svgElement("text", { x: position, y: 35, "text-anchor": anchor, class: "timeline-axis-label" }, timelineTime.format(new Date(at))));
+    }
+    for (const [index, channel] of channelNames.entries()) {
+      const y = 62 + index * 58;
+      const channelLabel = channel.length > 16 ? channel.slice(0, 15) + "…" : channel;
+      const channelAttributes = { x: 12, y: y + 17, class: "timeline-channel" };
+      // Leave a 12px gutter before the plot, even for wide valid login glyphs.
+      if (channel.length > 12) { channelAttributes.textLength = 156; channelAttributes.lengthAdjust = "spacingAndGlyphs"; }
+      const channelText = svgElement("text", channelAttributes, channelLabel);
+      channelText.append(svgElement("title", {}, channel));
+      graphic.append(channelText, svgElement("rect", { x: 180, y, width: 790, height: 32, class: "timeline-unknown" }));
+      if (data.broadcast) graphic.append(svgElement("rect", { x: 180, y: y - 3, width: 790, height: 38, class: "timeline-window" }));
+    }
+    for (const item of intervals) {
+      const y = 78 + channelNames.indexOf(String(item.channel || "Unknown channel")) * 58;
+      const inferenceFrom = Date.parse(item.inference_from), inferenceTo = Date.parse(item.inference_to);
+      if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(inferenceFrom) && Number.isFinite(inferenceTo)) {
+        const left = Math.max(start, inferenceFrom), right = Math.min(end, inferenceTo);
+        if (right > left) {
+          const attributes = { x: x(left), y: y - 9, width: x(right) - x(left), height: 18, class: "timeline-inference" };
+          const span = svgElement("rect", attributes);
+          span.append(svgElement("title", {}, `${item.channel}: uncertain inference ${timelineText(new Date(left).toISOString())} — ${timelineText(new Date(right).toISOString())}; ${label(item.inference_end_basis)}. Continuous presence is unknown.`));
+          graphic.append(span, svgElement("rect", { x: x(left), y: y - 9, width: x(right) - x(left), height: 18, fill: `url(#${prefix}-hatch)`, "aria-hidden": "true" }));
+        }
+      }
+      const seen = new Set();
+      for (const marker of Array.isArray(item.markers) ? item.markers.slice(0, 3) : []) {
+        const at = Date.parse(marker.at);
+        if (!Number.isFinite(at) || at < start || at >= end || !["first_positive", "last_positive", "part"].includes(marker.kind) || seen.has(`${marker.kind}:${at}`)) continue;
+        seen.add(`${marker.kind}:${at}`);
+        const position = x(at);
+        const shape = marker.kind === "part" ? svgElement("polygon", { points: `${position},${y - 6} ${position + 6},${y} ${position},${y + 6} ${position - 6},${y}`, class: "timeline-departure" }) : svgElement("circle", { cx: position, cy: y, r: 4.5, class: "positive-point" });
+        shape.append(svgElement("title", {}, `${item.channel}: ${label(marker.kind)} received ${timelineText(marker.at)}; ${label(marker.basis)}. Stored event ${marker.observation_id}.`));
+        graphic.append(shape);
+      }
+    }
+    const scroll = node("div", null, "timeline-scroll");
+    scroll.tabIndex = 0; scroll.setAttribute("role", "region"); scroll.setAttribute("aria-label", "Scrollable account evidence timeline; exact values are in the following evidence table"); scroll.append(graphic); result.append(scroll);
+    if (!intervals.length) result.append(node("p", "No matching evidence is loaded in this period. The entire visible period remains unknown; this does not establish absence.", "table-note"));
+    const details = node("details", null, "timeline-details");
+    details.append(node("summary", `Exact times and evidence basis (${count(intervals.length)} segments on this page)`));
+    details.append(table(["Channel / session", "Evidence quality", "Actual positive endpoint receipts", "Uncertain inference shown", "Actual PART receipts / boundary"], intervals, (item) => {
+      const row = node("tr");
+      const identity = node("div", item.channel); identity.append(node("span", `Session ${item.session_id} · ${item.kind === "departure" ? "PART only" : "Segment " + item.id}`, "secondary-line"));
+      const quality = node("div", item.kind === "departure" ? "Departure receipt only" : item.supported_visit && !item.out_of_order ? "Supported segment · continuity uncertain" : "Ambiguous observation only · no inference");
+      quality.append(node("span", `Start: ${label(item.start_basis)}. End: ${label(item.end_basis)}${item.end_reason ? " (" + label(item.end_reason) + ")" : ""}.`, "secondary-line"));
+      if (item.out_of_order) quality.append(node("span", "Out-of-order evidence; no inference drawn.", "secondary-line"));
+      if (item.session_end_uncertain) quality.append(node("span", "Collection session end is uncertain.", "secondary-line"));
+      const endpoints = node("div");
+      if (item.first_observed_at) { endpoints.append(node("span", "First endpoint: "), exactTime(item.first_observed_at)); }
+      if (item.last_observed_at && item.last_observed_at !== item.first_observed_at) endpoints.append(node("span", "Last endpoint: ", "secondary-line"), exactTime(item.last_observed_at));
+      if (!item.first_observed_at) endpoints.append(node("span", "No positive receipt endpoint"));
+      endpoints.append(node("span", "Only actual markers inside the visible period are drawn; endpoints can be outside it.", "secondary-line"));
+      const inference = node("div");
+      const left = Math.max(start, Date.parse(item.inference_from)), right = Math.min(end, Date.parse(item.inference_to));
+      if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(left) && Number.isFinite(right) && right > left) inference.append(exactTime(new Date(left).toISOString()), node("span", "Until (exclusive): ", "secondary-line"), exactTime(new Date(right).toISOString()), node("span", `Basis: earlier positive receipt; end: ${label(item.inference_end_basis)}. Patterned interval is uncertain.`, "secondary-line"));
+      else inference.append(node("span", "None · unknown between receipts"));
+      const boundary = node("div");
+      const parts = (Array.isArray(item.markers) ? item.markers : []).filter((marker) => marker.kind === "part");
+      for (const part of parts) boundary.append(node("span", "PART received: "), exactTime(part.at), node("span", `Basis: ${label(part.basis)}; event ${part.observation_id}. Departure time is unverified.`, "secondary-line"));
+      if (item.boundary_at) boundary.append(node("span", `Boundary (${label(item.boundary_basis)}): `, "secondary-line"), exactTime(item.boundary_at));
+      if (!parts.length && !item.boundary_at) boundary.append(node("span", "No recorded boundary"));
+      row.append(cell(identity), cell(quality), cell(endpoints), cell(inference), cell(boundary)); return row;
+    }, "Equivalent timeline evidence · exact local receipt times and UTC · IRC observations only · unknown is not absence"));
+    result.append(details);
+    return result;
+  }
+
+  const timelineView = pagedView("timeline", fetchTimeline, (data, query) => timelinePage(data, query, "timeline"));
+  const broadcastTimelineView = pagedView("broadcast-timeline", fetchTimeline, (data, query) => timelinePage(data, query, "broadcast-timeline"));
+
+  function timelinePrompt(view, prefix, text) {
+    view.clear();
+    $(prefix + "-results").replaceChildren(empty(text));
+  }
+
   function evidenceTimeline(item, start, end) {
     const graphic = svgElement("svg", { viewBox: "0 0 260 30", width: "260", height: "30", "aria-hidden": "true", class: "evidence-timeline" });
     const position = (value) => 10 + 240 * Math.max(0, Math.min(1, (Date.parse(value) - start) / Math.max(1, end - start)));
     const first = position(item.first_observed_at);
     const last = position(item.last_observed_at);
-    graphic.append(svgElement("line", { x1: first, y1: 15, x2: last, y2: 15, class: "evidence-span" }), svgElement("circle", { cx: first, cy: 15, r: 4, class: "positive-point" }), svgElement("circle", { cx: last, cy: 15, r: 4, class: "positive-point" }));
+    if (item.supported_visit !== false && !item.out_of_order) graphic.append(svgElement("line", { x1: first, y1: 15, x2: last, y2: 15, class: "evidence-span" }));
+    graphic.append(svgElement("circle", { cx: first, cy: 15, r: 4, class: "positive-point" }), svgElement("circle", { cx: last, cy: 15, r: 4, class: "positive-point" }));
     return graphic;
   }
 
@@ -711,6 +858,8 @@
       eventsView.reset(searchQuery);
       relationshipsView.reset(searchQuery);
       visitsView.reset(searchQuery);
+      if (account) timelineView.reset(searchQuery);
+      else timelinePrompt(timelineView, "timeline", "Enter an exact account login to show its timeline. A channel filter is optional.");
       presenceView.clear();
       $("channel-context").hidden = !channel;
       if (channel) {
@@ -762,6 +911,8 @@
     broadcastEventsView.reset({ id: item.id, account: query.account, from: query.from, to: query.to });
     broadcastAccountsView.reset({ id: item.id, account: query.account, from: query.from, to: query.to });
     broadcastVisitsView.reset({ broadcast_id: item.id, account: query.account, from: query.from, to: query.to, limit: 50 });
+    if (query.account) broadcastTimelineView.reset({ broadcast_id: item.id, account: query.account, from: query.from, to: query.to });
+    else timelinePrompt(broadcastTimelineView, "broadcast-timeline", "Search broadcasts with an exact account login, then open a summary to show its timeline.");
     $("broadcast-evidence").scrollIntoView({ behavior: "auto", block: "start" });
   }
 
@@ -791,6 +942,7 @@
       broadcastEventsView.clear();
       broadcastAccountsView.clear();
       broadcastVisitsView.clear();
+      broadcastTimelineView.clear();
       broadcastsView.reset(broadcastQuery);
     } catch (error) { message("broadcasts-message", failure(error), "error"); }
   }
@@ -858,10 +1010,10 @@
   $("broadcasts-form").addEventListener("submit", startBroadcastSearch);
   $("refresh-status").addEventListener("click", () => refreshStatus(true));
   for (const id of ["search-account", "search-channel", "search-limit", "search-from", "search-to"]) $(id).addEventListener("input", () => {
-    eventsView.markStale(); relationshipsView.markStale(); sessionsView.markStale(); visitsView.markStale(); metadataHistoryView.markStale(); presenceView.markStale();
+    eventsView.markStale(); relationshipsView.markStale(); sessionsView.markStale(); visitsView.markStale(); metadataHistoryView.markStale(); presenceView.markStale(); timelineView.markStale();
   });
   for (const id of ["broadcasts-account", "broadcasts-channel", "broadcasts-from", "broadcasts-to"]) $(id).addEventListener("input", () => {
-    broadcastsView.markStale(); broadcastEventsView.markStale(); broadcastAccountsView.markStale(); broadcastVisitsView.markStale();
+    broadcastsView.markStale(); broadcastEventsView.markStale(); broadcastAccountsView.markStale(); broadcastVisitsView.markStale(); broadcastTimelineView.markStale();
   });
   $("open-channel-broadcasts").addEventListener("click", () => {
     if (!searchQuery || !searchQuery.channel) return;

@@ -76,8 +76,10 @@ jobs:
             if (-not $ready -or $ready.state -ne 'idle' -or $ready.enabled_channels -ne 0 -or $ready.session_count -ne 0 -or $ready.observation_count -ne 0 -or $ready.storage_health -ne 'available') { throw 'Empty application startup status was invalid' }
             $metadata = Invoke-RestMethod -Uri "$baseUrl/api/metadata/status" -TimeoutSec 2
             if ($metadata.configured -or $metadata.channels.Count -ne 0) { throw 'Offline smoke unexpectedly enabled metadata' }
+            $timeline = Invoke-RestMethod -Uri "$baseUrl/api/timeline?account=fixture_account" -TimeoutSec 2
+            if ($timeline.account -ne 'fixture_account' -or $timeline.intervals.Count -ne 0 -or $timeline.has_more -or $null -ne $timeline.confidence -or $timeline.confidence_status -ne 'not_calibrated' -or $timeline.effective_range.from -ge $timeline.effective_range.to) { throw 'Packaged empty account timeline contract was invalid' }
             $page = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 2
-            if ($page.StatusCode -ne 200 -or -not $page.Content.Contains('Veylurk')) { throw 'Embedded interface was unavailable' }
+            if ($page.StatusCode -ne 200 -or -not $page.Content.Contains('Veylurk') -or -not $page.Content.Contains('timeline-panel') -or -not $page.Content.Contains('broadcast-timeline-panel')) { throw 'Embedded interface was unavailable' }
             foreach ($asset in @('app.js', 'theme.js', 'style.css')) {
               $response = Invoke-WebRequest -Uri "$baseUrl/$asset" -TimeoutSec 2
               if ($response.StatusCode -ne 200 -or $response.RawContentLength -le 0) { throw 'Embedded asset was unavailable' }
@@ -103,7 +105,7 @@ jobs:
           Get-ChildItem -LiteralPath scripts -Filter '*Veylurk*.ps1' -File | Copy-Item -Destination app-package -ErrorAction Stop
           Copy-Item -LiteralPath scripts/Setup-Twitch.ps1 -Destination app-package -ErrorAction Stop
           New-Item -ItemType Directory -Path app-package/docs -ErrorAction Stop | Out-Null
-          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md -Destination app-package/docs -ErrorAction Stop
+          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md, docs/timeline.md, docs/remaining-work.md -Destination app-package/docs -ErrorAction Stop
       - name: Verify packaged background shutdown and offline backup with actual SQLite
         shell: powershell
         run: |

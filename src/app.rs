@@ -106,6 +106,7 @@ pub fn router(state: AppState, additional: Router) -> Router {
         .route("/api/search", get(search))
         .route("/api/relationships", get(relationships))
         .route("/api/history", get(visits))
+        .route("/api/timeline", get(timeline))
         .route("/api/presence", get(presence))
         .with_state(state.clone())
         .merge(additional)
@@ -406,6 +407,25 @@ async fn relationships(
     Ok(Json(
         json!({"relationships":rows,"has_more":more,"next_offset":if more {Some(offset+limit)} else {None},"range":range}),
     ))
+}
+
+async fn timeline(
+    State(state): State<AppState>,
+    query: Result<Query<crate::timeline::TimelineQuery>, QueryRejection>,
+) -> Result<Json<crate::timeline::Timeline>, ApiError> {
+    let query = query.map(|query| query.0).map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Timeline query parameters are invalid.",
+        )
+    })?;
+    match state.store.timeline(query).await {
+        Ok(timeline) => Ok(Json(timeline)),
+        Err(StoreError::NotFound) => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "Broadcast not found.")),
+        Err(StoreError::Invalid) => Err(ApiError(StatusCode::BAD_REQUEST, "invalid_input", "Supply an exact account, valid logins and RFC3339 bounds spanning at most 31 days, a limit from 1 to 100, and positive broadcast/cursor IDs.")),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn visits(

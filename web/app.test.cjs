@@ -40,7 +40,7 @@ class Element {
   querySelector(selector) { assert.equal(selector, ".table-wrap"); return descendants(this).slice(1).find((element) => element.classList.contains("table-wrap")) || null; }
   querySelectorAll(selector) { assert.equal(selector, "[data-channel-action]"); return descendants(this).slice(1).filter((element) => element.dataset.channelAction); }
   focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
-  setAttribute(key, value) { this.attributes[key] = value; }
+  setAttribute(key, value) { this.attributes[key] = String(value); if (key === "class") this.className = String(value); }
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(name, callback) { this.listeners.set(name, [...(this.listeners.get(name) || []), callback]); }
   async dispatch(name) { await Promise.all((this.listeners.get(name) || []).map((callback) => callback({ preventDefault() {} }))); }
@@ -75,6 +75,7 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     if (target.pathname === "/api/channels") return { channels: [{ login: "sample_channel", tracked: true, enabled: true, active_session_id: 1, last_observed_at: received }] };
     if (target.pathname === "/api/metadata/status") return { configured: false, state: "unavailable", channels: [] };
     if (target.pathname === "/api/settings") return { collection_mode: "all", unknown_policy: "collect" };
+    if (target.pathname === "/api/timeline") return timeline();
     if (target.pathname === "/api/history") return { visits: [], has_more: false, next_offset: null };
     if (target.pathname === "/api/presence" || target.pathname.endsWith("/accounts")) return { accounts: [], has_more: false, next_offset: null };
     if (target.pathname.endsWith("/metadata/history")) return { observations: [], has_more: false, next_offset: null };
@@ -323,6 +324,7 @@ test("ambiguous delayed membership observations are not labeled as supported vis
   assert.match(app.get("visits-results").textContent, /1 ambiguous observation segments/);
   assert.match(app.get("visits-results").textContent, /Observation only — ambiguous/);
   assert.match(app.get("visits-results").textContent, /no supported visit or continuity inference/);
+  assert.equal(descendants(app.get("visits-results")).some((item) => item.classList.contains("evidence-span")), false);
 });
 
 test("metadata history keeps text literal and viewer samples unconnected with a table alternative", async () => {
@@ -478,4 +480,258 @@ test("per-room health overrides an open session and never equates recent receipt
   assert.match(app.get("channels-results").textContent, /Latest positive receipt/);
   assert.match(app.get("channels-results").textContent, /completeness unknown/);
   assert.doesNotMatch(app.get("channels-results").textContent, /Session open/);
+});
+
+const timelineFrom = "2026-10-23T10:00:00.000Z";
+const timelineTo = "2026-10-23T14:00:00.000Z";
+function timeline(intervals = [], extra = {}) {
+  return { account: "sample_account", channel: null, broadcast: null, effective_range: { from: timelineFrom, to: timelineTo }, as_of: timelineTo, empty: false, intervals, has_more: false, next_before: null, confidence: null, confidence_status: "not_calibrated", ...extra };
+}
+function timelineVisit(extra = {}) {
+  return {
+    kind: "visit", id: 10, account: "sample_account", channel: "sample_channel", session_id: 1,
+    first_observed_at: "2026-10-23T11:00:00Z", last_observed_at: received,
+    supported_visit: true, out_of_order: false, start_basis: "join", end_basis: "part", boundary_at: "2026-10-23T13:00:00Z", boundary_basis: "part",
+    inference_from: "2026-10-23T11:00:00Z", inference_to: "2026-10-23T13:00:00Z", inference_end_basis: "part",
+    markers: [{ observation_id: 10, at: "2026-10-23T11:00:00Z", kind: "first_positive", basis: "join" }, { observation_id: 11, at: received, kind: "last_positive", basis: "positive_receipt" }, { observation_id: 12, at: "2026-10-23T13:00:00Z", kind: "part", basis: "part_receipt" }], ...extra,
+  };
+}
+
+test("account timeline queries exact account, optional channel, and a bounded evidence page while retaining existing tables", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit(), timelineVisit({ id: 5, channel: "another_channel", session_id: 2 })]) : undefined);
+  await settle();
+  app.get("search-account").value = "@Sample_Account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  let call = app.calls.find((item) => item.target.pathname === "/api/timeline");
+  assert.equal(call.target.searchParams.get("account"), "sample_account");
+  assert.equal(call.target.searchParams.has("channel"), false);
+  assert.equal(call.target.searchParams.get("limit"), "25");
+  assert.equal(call.target.searchParams.has("from"), false);
+  assert.ok(app.calls.some((item) => item.target.pathname === "/api/search"));
+  assert.ok(app.calls.some((item) => item.target.pathname === "/api/history"));
+  const elements = descendants(app.get("timeline-results"));
+  assert.equal(elements.filter((item) => item.classList.contains("timeline-unknown")).length, 2);
+  assert.equal(elements.filter((item) => item.classList.contains("timeline-channel")).map((item) => item._text).join(","), "another_channel,sample_channel");
+  assert.equal(elements.filter((item) => item.tagName === "SVG").length, 1);
+  app.get("search-channel").value = "sample_channel";
+  await app.get("search-form").dispatch("submit"); await settle();
+  call = app.calls.filter((item) => item.target.pathname === "/api/timeline").at(-1);
+  assert.equal(call.target.searchParams.get("channel"), "sample_channel");
+});
+
+test("timeline keyset pagination pins the effective axis, warns about unloaded evidence, and supports previous page", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()], { has_more: !target.searchParams.has("before"), next_before: target.searchParams.has("before") ? null : 10 }) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("timeline-results").textContent, /additional evidence.*other pages/i);
+  const firstAxis = descendants(app.get("timeline-results")).filter((item) => item.classList.contains("timeline-axis-label")).map((item) => item.textContent);
+  await app.get("timeline-next").dispatch("click"); await settle();
+  let call = app.calls.filter((item) => item.target.pathname === "/api/timeline").at(-1);
+  assert.equal(call.target.searchParams.get("before"), "10");
+  assert.equal(call.target.searchParams.get("from"), timelineFrom);
+  assert.equal(call.target.searchParams.get("to"), timelineTo);
+  assert.deepEqual(descendants(app.get("timeline-results")).filter((item) => item.classList.contains("timeline-axis-label")).map((item) => item.textContent), firstAxis);
+  assert.match(app.get("timeline-results").textContent, /Partial evidence page/);
+  assert.equal(app.get("timeline-page").textContent, "Page 2");
+  await app.get("timeline-previous").dispatch("click"); await settle();
+  call = app.calls.filter((item) => item.target.pathname === "/api/timeline").at(-1);
+  assert.equal(call.target.searchParams.has("before"), false);
+  assert.equal(call.target.searchParams.get("from"), timelineFrom);
+  assert.equal(app.get("timeline-page").textContent, "Page 1");
+});
+
+test("timeline clips inference and uses only actual half-open-window markers without synthetic edge points", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit({
+    inference_from: "2026-10-23T09:00:00Z", inference_to: "2026-10-23T15:00:00Z",
+    markers: [
+      { observation_id: 1, at: "2026-10-23T09:00:00Z", kind: "first_positive", basis: "join" },
+      { observation_id: 2, at: timelineFrom, kind: "part", basis: "part_receipt" },
+      { observation_id: 3, at: timelineTo, kind: "last_positive", basis: "positive_receipt" },
+    ],
+  })]) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const elements = descendants(app.get("timeline-results"));
+  assert.equal(elements.filter((item) => item.tagName === "CIRCLE").length, 0);
+  assert.equal(elements.filter((item) => item.tagName === "POLYGON").length, 1);
+  const inferred = elements.find((item) => item.classList.contains("timeline-inference"));
+  assert.equal(inferred.attributes.x, "180"); assert.equal(inferred.attributes.width, "790");
+  assert.match(app.get("timeline-results").textContent, /2026-10-23T10:00:00.000Z/);
+  assert.match(app.get("timeline-results").textContent, /2026-10-23T14:00:00.000Z/);
+});
+
+test("separate sessions, ambiguous segments, out-of-order evidence and PART-only rows never gain connecting inference", async () => {
+  const point = (at, id) => [{ observation_id: id, at, kind: "first_positive", basis: "join" }];
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([
+    timelineVisit({ id: 4, session_id: 1, inference_from: "2026-10-23T10:30:00Z", inference_to: "2026-10-23T11:00:00Z", markers: point("2026-10-23T10:30:00Z", 4) }),
+    timelineVisit({ id: 3, session_id: 2, inference_from: "2026-10-23T13:00:00Z", inference_to: "2026-10-23T13:30:00Z", markers: point("2026-10-23T13:00:00Z", 3) }),
+    timelineVisit({ id: 2, supported_visit: false, markers: point(received, 2) }),
+    timelineVisit({ id: 1, out_of_order: true, markers: point(received, 1) }),
+    timelineVisit({ id: 0, kind: "departure", supported_visit: false, first_observed_at: null, last_observed_at: null, markers: [{ observation_id: 9, at: received, kind: "part", basis: "part_receipt" }] }),
+  ]) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const elements = descendants(app.get("timeline-results"));
+  assert.equal(elements.filter((item) => item.classList.contains("timeline-inference")).length, 2);
+  assert.equal(elements.filter((item) => item.tagName === "CIRCLE").length, 4);
+  assert.equal(elements.filter((item) => item.classList.contains("timeline-departure")).length, 1);
+  const spans = elements.filter((item) => item.classList.contains("timeline-inference"));
+  assert.ok(Number(spans[0].attributes.x) + Number(spans[0].attributes.width) < Number(spans[1].attributes.x));
+  assert.match(app.get("timeline-results").textContent, /Ambiguous observation only/);
+  assert.match(app.get("timeline-results").textContent, /Out-of-order evidence/);
+  assert.match(app.get("timeline-results").textContent, /PART only/);
+});
+
+test("timeline empty evidence remains unknown and channel-only searches require an account", async () => {
+  const app = createApp(); await settle();
+  app.get("search-channel").value = "sample_channel";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(app.calls.some((item) => item.target.pathname === "/api/timeline"), false);
+  assert.match(app.get("timeline-results").textContent, /exact account login/);
+  app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("timeline-results").textContent, /entire visible period remains unknown/);
+  assert.match(app.get("timeline-results").textContent, /not.*absence/);
+  assert.match(app.get("timeline-results").textContent, /No confidence percentage is calibrated/);
+  assert.doesNotMatch(app.get("timeline-results").textContent, /99%|confirmed absence|verified absence|absent for/i);
+  assert.equal(descendants(app.get("timeline-results")).filter((item) => item.classList.contains("timeline-unknown")).length, 1);
+});
+
+test("broadcast timeline requires an exact account and requests only the selected broadcast and time bounds", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/broadcasts") return { broadcasts: [{ id: 9, channel: "sample_channel", title: "A title", started_at: timelineFrom, last_live_at: timelineTo }], next_before: null };
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()], { broadcast: { id: 9, channel: "sample_channel", started_at: timelineFrom, last_live_at: timelineTo } });
+  });
+  await settle();
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  let open = descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events");
+  await open.dispatch("click"); await settle();
+  assert.equal(app.calls.some((item) => item.target.pathname === "/api/timeline"), false);
+  assert.match(app.get("broadcast-timeline-results").textContent, /exact account login/);
+  app.get("broadcasts-account").value = "sample_account";
+  app.get("broadcasts-from").value = "2026-10-23T10:00:00";
+  app.get("broadcasts-to").value = "2026-10-23T14:00:00";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  open = descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events");
+  await open.dispatch("click"); await settle();
+  const call = app.calls.find((item) => item.target.pathname === "/api/timeline");
+  assert.equal(call.target.searchParams.get("broadcast_id"), "9");
+  assert.equal(call.target.searchParams.get("account"), "sample_account");
+  assert.equal(call.target.searchParams.get("from"), new Date("2026-10-23T10:00:00").toISOString());
+  assert.equal(call.target.searchParams.get("to"), new Date("2026-10-23T14:00:00").toISOString());
+  assert.match(app.get("broadcast-timeline-results").textContent, /Broadcast metadata window/);
+  assert.equal(descendants(app.get("broadcast-timeline-results")).filter((item) => item.classList.contains("timeline-window")).length, 1);
+});
+
+test("timeline renders hostile text literally with an accessible shared chart and keyboard reachable exact table", async () => {
+  const hostile = '<img src=x onerror="injected()">';
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit({ channel: hostile, start_basis: hostile })], { account: hostile }) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const elements = descendants(app.get("timeline-results"));
+  assert.match(app.get("timeline-results").textContent, /<img src=x/);
+  assert.equal(elements.some((item) => item.tagName === "IMG"), false);
+  const graphic = elements.find((item) => item.tagName === "SVG");
+  assert.equal(graphic.attributes.role, "img");
+  assert.equal(graphic.attributes["aria-labelledby"], "timeline-chart-title timeline-chart-description");
+  const scroll = elements.find((item) => item.classList.contains("timeline-scroll"));
+  assert.equal(scroll.tabIndex, 0); assert.equal(scroll.attributes.role, "region");
+  scroll.focus(); assert.equal(app.document.activeElement, scroll);
+  const details = elements.find((item) => item.tagName === "DETAILS");
+  assert.equal(details.children[0].tagName, "SUMMARY");
+  assert.ok(descendants(details).some((item) => item.tagName === "TABLE"));
+  assert.ok(descendants(details).some((item) => item.tagName === "TIME" && item.dateTime === new Date(received).toISOString()));
+  assert.match(details.textContent, /positive receipt|Join|join/i);
+  assert.match(details.textContent, /2026-10-23T12:00:00.000Z/);
+});
+
+test("a valid wide 25-character channel label stays within its slot while full identity remains accessible", async () => {
+  const channel = "w".repeat(25);
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit({ channel })]) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const elements = descendants(app.get("timeline-results"));
+  const label = elements.find((item) => item.classList.contains("timeline-channel"));
+  assert.equal(label._text, "w".repeat(15) + "…");
+  assert.equal(label.attributes.lengthAdjust, "spacingAndGlyphs");
+  const plot = elements.find((item) => item.classList.contains("timeline-unknown"));
+  assert.ok(Number(label.attributes.x) + Number(label.attributes.textLength) <= Number(plot.attributes.x) - 12);
+  assert.equal(label.children.find((item) => item.tagName === "TITLE").textContent, channel);
+  const evidenceTable = elements.find((item) => item.tagName === "TABLE");
+  assert.ok(evidenceTable.textContent.includes(channel));
+});
+
+test("timeline request generations reject late replies and edited filters keep replies visibly stale", async () => {
+  const old = deferred();
+  const app = createApp((target) => target.pathname === "/api/timeline" ? target.searchParams.get("account") === "old_account" ? old.promise : timeline([timelineVisit()], { account: "new_account", has_more: true, next_before: 10 }) : undefined);
+  await settle(); app.get("search-account").value = "old_account";
+  await app.get("search-form").dispatch("submit");
+  assert.equal(app.get("timeline-results").attributes["aria-busy"], "true");
+  assert.match(app.get("timeline-message").textContent, /Loading/);
+  app.get("search-account").value = "new_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  old.resolve(timeline([], { account: "old_account" })); await settle();
+  assert.match(app.get("timeline-results").textContent, /new_account/);
+  assert.doesNotMatch(app.get("timeline-results").textContent, /old_account/);
+  app.get("search-account").value = "edited_account";
+  await app.get("search-account").dispatch("input");
+  assert.equal(app.get("timeline-results").classList.contains("stale"), true);
+  assert.equal(app.get("timeline-next").disabled, true);
+  const countBefore = app.calls.length;
+  await app.get("timeline-next").dispatch("click"); await settle();
+  assert.equal(app.calls.length, countBefore);
+});
+
+test("timeline failure retains the previous evidence page, rejects changed axes, and bounds overly wide requests", async () => {
+  let changeAxis = false;
+  const app = createApp((target) => target.pathname === "/api/timeline" ? target.searchParams.has("before") ? changeAxis ? timeline([], { effective_range: { from: "2026-10-22T10:00:00Z", to: timelineTo } }) : { httpStatus: 500, error: { message: "Timeline storage unavailable" } } : timeline([timelineVisit()], { has_more: true, next_before: 10 }) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  await app.get("timeline-next").dispatch("click"); await settle();
+  assert.match(app.get("timeline-message").textContent, /Timeline storage unavailable.*previous page/);
+  assert.equal(app.get("timeline-page").textContent, "Page 1");
+  assert.match(app.get("timeline-results").textContent, /sample_channel/);
+  changeAxis = true;
+  await app.get("timeline-next").dispatch("click"); await settle();
+  assert.match(app.get("timeline-message").textContent, /period changed unexpectedly.*previous page/);
+  const requests = app.calls.filter((item) => item.target.pathname === "/api/timeline").length;
+  app.get("search-from").value = "2026-08-01T00:00:00"; app.get("search-to").value = "2026-10-23T00:00:00";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("timeline-message").textContent, /maximum of 31 days/);
+  assert.equal(app.calls.filter((item) => item.target.pathname === "/api/timeline").length, requests);
+});
+
+test("editing timeline filters in flight preserves a stale warning after the pending response", async () => {
+  const pending = deferred();
+  const app = createApp((target) => target.pathname === "/api/timeline" ? pending.promise : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit");
+  app.get("search-channel").value = "new_channel";
+  await app.get("search-channel").dispatch("input");
+  pending.resolve(timeline([timelineVisit()], { has_more: true, next_before: 10 })); await settle();
+  assert.equal(app.get("timeline-results").classList.contains("stale"), true);
+  assert.match(app.get("timeline-message").textContent, /Filters changed/);
+  assert.equal(app.get("timeline-next").disabled, true);
+  assert.equal(app.get("timeline-results").attributes["aria-busy"], "false");
+});
+
+test("a channel-only search clears an in-flight account timeline without a late overwrite", async () => {
+  const pending = deferred();
+  const app = createApp((target) => target.pathname === "/api/timeline" ? pending.promise : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit");
+  app.get("search-account").value = ""; app.get("search-channel").value = "sample_channel";
+  await app.get("search-form").dispatch("submit");
+  pending.resolve(timeline([timelineVisit()])); await settle();
+  assert.match(app.get("timeline-results").textContent, /Enter an exact account login/);
+  assert.equal(descendants(app.get("timeline-results")).some((item) => item.tagName === "SVG"), false);
+  assert.equal(app.get("timeline-results").attributes["aria-busy"], "false");
+});
+
+test("disjoint broadcast timeline period reports unknown without manufacturing an axis or receipt markers", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([], { empty: true, effective_range: { from: timelineFrom, to: timelineFrom } }) : undefined);
+  await settle(); app.get("search-account").value = "sample_account";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("timeline-results").textContent, /No overlapping timeline period/);
+  assert.equal(descendants(app.get("timeline-results")).some((item) => item.tagName === "SVG"), false);
 });

@@ -214,6 +214,31 @@ td.actions { min-width: 260px; }
 .positive-point { fill: var(--accent-strong); }
 .evidence-timeline { display: block; min-width: 200px; }
 .evidence-span { stroke: var(--accent-strong); stroke-width: 2; stroke-dasharray: 3 4; }
+.timeline-panel { margin: 1.4rem 0; padding: 1.15rem; background: var(--panel); border: 1px solid var(--border); border-radius: 9px; }
+.timeline-period { margin: 0 0 .7rem; font-size: .9rem; overflow-wrap: anywhere; }
+.timeline-legend { display: flex; flex-wrap: wrap; gap: .6rem 1.25rem; padding: 0; margin: .75rem 0; list-style: none; font-size: .8rem; color: var(--secondary-text); }
+.timeline-legend li { display: flex; align-items: center; gap: .4rem; }
+.timeline-key { display: inline-block; width: 24px; height: 14px; flex-shrink: 0; }
+.timeline-key.positive { background: var(--accent-strong); border-radius: 50%; width: 9px; height: 9px; margin: 0 7px; }
+.timeline-key.inferred { border: 1px dashed var(--warning-text); background: repeating-linear-gradient(135deg, var(--warning) 0 4px, var(--warning-text) 4px 5px); }
+.timeline-key.departure { width: 14px; height: 14px; margin: 0 5px; border: 2px solid var(--text); transform: rotate(45deg); }
+.timeline-key.unknown { background: var(--table-heading); border: 1px solid var(--border); }
+.timeline-key.window { border: 2px dashed var(--link); }
+.timeline-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; scrollbar-color: var(--input-border) var(--panel); }
+.timeline-scroll svg { display: block; width: 100%; min-width: 900px; height: auto; }
+.timeline-unknown { fill: var(--table-heading); stroke: var(--border); stroke-width: 1; }
+.timeline-inference { fill: var(--warning); stroke: var(--warning-text); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.timeline-hatch { stroke: var(--warning-text); stroke-width: 1; }
+.timeline-departure { fill: var(--panel); stroke: var(--text); stroke-width: 2; }
+.timeline-channel { fill: var(--text); font-size: 13px; font-weight: 600; }
+.timeline-axis-label { fill: var(--muted); font-size: 11px; }
+.timeline-window { fill: none; stroke: var(--link); stroke-width: 2; stroke-dasharray: 7 4; }
+.timeline-warning { padding: .6rem .8rem; margin: .75rem 0; color: var(--warning-text); background: var(--warning); border: 1px solid var(--warning-border); border-radius: 5px; font-size: .84rem; }
+.timeline-details { margin-top: .85rem; }
+.timeline-details summary { cursor: pointer; color: var(--link); font-size: .9rem; }
+.timeline-details .table-wrap { margin-top: .65rem; }
+.timeline-details table { min-width: 1100px; }
+.timeline-exact-time { display: block; font-size: .76rem; color: var(--muted); }
 .health-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
 .metric { min-height: 112px; }
 .metric h3 { font-size: .8rem; color: var(--muted); font-weight: 600; margin-bottom: .55rem; }
