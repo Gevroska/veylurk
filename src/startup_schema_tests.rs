@@ -29,7 +29,9 @@ fn raw(conn: &Connection) -> Vec<(i64, i64, String, String, String)> {
         .unwrap()
 }
 
-fn visits(conn: &Connection) -> Vec<(i64, i64, i64, i64, Option<i64>, i64, String)> {
+type RetainedVisit = (i64, i64, i64, i64, Option<i64>, i64, String);
+
+fn visits(conn: &Connection) -> Vec<RetainedVisit> {
     conn.prepare("SELECT id,session_id,first_observation_id,last_observation_id,end_observation_id,positive_observation_count,end_basis FROM history_visits ORDER BY id")
         .unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))
         .unwrap().collect::<rusqlite::Result<_>>().unwrap()
