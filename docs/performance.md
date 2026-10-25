@@ -16,6 +16,8 @@ The fixed mixed-event workload includes repeated observations, departures, retur
 
 Every run checks exact raw/derived/aggregate counts, SQLite integrity, foreign keys, FULL durability and a stable logical fingerprint. The fingerprint compares evidence independently of SQLite file layout, global IDs and nondeterministic housekeeping timestamps. An optimization must preserve these logical results. The elapsed-time guard is checked between operations; it cannot impose a hard deadline on an in-flight durable filesystem flush.
 
+The initial baseline closes each room session separately. The candidate closes the same sessions, cutoffs and reasons in one bounded atomic transaction, matching terminal collector cleanup. Its report identifies this strategy. Compare session-close wall time separately from ingestion and the final checkpoint; matching evidence fingerprints and query digests are required. A failed batch rolls back all its closures, leaving committed observations intact for the existing uncertain restart recovery.
+
 Short real-Twitch runs are measured separately, with an isolated database and the already authorized executable when possible. Report configured channels, actual room states and received records: 50 configured channels do not imply 50 live broadcasts or complete membership. These measurements characterize resource use and API responsiveness; deterministic offline runs provide the before/after comparison.
 
 ## Existing capacity evidence

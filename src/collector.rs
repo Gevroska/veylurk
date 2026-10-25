@@ -1,7 +1,7 @@
 //! Continuous collection with explicit connection sessions and visible failure state.
 use crate::{
     irc::{self, StreamEvent},
-    store::{now, NewObservation, Store},
+    store::{now, NewObservation, SessionEnd, Store},
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -289,18 +289,16 @@ async fn run_endpoint(
         let failed = worker_error.is_some();
         let end_reason = session_end_reason(reason, worker_error);
         let ended_at = transport_end.lock().ok().and_then(|at| at.clone());
-        for (_, id) in sessions {
-            let saved = match &ended_at {
-                Some(at) => {
-                    store
-                        .end_session_at(id, end_reason.clone(), at.clone())
-                        .await
-                }
-                None => store.end_session_uncertain(id, end_reason.clone()).await,
-            };
-            if saved.is_err() {
-                storage_failure = true;
-            }
+        let ends = sessions
+            .into_values()
+            .map(|session_id| SessionEnd {
+                session_id,
+                reason: end_reason.clone(),
+                source_at: ended_at.clone(),
+            })
+            .collect();
+        if store.end_sessions(ends).await.is_err() {
+            storage_failure = true;
         }
         {
             let mut state = status.write().await;

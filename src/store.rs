@@ -31,6 +31,10 @@ pub fn now() -> String {
 #[path = "store_diagnostics_tests.rs"]
 mod diagnostics_tests;
 
+#[cfg(test)]
+#[path = "store_batch_close_tests.rs"]
+mod batch_close_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("SQLite operation failed")]
@@ -117,6 +121,14 @@ pub struct NewObservation {
     pub received_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionEnd {
+    pub session_id: i64,
+    pub reason: String,
+    /// The captured transport boundary, or an uncertain retained-receipt fallback when absent.
+    pub source_at: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StorageStats {
     pub observation_count: i64,
@@ -137,33 +149,31 @@ pub fn normalize(value: &str) -> Result<String, StoreError> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn close_session(
-    conn: &mut Connection,
+fn close_session_in_transaction(
+    conn: &Connection,
     id: i64,
     reason: &str,
     source_at: Option<String>,
     uncertain: bool,
 ) -> Result<(), StoreError> {
-    let tx = conn.transaction()?;
     let at = match source_at {
         Some(at) => at,
         None => {
-            let retained:Option<String>=tx.query_row("SELECT COALESCE((SELECT MAX(received_at_utc) FROM observations WHERE session_id=?1),started_at) FROM sessions WHERE id=?1",[id],|row|row.get(0)).optional()?;
+            let retained:Option<String>=conn.query_row("SELECT COALESCE((SELECT MAX(received_at_utc) FROM observations WHERE session_id=?1),started_at) FROM sessions WHERE id=?1",[id],|row|row.get(0)).optional()?;
             let Some(retained) = retained else {
                 return Ok(());
             };
             retained
         }
     };
-    let changed=tx.execute(
+    let changed=conn.execute(
         "UPDATE sessions SET ended_at=?1,closed_recorded_at=?4,end_reason=?2,end_uncertain=MAX(end_uncertain,?5 OR ?1<started_at OR EXISTS(SELECT 1 FROM history_visits v WHERE v.session_id=sessions.id AND v.end_basis IS NULL AND v.last_observed_at>?1) OR EXISTS(SELECT 1 FROM history_visits v WHERE v.session_id=sessions.id AND v.end_basis='coverage_gap' AND v.closed_at>?1 AND v.last_observed_at>?1)) WHERE id=?3 AND ended_at IS NULL",
         params![at,reason,id,now(),uncertain],
     )?;
     if changed > 0 {
-        tx.execute("UPDATE history_visits SET end_basis='session_end',end_reason=?1,closed_at=?2,out_of_order=MAX(out_of_order,?2<last_observed_at OR ?2<(SELECT started_at FROM sessions WHERE id=?3)) WHERE session_id=?3 AND end_basis IS NULL",params![reason,at,id])?;
-        tx.execute("UPDATE history_visits SET closed_at=?1,out_of_order=MAX(out_of_order,?1<last_observed_at OR ?1<(SELECT started_at FROM sessions WHERE id=?2)) WHERE session_id=?2 AND end_basis='coverage_gap' AND closed_at>?1",params![at,id])?;
+        conn.execute("UPDATE history_visits SET end_basis='session_end',end_reason=?1,closed_at=?2,out_of_order=MAX(out_of_order,?2<last_observed_at OR ?2<(SELECT started_at FROM sessions WHERE id=?3)) WHERE session_id=?3 AND end_basis IS NULL",params![reason,at,id])?;
+        conn.execute("UPDATE history_visits SET closed_at=?1,out_of_order=MAX(out_of_order,?1<last_observed_at OR ?1<(SELECT started_at FROM sessions WHERE id=?2)) WHERE session_id=?2 AND end_basis='coverage_gap' AND closed_at>?1",params![at,id])?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -523,19 +533,58 @@ impl Store {
         reason: String,
         at: String,
     ) -> Result<(), StoreError> {
-        let at = crate::history::utc(&at)
-            .inspect_err(|error| self.record_failure(Operation::SessionEnd, error))?;
-        self.call_write(Operation::SessionEnd, move |conn| {
-            close_session(conn, id, &reason, Some(at), false)
-        })
+        self.end_sessions(vec![SessionEnd {
+            session_id: id,
+            reason,
+            source_at: Some(at),
+        }])
         .await
     }
 
     /// Fallback only when a failed transport cannot provide its terminal receipt clock.
     /// The last retained receipt (or start for an empty session) is an uncertain cutoff.
     pub async fn end_session_uncertain(&self, id: i64, reason: String) -> Result<(), StoreError> {
+        self.end_sessions(vec![SessionEnd {
+            session_id: id,
+            reason,
+            source_at: None,
+        }])
+        .await
+    }
+
+    /// Atomically closes at most 50 room sessions with one durable commit. Each transport cutoff
+    /// is validated before the job is queued; a missing cutoff is resolved separately per session.
+    /// Missing or already-closed sessions are harmless; the first close of a repeated ID wins.
+    pub async fn end_sessions(&self, mut sessions: Vec<SessionEnd>) -> Result<(), StoreError> {
+        if sessions.len() > 50 {
+            self.record_failure(Operation::SessionEnd, &StoreError::Invalid);
+            return Err(StoreError::Invalid);
+        }
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        for end in &mut sessions {
+            end.source_at = end
+                .source_at
+                .as_deref()
+                .map(crate::history::utc)
+                .transpose()
+                .inspect_err(|error| self.record_failure(Operation::SessionEnd, error))?;
+        }
         self.call_write(Operation::SessionEnd, move |conn| {
-            close_session(conn, id, &reason, None, true)
+            let tx = conn.transaction()?;
+            for end in sessions {
+                let uncertain = end.source_at.is_none();
+                close_session_in_transaction(
+                    &tx,
+                    end.session_id,
+                    &end.reason,
+                    end.source_at,
+                    uncertain,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
         })
         .await
     }

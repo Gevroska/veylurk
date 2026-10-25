@@ -2,7 +2,7 @@
 use crate::{
     diagnostics::Operation,
     history::{TimeRange, VisitQuery},
-    store::{NewObservation, Store, StoreError},
+    store::{NewObservation, SessionEnd, Store, StoreError},
     timeline::TimelineQuery,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -56,6 +56,7 @@ impl BenchmarkConfig {
 #[derive(Debug, Serialize)]
 pub struct BenchmarkReport {
     pub schema_version: u32,
+    pub session_close_strategy: &'static str,
     pub success: bool,
     pub provenance: Value,
     pub config: BenchmarkConfig,
@@ -866,13 +867,20 @@ pub async fn run(output: &Path, config: BenchmarkConfig) -> Result<BenchmarkRepo
     let ingest_process_after = process_snapshot();
     budget(started, config.max_seconds)?;
     let closing = Instant::now();
-    for session in sessions {
-        budget(started, config.max_seconds)?;
-        store
-            .end_session_at(session, "synthetic_fixture_end".into(), end.clone())
-            .await?;
-        peaks.sample(&path);
-    }
+    budget(started, config.max_seconds)?;
+    store
+        .end_sessions(
+            sessions
+                .into_iter()
+                .map(|session_id| SessionEnd {
+                    session_id,
+                    reason: "synthetic_fixture_end".into(),
+                    source_at: Some(end.clone()),
+                })
+                .collect(),
+        )
+        .await?;
+    peaks.sample(&path);
     let session_close_ms = millis(closing.elapsed());
     let query_process_before = process_snapshot();
     let querying = Instant::now();
@@ -916,6 +924,7 @@ pub async fn run(output: &Path, config: BenchmarkConfig) -> Result<BenchmarkRepo
         && queries.iter().all(|q| q["success"] == true);
     Ok(BenchmarkReport {
         schema_version: 1,
+        session_close_strategy: "one_atomic_durable_transaction",
         success,
         config,
         provenance: json!({"workload":"offline_synthetic_irc_receipts_v1","network_used":false,"twitch_credentials_used":false,"existing_database_used":false,"live_twitch_throughput_claim":false,"timestamp_base":BASE,"fixture_cycle":"JOIN hot; NAMES hot repeat; JOIN distinct cold; PART hot; ambiguous NAMES hot; JOIN hot confirmation; PART hot; PART cold; JOIN hot return; backwards NAMES hot; JOIN hot confirmation; PART hot","scope":"Store ingestion and query measurements; excludes transport, HTTP, browser, and collection reliability","time_budget":"checked between operations; in-flight durable filesystem operations may finish after the budget"}),
