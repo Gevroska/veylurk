@@ -2,7 +2,9 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
 
@@ -33,6 +35,8 @@ pub enum IrcError {
     Timeout,
     #[error("observation delivery stalled; some received evidence may be missing")]
     Backpressure,
+    #[error("collection stopped before received evidence was delivered; some received evidence may be missing")]
+    CancelledEvidence,
 }
 
 fn login(value: &str) -> Option<String> {
@@ -439,14 +443,171 @@ pub enum StreamEvent {
     RoomUnavailable(String),
 }
 
-async fn deliver(
-    events: &tokio::sync::mpsc::Sender<StreamEvent>,
+pub(crate) const RECEIVE_BUFFER_UNITS: usize = 32_768;
+const MAX_RECEIPT_CHUNK: usize = 256;
+
+/// A receipt stays charged while queued, pending, or in a storage transaction.
+/// The collector releases its permit only after the corresponding commit.
+#[derive(Debug)]
+pub(crate) struct QueuedEvent {
     event: StreamEvent,
-) -> Result<(), IrcError> {
-    timeout(Duration::from_secs(5), events.send(event))
-        .await
-        .map_err(|_| IrcError::Backpressure)?
-        .map_err(|_| IrcError::Transport)
+    permit: OwnedSemaphorePermit,
+    received_at: String,
+}
+
+impl QueuedEvent {
+    pub(crate) fn received_at(&self) -> &str {
+        &self.received_at
+    }
+
+    pub(crate) fn into_parts(self) -> (StreamEvent, OwnedSemaphorePermit) {
+        (self.event, self.permit)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ReceiptSender {
+    events: mpsc::Sender<QueuedEvent>,
+    budget: Arc<Semaphore>,
+    end_time: Arc<Mutex<Option<String>>>,
+}
+
+impl ReceiptSender {
+    /// Metrics may retain this handle without keeping the event channel open.
+    pub(crate) fn budget_handle(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.budget)
+    }
+
+    /// The terminal cutoff excludes admission waits and PART/Close cleanup.
+    /// Retaining this clock does not keep the event channel open.
+    pub(crate) fn end_time_handle(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.end_time)
+    }
+
+    fn record_end_at(&self, received_at: &str) {
+        let mut cutoff = self
+            .end_time
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // All transport timestamps use the same UTC RFC 3339 representation.
+        if cutoff.as_ref().is_none_or(|at| received_at < at.as_str()) {
+            *cutoff = Some(received_at.to_owned());
+        }
+    }
+}
+
+pub(crate) fn receipt_queue() -> (ReceiptSender, mpsc::Receiver<QueuedEvent>) {
+    let (events, receiver) = mpsc::channel(RECEIVE_BUFFER_UNITS);
+    (
+        ReceiptSender {
+            events,
+            budget: Arc::new(Semaphore::new(RECEIVE_BUFFER_UNITS)),
+            end_time: Arc::new(Mutex::new(None)),
+        },
+        receiver,
+    )
+}
+
+enum EventSink {
+    Legacy(mpsc::Sender<StreamEvent>),
+    Buffered(ReceiptSender),
+}
+
+impl EventSink {
+    fn record_end_at(&self, received_at: &str) {
+        if let Self::Buffered(sender) = self {
+            sender.record_end_at(received_at);
+        }
+    }
+
+    /// `false` means clean cancellation with no received evidence discarded.
+    /// Admission and sending share one deadline, including both queue bounds.
+    async fn deliver(
+        &self,
+        event: StreamEvent,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<bool, IrcError> {
+        let received_at = match &event {
+            StreamEvent::Observations(rows) if !rows.is_empty() => rows[0].received_at.clone(),
+            _ => crate::store::now(),
+        };
+        self.deliver_at(event, &received_at, stop).await
+    }
+
+    async fn deliver_at(
+        &self,
+        event: StreamEvent,
+        received_at: &str,
+        stop: &mut watch::Receiver<bool>,
+    ) -> Result<bool, IrcError> {
+        let received_at = match &event {
+            StreamEvent::Observations(rows) if !rows.is_empty() => rows[0].received_at.as_str(),
+            _ => received_at,
+        }
+        .to_owned();
+        // RoomReady precedes its already-parsed names_end row; cancelling it
+        // would discard that row too. Gap controls must not disappear cleanly.
+        let evidence_at_risk = match &event {
+            StreamEvent::Observations(rows) => !rows.is_empty(),
+            StreamEvent::RoomLeft(_)
+            | StreamEvent::RoomUnavailable(_)
+            | StreamEvent::RoomReady(_) => true,
+            _ => false,
+        };
+        let delivery = async {
+            match self {
+                Self::Legacy(events) => events.send(event).await.map_err(|_| IrcError::Transport),
+                Self::Buffered(sender) => {
+                    let weight = match &event {
+                        StreamEvent::Observations(rows) => {
+                            if rows.len() > MAX_RECEIPT_CHUNK {
+                                return Err(IrcError::Limit);
+                            }
+                            rows.len().max(1)
+                        }
+                        _ => 1,
+                    };
+                    let permit = Arc::clone(&sender.budget)
+                        .acquire_many_owned(weight as u32)
+                        .await
+                        .map_err(|_| IrcError::Transport)?;
+                    sender
+                        .events
+                        .send(QueuedEvent {
+                            event,
+                            permit,
+                            received_at: received_at.clone(),
+                        })
+                        .await
+                        .map_err(|_| IrcError::Transport)
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_stop(stop) => {
+                if evidence_at_risk { Err(IrcError::CancelledEvidence) } else { Ok(false) }
+            },
+            result = timeout_at(Instant::now() + Duration::from_secs(5), delivery) => {
+                result.unwrap_or(Err(IrcError::Backpressure)).map(|()| true)
+            }
+        };
+        if !matches!(result, Ok(true)) {
+            self.record_end_at(&received_at);
+        }
+        result
+    }
+}
+
+async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow_and_update() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// One connection, at most fifty rooms, paced joins and bounded delivery backpressure.
@@ -476,7 +637,7 @@ async fn stream_configured(
 ) -> Result<(), IrcError> {
     stream_managed(
         channels,
-        events,
+        EventSink::Legacy(events),
         stop,
         endpoint,
         room_timeout,
@@ -488,21 +649,40 @@ async fn stream_configured(
 }
 
 pub(crate) async fn stream_dynamic_endpoint(
-    mut channels: tokio::sync::watch::Receiver<Vec<String>>,
-    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    channels: tokio::sync::watch::Receiver<Vec<String>>,
+    events: ReceiptSender,
     stop: tokio::sync::watch::Receiver<bool>,
     endpoint: &str,
 ) -> Result<(), IrcError> {
-    let initial = channels.borrow_and_update().clone();
-    stream_managed(
-        initial,
+    stream_dynamic_configured(
+        channels,
         events,
         stop,
         endpoint,
         Duration::from_secs(30),
+        Duration::from_secs(6),
+    )
+    .await
+}
+
+pub(crate) async fn stream_dynamic_configured(
+    mut channels: tokio::sync::watch::Receiver<Vec<String>>,
+    events: ReceiptSender,
+    stop: tokio::sync::watch::Receiver<bool>,
+    endpoint: &str,
+    room_timeout: Duration,
+    join_interval: Duration,
+) -> Result<(), IrcError> {
+    let initial = channels.borrow_and_update().clone();
+    stream_managed(
+        initial,
+        EventSink::Buffered(events),
+        stop,
+        endpoint,
+        room_timeout,
         Some(channels),
         Duration::from_secs(60),
-        Duration::from_secs(6),
+        join_interval,
     )
     .await
 }
@@ -510,7 +690,7 @@ pub(crate) async fn stream_dynamic_endpoint(
 #[allow(clippy::too_many_arguments)]
 async fn stream_managed(
     channels: Vec<String>,
-    events: tokio::sync::mpsc::Sender<StreamEvent>,
+    events: EventSink,
     mut stop: tokio::sync::watch::Receiver<bool>,
     endpoint: &str,
     room_timeout: Duration,
@@ -534,15 +714,44 @@ async fn stream_managed(
         .max_write_buffer_size(16 * 1024)
         .max_message_size(Some(MAX_BUFFER))
         .max_frame_size(Some(MAX_BUFFER));
+    if *stop.borrow() {
+        events.record_end_at(&crate::store::now());
+        return Ok(());
+    }
     let connected = tokio::select! {
-        _=stop.changed()=>return Ok(()),
+        _=wait_for_stop(&mut stop)=>{
+            events.record_end_at(&crate::store::now());
+            return Ok(());
+        },
         result=timeout(Duration::from_secs(10),tokio_tungstenite::connect_async_with_config(endpoint,Some(config),false))=>result,
     };
-    let (mut socket, _) = connected
-        .map_err(|_| IrcError::Timeout)?
-        .map_err(|_| IrcError::Connect)?;
+    let (mut socket, _) = match connected {
+        Ok(Ok(connection)) => connection,
+        result => {
+            events.record_end_at(&crate::store::now());
+            return Err(if result.is_err() {
+                IrcError::Timeout
+            } else {
+                IrcError::Connect
+            });
+        }
+    };
     let mut joined = Vec::<String>::new();
     let result=async {
+        macro_rules! deliver {
+            ($event:expr) => {
+                if !events.deliver($event, &mut stop).await? {
+                    return Ok(());
+                }
+            };
+        }
+        macro_rules! deliver_at {
+            ($event:expr, $received_at:expr) => {
+                if !events.deliver_at($event, $received_at, &mut stop).await? {
+                    return Ok(());
+                }
+            };
+        }
         for command in ["CAP REQ :twitch.tv/membership\r\n".to_owned(),"PASS SCHMOOPIIE\r\n".to_owned(),format!("NICK {guest}\r\n")] {
             timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
         }
@@ -566,6 +775,7 @@ async fn stream_managed(
                     let next=changes.as_mut().expect("configuration receiver").borrow_and_update().clone();
                     desired=if next.is_empty() {Vec::new()} else {normalize_channels_with_limit(&next,50)?};
                     let removed=joined.iter().filter(|channel|!desired.contains(channel)).cloned().collect::<Vec<_>>();
+                    let decision_at=crate::store::now();
                     if !removed.is_empty() {
                         let command=format!("PART {}\r\n",removed.iter().map(|channel|format!("#{channel}")).collect::<Vec<_>>().join(","));
                         timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
@@ -573,7 +783,7 @@ async fn stream_managed(
                     for channel in removed {
                         joined.retain(|current|current!=&channel);
                         names_deadlines.remove(&channel);ready.remove(&channel);state.rooms.remove(&channel);
-                        deliver(&events,StreamEvent::RoomLeft(channel)).await?;
+                        deliver_at!(StreamEvent::RoomLeft(channel), &decision_at);
                     }
                     retry_at.retain(|channel,_|desired.contains(channel));
                     attempts.retain(|channel,_|desired.contains(channel));
@@ -582,13 +792,14 @@ async fn stream_managed(
                 }
                 _=heartbeat.tick()=> {
                     let now=Instant::now();
+                    let decision_at=crate::store::now();
                     if !registered && now>=registration_deadline { return Err(IrcError::Timeout); }
                     if now.duration_since(last_received)>Duration::from_secs(360) { return Err(IrcError::Timeout); }
                     let unavailable=names_deadlines.iter().filter(|(_,deadline)|now>=**deadline).map(|(channel,_)|channel.clone()).collect::<Vec<_>>();
                     for channel in unavailable {
                         names_deadlines.remove(&channel);
                         ready.remove(&channel);
-                        deliver(&events,StreamEvent::RoomUnavailable(channel.clone())).await?;
+                        deliver_at!(StreamEvent::RoomUnavailable(channel.clone()), &decision_at);
                         if changes.is_some() {
                             let command=format!("PART #{channel}\r\n");
                             timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
@@ -603,7 +814,8 @@ async fn stream_managed(
                         let batch=desired.iter().filter(|channel|!joined.contains(channel)&&retry_at.get(*channel).is_none_or(|at|now>=*at)).take(10).cloned().collect::<Vec<_>>();
                         if batch.is_empty() {continue;}
                         let command=format!("JOIN {}\r\n",batch.iter().map(|c|format!("#{c}")).collect::<Vec<_>>().join(","));
-                        if changes.is_some() {for channel in &batch {deliver(&events,StreamEvent::RoomJoining(channel.clone())).await?;}}
+                        let attempted_at=crate::store::now();
+                        if changes.is_some() {for channel in &batch {deliver_at!(StreamEvent::RoomJoining(channel.clone()), &attempted_at);}}
                         timeout(Duration::from_secs(5),socket.send(Message::text(command))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
                         for channel in batch { names_deadlines.insert(channel.clone(),Instant::now()+room_timeout); joined.push(channel); }
                         next_join=Instant::now()+join_interval;
@@ -635,7 +847,7 @@ async fn stream_managed(
                                     if !joined.contains(&channel) {return Err(IrcError::Protocol);}
                                     names_deadlines.remove(&channel);
                                     ready.remove(&channel);
-                                    deliver(&events,StreamEvent::RoomUnavailable(channel.clone())).await?;
+                                    deliver_at!(StreamEvent::RoomUnavailable(channel.clone()), &received_at);
                                     if changes.is_some() {
                                         if !own_part {
                                             timeout(Duration::from_secs(5),socket.send(Message::text(format!("PART #{channel}\r\n")))).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?;
@@ -653,7 +865,7 @@ async fn stream_managed(
                                 if state.ready_to_join() {
                                     let _=state.start_join()?;
                                     registered=true;
-                                    deliver(&events,StreamEvent::Connected).await?;
+                                    deliver_at!(StreamEvent::Connected, &received_at);
                                 }
                                 let message=parse(&line)?;
                                 let mut observed=Vec::new();
@@ -662,10 +874,18 @@ async fn stream_managed(
                                     "353"=> {
                                         let channel=login(message.params[2].trim_start_matches('#')).ok_or(IrcError::Protocol)?;
                                         if !joined.contains(&channel) { return Err(IrcError::Protocol); }
+                                        observed=Vec::with_capacity(MAX_RECEIPT_CHUNK);
+                                        let mut observed_count=0;
                                         for raw in message.params[3].split_whitespace() {
                                             let account=login(raw.trim_start_matches(['@','+'])).ok_or(IrcError::Protocol)?;
-                                            if account!=guest { observed.push(crate::store::NewObservation{channel:channel.clone(),account:Some(account),kind:"names".into(),received_at:stamp.clone()}); }
-                                            if observed.len()>MAX_ACCOUNTS { return Err(IrcError::Limit); }
+                                            if account!=guest {
+                                                observed_count+=1;
+                                                if observed_count>MAX_ACCOUNTS { return Err(IrcError::Limit); }
+                                                observed.push(crate::store::NewObservation{channel:channel.clone(),account:Some(account),kind:"names".into(),received_at:stamp.clone()});
+                                                if observed.len()==MAX_RECEIPT_CHUNK {
+                                                    deliver!(StreamEvent::Observations(std::mem::replace(&mut observed,Vec::with_capacity(MAX_RECEIPT_CHUNK))));
+                                                }
+                                            }
                                         }
                                     }
                                     "366"=> {
@@ -673,20 +893,20 @@ async fn stream_managed(
                                         if !joined.contains(&channel) { return Err(IrcError::Protocol); }
                                         names_deadlines.remove(&channel);
                                         retry_at.remove(&channel);attempts.remove(&channel);
-                                        observed.push(crate::store::NewObservation{channel:channel.clone(),account:None,kind:"names_end".into(),received_at:stamp});
-                                        if ready.insert(channel.clone()) { deliver(&events,StreamEvent::RoomReady(channel)).await?; }
+                                        observed=vec![crate::store::NewObservation{channel:channel.clone(),account:None,kind:"names_end".into(),received_at:stamp}];
+                                        if ready.insert(channel.clone()) { deliver_at!(StreamEvent::RoomReady(channel), &received_at); }
                                     }
                                     "JOIN"|"PART"=> {
                                         let channel=login(message.params[0].trim_start_matches('#')).ok_or(IrcError::Protocol)?;
                                         if !joined.contains(&channel) { return Err(IrcError::Protocol); }
                                         let account=user(message.prefix)?;
-                                        if account!=guest { observed.push(crate::store::NewObservation{channel,account:Some(account),kind:message.command.to_ascii_lowercase(),received_at:stamp}); }
+                                        if account!=guest { observed=vec![crate::store::NewObservation{channel,account:Some(account),kind:message.command.to_ascii_lowercase(),received_at:stamp}]; }
                                     }
                                     _=>{}
                                 }
                                 // The continuous path retains received evidence, not a guessed roster.
                                 for room in state.rooms.values_mut() { room.accounts.clear(); room.departed.clear(); room.joins=0; room.parts=0; }
-                                if !observed.is_empty() { deliver(&events,StreamEvent::Observations(observed)).await?; }
+                                if !observed.is_empty() { deliver!(StreamEvent::Observations(observed)); }
                             }
                         }
                         Message::Ping(_)=> { timeout(Duration::from_secs(5),socket.flush()).await.map_err(|_|IrcError::Timeout)?.map_err(|_|IrcError::Transport)?; }
@@ -697,6 +917,9 @@ async fn stream_managed(
             }
         }
     }.await;
+    // Capture the evidence cutoff before potentially slow PART/Close cleanup.
+    // Failed admission or cancellation may already have recorded an earlier receipt.
+    events.record_end_at(&crate::store::now());
     if !joined.is_empty() {
         let part = format!(
             "PART {}\r\n",
@@ -871,6 +1094,412 @@ async fn observe_endpoint(
 mod tests {
     use super::*;
 
+    fn receipt_rows(start: usize, count: usize) -> Vec<crate::store::NewObservation> {
+        (start..start + count)
+            .map(|index| crate::store::NewObservation {
+                channel: "test".into(),
+                account: Some(format!("account{index}")),
+                kind: "join".into(),
+                received_at: "2026-10-25T00:00:00.000Z".into(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn receipt_fifo_and_weights_follow_inflight_ownership_without_retaining_sender() {
+        let (sender, mut receiver) = receipt_queue();
+        let budget = sender.budget_handle();
+        let _end_time = sender.end_time_handle();
+        let sink = EventSink::Buffered(sender);
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        for event in [
+            StreamEvent::Observations(receipt_rows(0, MAX_RECEIPT_CHUNK)),
+            StreamEvent::RoomReady("test".into()),
+            StreamEvent::Observations(receipt_rows(MAX_RECEIPT_CHUNK, 1)),
+        ] {
+            assert!(sink.deliver(event, &mut stop_rx).await.unwrap());
+        }
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS - 258);
+        let first = receiver.recv().await.unwrap();
+        assert_eq!(first.received_at(), "2026-10-25T00:00:00.000Z");
+        let (first, committed_later) = first.into_parts();
+        assert!(matches!(first, StreamEvent::Observations(rows) if rows.len() == 256));
+        assert_eq!(committed_later.num_permits(), 256);
+        // Retaining a metrics handle must not retain an mpsc Sender.
+        drop(sink);
+        let (second, control_permit) = receiver.recv().await.unwrap().into_parts();
+        assert!(matches!(second, StreamEvent::RoomReady(channel) if channel == "test"));
+        assert_eq!(control_permit.num_permits(), 1);
+        drop(control_permit);
+        let (third, final_permit) = receiver.recv().await.unwrap().into_parts();
+        assert!(
+            matches!(third, StreamEvent::Observations(rows) if rows[0].account.as_deref() == Some("account256"))
+        );
+        drop(final_permit);
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS - 256);
+        drop(committed_later);
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_full_weight_budget_reports_gap_after_five_seconds_and_recovers() {
+        let (sender, receiver) = receipt_queue();
+        let budget = sender.budget_handle();
+        let end_time = sender.end_time_handle();
+        let sink = EventSink::Buffered(sender);
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        for _ in 0..RECEIVE_BUFFER_UNITS / MAX_RECEIPT_CHUNK - 1 {
+            assert!(sink
+                .deliver(
+                    StreamEvent::Observations(receipt_rows(0, MAX_RECEIPT_CHUNK)),
+                    &mut stop_rx,
+                )
+                .await
+                .unwrap());
+        }
+        assert!(sink
+            .deliver(
+                StreamEvent::Observations(receipt_rows(0, MAX_RECEIPT_CHUNK - 1)),
+                &mut stop_rx,
+            )
+            .await
+            .unwrap());
+        assert!(sink
+            .deliver(StreamEvent::RoomReady("test".into()), &mut stop_rx)
+            .await
+            .unwrap());
+        assert_eq!(budget.available_permits(), 0);
+        let started = Instant::now();
+        assert_eq!(
+            sink.deliver_at(
+                StreamEvent::Connected,
+                "2026-10-25T01:00:00.000Z",
+                &mut stop_rx,
+            )
+            .await,
+            Err(IrcError::Backpressure)
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        // Cleanup and later failures cannot move the first missing receipt forward.
+        sink.record_end_at("2026-10-25T01:00:09.000Z");
+        assert_eq!(
+            end_time.lock().unwrap().as_deref(),
+            Some("2026-10-25T01:00:00.000Z")
+        );
+        drop(receiver);
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_admission_and_channel_send_share_one_deadline() {
+        // Smaller independent bounds exercise a send blocked after admission.
+        let (events, receiver) = mpsc::channel(1);
+        let budget = Arc::new(Semaphore::new(3));
+        let sink = EventSink::Buffered(ReceiptSender {
+            events,
+            budget: Arc::clone(&budget),
+            end_time: Arc::new(Mutex::new(None)),
+        });
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        assert!(sink
+            .deliver(StreamEvent::Connected, &mut stop_rx)
+            .await
+            .unwrap());
+        let inflight = Arc::clone(&budget).acquire_many_owned(2).await.unwrap();
+        let started = Instant::now();
+        let sending = tokio::spawn(async move {
+            sink.deliver(StreamEvent::Observations(receipt_rows(0, 2)), &mut stop_rx)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(!sending.is_finished());
+        drop(inflight);
+        tokio::task::yield_now().await;
+        assert_eq!(budget.available_permits(), 0);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(sending.await.unwrap(), Err(IrcError::Backpressure));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(budget.available_permits(), 2);
+        drop(receiver);
+        assert_eq!(budget.available_permits(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_cancellation_interrupts_admission_and_send_without_leaking_permits() {
+        for blocked_in_send in [false, true] {
+            let (events, receiver) = mpsc::channel(1);
+            let budget = Arc::new(Semaphore::new(3));
+            let end_time = Arc::new(Mutex::new(None));
+            let sink = EventSink::Buffered(ReceiptSender {
+                events,
+                budget: Arc::clone(&budget),
+                end_time: Arc::clone(&end_time),
+            });
+            let (stop_tx, mut stop_rx) = watch::channel(false);
+            assert!(sink
+                .deliver(StreamEvent::Connected, &mut stop_rx)
+                .await
+                .unwrap());
+            let inflight = if blocked_in_send {
+                None
+            } else {
+                Some(Arc::clone(&budget).acquire_many_owned(2).await.unwrap())
+            };
+            let sending = tokio::spawn(async move {
+                sink.deliver(StreamEvent::Observations(receipt_rows(0, 2)), &mut stop_rx)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(!sending.is_finished());
+            assert_eq!(budget.available_permits(), 0);
+            stop_tx.send(true).unwrap();
+            assert_eq!(
+                timeout(Duration::from_millis(1), sending)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(IrcError::CancelledEvidence)
+            );
+            assert_eq!(
+                end_time.lock().unwrap().as_deref(),
+                Some("2026-10-25T00:00:00.000Z")
+            );
+            drop(inflight);
+            assert_eq!(budget.available_permits(), 2);
+            drop(receiver);
+            assert_eq!(budget.available_permits(), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_timestamps_precede_admission_waits_for_observations_and_gap_controls() {
+        let (sender, mut receiver) = receipt_queue();
+        let budget = sender.budget_handle();
+        for (event, supplied_at, expected_at) in [
+            (
+                StreamEvent::Observations(receipt_rows(0, 1)),
+                "2026-10-25T02:00:09.000Z",
+                "2026-10-25T00:00:00.000Z",
+            ),
+            (
+                StreamEvent::RoomUnavailable("test".into()),
+                "2026-10-25T02:00:00.000Z",
+                "2026-10-25T02:00:00.000Z",
+            ),
+        ] {
+            let inflight = Arc::clone(&budget)
+                .acquire_many_owned(RECEIVE_BUFFER_UNITS as u32)
+                .await
+                .unwrap();
+            let (_stop_tx, mut stop_rx) = watch::channel(false);
+            let sink = EventSink::Buffered(sender.clone());
+            let sending =
+                tokio::spawn(
+                    async move { sink.deliver_at(event, supplied_at, &mut stop_rx).await },
+                );
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(3)).await;
+            assert!(!sending.is_finished());
+            drop(inflight);
+            assert!(sending.await.unwrap().unwrap());
+            let queued = receiver.recv().await.unwrap();
+            assert_eq!(queued.received_at(), expected_at);
+            drop(queued);
+        }
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS);
+    }
+
+    #[tokio::test]
+    async fn receipt_cancelled_controls_preserve_known_gap_cutoff_and_loss_reason() {
+        for (event, expected) in [
+            (StreamEvent::RoomJoining("test".into()), Ok(false)),
+            (
+                StreamEvent::RoomLeft("test".into()),
+                Err(IrcError::CancelledEvidence),
+            ),
+            (
+                StreamEvent::RoomUnavailable("test".into()),
+                Err(IrcError::CancelledEvidence),
+            ),
+            (
+                StreamEvent::RoomReady("test".into()),
+                Err(IrcError::CancelledEvidence),
+            ),
+        ] {
+            let (sender, _receiver) = receipt_queue();
+            let end_time = sender.end_time_handle();
+            let sink = EventSink::Buffered(sender);
+            let (_stop_tx, mut stop_rx) = watch::channel(true);
+            assert_eq!(
+                sink.deliver_at(event, "2026-10-25T03:00:00.000Z", &mut stop_rx)
+                    .await,
+                expected
+            );
+            assert_eq!(
+                end_time.lock().unwrap().as_deref(),
+                Some("2026-10-25T03:00:00.000Z")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_closed_receiver_and_oversize_chunk_release_budget() {
+        let (sender, receiver) = receipt_queue();
+        let budget = sender.budget_handle();
+        let sink = EventSink::Buffered(sender);
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        assert_eq!(
+            sink.deliver(
+                StreamEvent::Observations(receipt_rows(0, MAX_RECEIPT_CHUNK + 1)),
+                &mut stop_rx,
+            )
+            .await,
+            Err(IrcError::Limit)
+        );
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS);
+        drop(receiver);
+        assert_eq!(
+            sink.deliver(StreamEvent::Connected, &mut stop_rx).await,
+            Err(IrcError::Transport)
+        );
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS);
+    }
+
+    #[tokio::test]
+    async fn buffered_transport_chunks_names_in_order_and_answers_pings_without_a_consumer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (_channels_tx, channels_rx) = watch::channel(vec!["test".into()]);
+        let (sender, mut receiver) = receipt_queue();
+        let budget = sender.budget_handle();
+        let end_time = sender.end_time_handle();
+        let server_end_time = Arc::clone(&end_time);
+        let names_count = MAX_RECEIPT_CHUNK * 2 + 13;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("CAP REQ :twitch.tv/membership\r\n")
+            );
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PASS SCHMOOPIIE\r\n")
+            );
+            let nick = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let guest = nick.strip_prefix("NICK ").unwrap().trim().to_owned();
+            socket.send(Message::text(format!(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 {guest} :Welcome\r\n"))).await.unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("JOIN #test\r\n")
+            );
+            let names = (0..names_count)
+                .map(|index| format!("account{index}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            socket.send(Message::text(format!(":tmi.twitch.tv 353 {guest} = #test :{guest} {names}\r\n:tmi.twitch.tv 366 {guest} #test :End\r\n:alice!alice@alice.tmi.twitch.tv JOIN #test\r\n"))).await.unwrap();
+            socket
+                .send(Message::Ping(vec![1, 2, 3].into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::text("PING :buffered\r\n"))
+                .await
+                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(1), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                Message::Pong(vec![1, 2, 3].into())
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(1), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                Message::text("PONG :buffered\r\n")
+            );
+            stop_tx.send(true).unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("PART #test\r\n")
+            );
+            assert!(server_end_time.lock().unwrap().is_some());
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+        });
+        timeout(
+            Duration::from_secs(5),
+            stream_dynamic_configured(
+                channels_rx,
+                sender,
+                stop_rx,
+                &endpoint,
+                Duration::from_secs(2),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        // No receipt has been consumed before both PING responses and cleanup.
+        assert_eq!(
+            budget.available_permits(),
+            RECEIVE_BUFFER_UNITS - names_count - 5
+        );
+        let mut order = Vec::new();
+        let mut accounts = Vec::new();
+        while let Some(queued) = receiver.recv().await {
+            let received_at = queued.received_at().to_owned();
+            let (event, permit) = queued.into_parts();
+            match event {
+                StreamEvent::Connected => order.push(("connected".to_owned(), 1)),
+                StreamEvent::RoomJoining(_) => order.push(("joining".to_owned(), 1)),
+                StreamEvent::RoomReady(_) => order.push(("ready".to_owned(), 1)),
+                StreamEvent::Observations(rows) => {
+                    assert_eq!(permit.num_permits(), rows.len());
+                    assert!(rows.len() <= MAX_RECEIPT_CHUNK);
+                    assert!(rows.iter().all(|row| row.received_at == received_at));
+                    order.push((rows[0].kind.clone(), rows.len()));
+                    accounts.extend(rows.into_iter().filter_map(|row| row.account));
+                }
+                unexpected => panic!("unexpected event: {unexpected:?}"),
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                ("connected", 1),
+                ("joining", 1),
+                ("names", 256),
+                ("names", 256),
+                ("names", 13),
+                ("ready", 1),
+                ("names_end", 1),
+                ("join", 1)
+            ]
+            .into_iter()
+            .map(|(kind, count)| (kind.to_owned(), count))
+            .collect::<Vec<_>>()
+        );
+        let mut expected = (0..names_count)
+            .map(|index| format!("account{index}"))
+            .collect::<Vec<_>>();
+        expected.push("alice".into());
+        assert_eq!(accounts, expected);
+        assert_eq!(budget.available_permits(), RECEIVE_BUFFER_UNITS);
+        assert!(end_time.lock().unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn dynamic_room_retry_and_configuration_keep_healthy_room_connected() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -961,7 +1590,7 @@ mod tests {
             Duration::from_secs(8),
             stream_managed(
                 vec!["healthy".into(), "missing".into()],
-                sender,
+                EventSink::Legacy(sender),
                 stop_rx,
                 &endpoint,
                 Duration::from_secs(2),
@@ -981,8 +1610,11 @@ mod tests {
     async fn continuous_delivery_stall_is_bounded_and_explicit() {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         sender.send(StreamEvent::Connected).await.unwrap();
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
         assert_eq!(
-            deliver(&sender, StreamEvent::Connected).await,
+            EventSink::Legacy(sender)
+                .deliver(StreamEvent::Connected, &mut stop_rx)
+                .await,
             Err(IrcError::Backpressure)
         );
     }

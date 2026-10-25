@@ -122,6 +122,36 @@ pub fn normalize(value: &str) -> Result<String, StoreError> {
     Ok(value.to_ascii_lowercase())
 }
 
+fn close_session(
+    conn: &mut Connection,
+    id: i64,
+    reason: &str,
+    source_at: Option<String>,
+    uncertain: bool,
+) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    let at = match source_at {
+        Some(at) => at,
+        None => {
+            let retained:Option<String>=tx.query_row("SELECT COALESCE((SELECT MAX(received_at_utc) FROM observations WHERE session_id=?1),started_at) FROM sessions WHERE id=?1",[id],|row|row.get(0)).optional()?;
+            let Some(retained) = retained else {
+                return Ok(());
+            };
+            retained
+        }
+    };
+    let changed=tx.execute(
+        "UPDATE sessions SET ended_at=?1,closed_recorded_at=?4,end_reason=?2,end_uncertain=MAX(end_uncertain,?5 OR ?1<started_at OR EXISTS(SELECT 1 FROM history_visits v WHERE v.session_id=sessions.id AND v.end_basis IS NULL AND v.last_observed_at>?1) OR EXISTS(SELECT 1 FROM history_visits v WHERE v.session_id=sessions.id AND v.end_basis='coverage_gap' AND v.closed_at>?1 AND v.last_observed_at>?1)) WHERE id=?3 AND ended_at IS NULL",
+        params![at,reason,id,now(),uncertain],
+    )?;
+    if changed > 0 {
+        tx.execute("UPDATE history_visits SET end_basis='session_end',end_reason=?1,closed_at=?2,out_of_order=MAX(out_of_order,?2<last_observed_at OR ?2<(SELECT started_at FROM sessions WHERE id=?3)) WHERE session_id=?3 AND end_basis IS NULL",params![reason,at,id])?;
+        tx.execute("UPDATE history_visits SET closed_at=?1,out_of_order=MAX(out_of_order,?1<last_observed_at OR ?1<(SELECT started_at FROM sessions WHERE id=?2)) WHERE session_id=?2 AND end_basis='coverage_gap' AND closed_at>?1",params![at,id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
@@ -268,9 +298,19 @@ impl Store {
     }
 
     pub async fn begin_session(&self, channels: Vec<String>) -> Result<i64, StoreError> {
+        self.begin_session_at(channels, now()).await
+    }
+
+    /// Starts a room/session at its transport receipt boundary, even when persistence is delayed.
+    pub async fn begin_session_at(
+        &self,
+        channels: Vec<String>,
+        at: String,
+    ) -> Result<i64, StoreError> {
+        let at = crate::history::utc(&at)?;
         self.call(move |conn| {
             let tx = conn.transaction()?;
-            tx.execute("INSERT INTO sessions(started_at) VALUES (?1)", [now()])?;
+            tx.execute("INSERT INTO sessions(started_at) VALUES (?1)", [at])?;
             let id = tx.last_insert_rowid();
             tx.execute(
                 "UPDATE collection_totals SET session_count=session_count+1 WHERE id=1",
@@ -289,18 +329,26 @@ impl Store {
     }
 
     pub async fn end_session(&self, id: i64, reason: String) -> Result<(), StoreError> {
-        self.call(move |conn| {
-            let tx=conn.transaction()?;
-            let stamp=now();
-            tx.execute(
-                "UPDATE sessions SET ended_at=?1,closed_recorded_at=?1,end_reason=?2 WHERE id=?3 AND ended_at IS NULL",
-                params![stamp, reason, id],
-            )?;
-            tx.execute("UPDATE history_visits SET end_basis='session_end',end_reason=?1,closed_at=?2 WHERE session_id=?3 AND end_basis IS NULL",params![reason,stamp,id])?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        self.end_session_at(id, reason, now()).await
+    }
+
+    /// Closes at the observed transport boundary; closure persistence has its own timestamp.
+    pub async fn end_session_at(
+        &self,
+        id: i64,
+        reason: String,
+        at: String,
+    ) -> Result<(), StoreError> {
+        let at = crate::history::utc(&at)?;
+        self.call(move |conn| close_session(conn, id, &reason, Some(at), false))
+            .await
+    }
+
+    /// Fallback only when a failed transport cannot provide its terminal receipt clock.
+    /// The last retained receipt (or start for an empty session) is an uncertain cutoff.
+    pub async fn end_session_uncertain(&self, id: i64, reason: String) -> Result<(), StoreError> {
+        self.call(move |conn| close_session(conn, id, &reason, None, true))
+            .await
     }
 
     pub async fn room_state(
@@ -527,6 +575,362 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delayed_transport_boundaries_preserve_source_times_and_do_not_bridge_a_known_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("source-boundaries.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T02:00:00+02:00".into())
+            .await
+            .unwrap();
+        let raw_receipt = "2026-01-01T00:00:30Z";
+        store
+            .append(
+                session,
+                vec![NewObservation {
+                    channel: "example".into(),
+                    account: Some("alice".into()),
+                    kind: "join".into(),
+                    received_at: raw_receipt.into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let recorded_after = now();
+        store
+            .end_session_at(
+                session,
+                "transport_gap".into(),
+                "2026-01-01T02:01:00+02:00".into(),
+            )
+            .await
+            .unwrap();
+        let history = store.history("example".into(), None, 10).await.unwrap();
+        assert_eq!(history[0].started_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(
+            history[0].ended_at.as_deref(),
+            Some("2026-01-01T00:01:00.000Z")
+        );
+        assert!(!history[0].end_uncertain);
+        let recorded = history[0].closed_recorded_at.as_deref().unwrap();
+        assert!(recorded >= recorded_after.as_str());
+        assert_ne!(recorded, history[0].ended_at.as_deref().unwrap());
+        let closed = store
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT closed_at FROM history_visits WHERE session_id=?1",
+                    [session],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(closed, "2026-01-01T00:01:00.000Z");
+        let range = crate::history::TimeRange::parse(
+            Some("2026-01-01T00:00:15Z".into()),
+            Some("2026-01-01T00:00:45Z".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .history_range("example".into(), None, 10, range)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .presence("example".into(), None, "2026-01-01T00:00:45Z".into(), 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        for at in ["2026-01-01T00:01:00Z", "2026-01-01T00:01:30Z"] {
+            assert!(store
+                .presence("example".into(), None, at.into(), 0, 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        let next = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T00:02:00Z".into())
+            .await
+            .unwrap();
+        store
+            .append(
+                next,
+                vec![NewObservation {
+                    channel: "example".into(),
+                    account: Some("alice".into()),
+                    kind: "join".into(),
+                    received_at: "2026-01-01T00:02:01Z".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        // A repeated cleanup call cannot move an already recorded source boundary.
+        store
+            .end_session_at(
+                session,
+                "later_cleanup".into(),
+                "2026-01-01T00:10:00Z".into(),
+            )
+            .await
+            .unwrap();
+        store.call(crate::history::recompute).await.unwrap();
+        assert!(store
+            .presence("example".into(), None, "2026-01-01T00:01:30Z".into(), 0, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let history = store.history("example".into(), None, 10).await.unwrap();
+        let original = history.iter().find(|row| row.id == session).unwrap();
+        assert_eq!(
+            original.ended_at.as_deref(),
+            Some("2026-01-01T00:01:00.000Z")
+        );
+        assert_eq!(original.end_reason.as_deref(), Some("transport_gap"));
+        let raw = store.search(None, None, None, 10).await.unwrap();
+        assert_eq!(
+            raw.iter()
+                .find(|row| row.session_id == session)
+                .unwrap()
+                .received_at,
+            raw_receipt
+        );
+        assert!(matches!(
+            store
+                .begin_session_at(vec!["example".into()], "invalid".into())
+                .await,
+            Err(StoreError::Invalid)
+        ));
+        assert!(matches!(
+            store
+                .end_session_at(next, "gap".into(), "invalid".into())
+                .await,
+            Err(StoreError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn backwards_transport_end_is_retained_and_flagged_uncertain_after_recomputation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("backwards-boundary.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T00:10:00Z".into())
+            .await
+            .unwrap();
+        store
+            .append(
+                session,
+                vec![NewObservation {
+                    channel: "example".into(),
+                    account: Some("alice".into()),
+                    kind: "join".into(),
+                    received_at: "2026-01-01T00:12:00Z".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        store
+            .end_session_at(
+                session,
+                "transport_clock_reversal".into(),
+                "2026-01-01T00:11:00Z".into(),
+            )
+            .await
+            .unwrap();
+        let history = store.history("example".into(), None, 10).await.unwrap();
+        assert_eq!(
+            history[0].ended_at.as_deref(),
+            Some("2026-01-01T00:11:00.000Z")
+        );
+        assert!(history[0].end_uncertain);
+        let query = || crate::history::VisitQuery {
+            limit: 10,
+            ..crate::history::VisitQuery::default()
+        };
+        assert!(store.visits(query()).await.unwrap()[0].out_of_order);
+        assert!(store
+            .presence("example".into(), None, "2026-01-01T00:12:01Z".into(), 0, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        store.call(crate::history::recompute).await.unwrap();
+        assert!(store.visits(query()).await.unwrap()[0].out_of_order);
+        let empty = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T00:10:00Z".into())
+            .await
+            .unwrap();
+        store
+            .end_session_at(
+                empty,
+                "transport_clock_reversal".into(),
+                "2026-01-01T00:09:00Z".into(),
+            )
+            .await
+            .unwrap();
+        assert!(store.history("example".into(), None, 10).await.unwrap()[0].end_uncertain);
+    }
+
+    #[tokio::test]
+    async fn delayed_source_end_clamps_a_previously_persisted_gap_without_rewriting_raw_boundaries()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("delayed-gap.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T00:00:00Z".into())
+            .await
+            .unwrap();
+        store
+            .append(
+                session,
+                [
+                    ("alice", "join", "00:00:30"),
+                    ("bob", "join", "00:00:10"),
+                    ("bob", "part", "00:00:45"),
+                ]
+                .into_iter()
+                .map(|(account, kind, at)| NewObservation {
+                    channel: "example".into(),
+                    account: Some(account.into()),
+                    kind: kind.into(),
+                    received_at: format!("2026-01-01T{at}Z"),
+                })
+                .collect(),
+            )
+            .await
+            .unwrap();
+        store
+            .room_state(session, "example".into(), false)
+            .await
+            .unwrap();
+        let raw_gap = store
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT recorded_at FROM history_boundaries WHERE session_id=?1",
+                    [session],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        store
+            .end_session_at(
+                session,
+                "membership_unavailable".into(),
+                "2026-01-01T00:01:00Z".into(),
+            )
+            .await
+            .unwrap();
+        for recompute in [false, true] {
+            if recompute {
+                store.call(crate::history::recompute).await.unwrap();
+            }
+            let (closed,retained_gap,part)=store.call(move|conn|Ok((conn.query_row("SELECT closed_at FROM history_visits WHERE session_id=?1 AND account='alice'",[session],|row|row.get::<_,String>(0))?,conn.query_row("SELECT recorded_at FROM history_boundaries WHERE session_id=?1",[session],|row|row.get::<_,String>(0))?,conn.query_row("SELECT end_observed_at FROM history_visits WHERE session_id=?1 AND account='bob'",[session],|row|row.get::<_,String>(0))?))).await.unwrap();
+            assert_eq!(closed, "2026-01-01T00:01:00.000Z");
+            assert_eq!(retained_gap, raw_gap);
+            assert_eq!(part, "2026-01-01T00:00:45.000Z");
+            assert!(store
+                .presence("example".into(), None, "2026-01-01T00:01:30Z".into(), 0, 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_clock_uses_an_uncertain_retained_cutoff_instead_of_persistence_time()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("uncertain-terminal.sqlite3"))
+            .await
+            .unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T00:00:00Z".into())
+            .await
+            .unwrap();
+        store
+            .append(
+                session,
+                vec![
+                    NewObservation {
+                        channel: "example".into(),
+                        account: Some("alice".into()),
+                        kind: "join".into(),
+                        received_at: "2026-01-01T00:00:30Z".into(),
+                    },
+                    NewObservation {
+                        channel: "example".into(),
+                        account: None,
+                        kind: "names_end".into(),
+                        received_at: "2026-01-01T00:00:40Z".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .room_state(session, "example".into(), false)
+            .await
+            .unwrap();
+        store
+            .end_session_uncertain(session, "transport_worker_failed".into())
+            .await
+            .unwrap();
+        let rows = store.history("example".into(), None, 10).await.unwrap();
+        assert_eq!(
+            rows[0].ended_at.as_deref(),
+            Some("2026-01-01T00:00:40.000Z")
+        );
+        assert!(rows[0].end_uncertain);
+        assert_ne!(rows[0].ended_at, rows[0].closed_recorded_at);
+        let closed = store
+            .call(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT closed_at FROM history_visits WHERE session_id=?1",
+                    [session],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(closed, "2026-01-01T00:00:40.000Z");
+        assert!(store
+            .presence("example".into(), None, "2026-01-01T00:00:41Z".into(), 0, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let empty = store
+            .begin_session_at(vec!["example".into()], "2026-01-01T00:01:00Z".into())
+            .await
+            .unwrap();
+        store
+            .end_session_uncertain(empty, "transport_worker_failed".into())
+            .await
+            .unwrap();
+        let rows = store.history("example".into(), None, 10).await.unwrap();
+        assert_eq!(
+            rows[0].ended_at.as_deref(),
+            Some(rows[0].started_at.as_str())
+        );
+        assert!(rows[0].end_uncertain);
+        assert_eq!(store.stats().await.unwrap().observation_count, 2);
+    }
+
     #[tokio::test]
     async fn retained_evidence_has_session_boundaries_and_exact_filters() {
         let dir = tempfile::tempdir().unwrap();

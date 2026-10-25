@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{watch, OwnedSemaphorePermit, RwLock, Semaphore};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectorStatus {
@@ -19,6 +19,8 @@ pub struct CollectorStatus {
     pub evidence_scope: &'static str,
     pub broadcast_metadata: &'static str,
     pub rooms: Vec<RoomStatus>,
+    #[serde(skip)]
+    pub receive_budget: Option<Arc<Semaphore>>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct RoomStatus {
@@ -42,6 +44,7 @@ pub fn status(store: &Store) -> SharedStatus {
         evidence_scope: irc::EVIDENCE_SCOPE,
         broadcast_metadata: "see /api/metadata/status",
         rooms: Vec::new(),
+        receive_budget: None,
     }))
 }
 
@@ -65,6 +68,7 @@ async fn flush_pending(
     store: &Store,
     sessions: &BTreeMap<String, i64>,
     pending: &mut Vec<NewObservation>,
+    permits: &mut Vec<OwnedSemaphorePermit>,
 ) -> Result<(), crate::store::StoreError> {
     let mut grouped = BTreeMap::<i64, Vec<NewObservation>>::new();
     let mut count = 0;
@@ -84,6 +88,9 @@ async fn flush_pending(
     if !grouped.is_empty() {
         store.append_sessions(grouped.into_iter().collect()).await?;
     }
+    // The admission budget includes pending/in-flight receipts until every part
+    // of this flush has committed, including a room-boundary flush.
+    permits.clear();
     Ok(())
 }
 
@@ -144,7 +151,9 @@ async fn run_endpoint(
         status.write().await.state = "connecting".into();
         let mut rooms = BTreeMap::<String, RoomStatus>::new();
         let mut sessions = BTreeMap::<String, i64>::new();
-        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (events_tx, mut events_rx) = irc::receipt_queue();
+        status.write().await.receive_budget = Some(events_tx.budget_handle());
+        let transport_end = events_tx.end_time_handle();
         let (stop_tx, stop_rx) = watch::channel(false);
         let connection_endpoint = endpoint.clone();
         let connection_channels = channels.clone();
@@ -160,13 +169,14 @@ async fn run_endpoint(
         let mut reason = None::<String>;
         let mut storage_failure = false;
         let mut pending = Vec::<NewObservation>::new();
+        let mut pending_permits = Vec::<OwnedSemaphorePermit>::new();
         let mut flush = tokio::time::interval(Duration::from_millis(250));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let began = std::time::Instant::now();
         loop {
             let outcome: Result<(), crate::store::StoreError> = tokio::select! {
                 _=flush.tick(),if !pending.is_empty()=> {
-                    let saved=flush_pending(&store,&sessions,&mut pending).await;
+                    let saved=flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await;
                     if saved.is_ok() {status.write().await.rooms=rooms.values().cloned().collect();}
                     saved
                 },
@@ -178,10 +188,13 @@ async fn run_endpoint(
                 },
                 _=shutdown.changed(),if reason.is_none()=> {reason=Some("shutdown".into());let _=stop_tx.send(true);Ok(())},
                 event=events_rx.recv()=> {
+                    let Some(envelope)=event else {break;};
+                    let source_at=envelope.received_at().to_owned();
+                    let (event,permit)=envelope.into_parts();
                     match event {
-                        Some(StreamEvent::Connected)=> {status.write().await.state="joining".into();Ok(())},
-                        Some(StreamEvent::RoomJoining(channel))=> {
-                            let saved=store.begin_session(vec![channel.clone()]).await;
+                        StreamEvent::Connected=> {status.write().await.state="joining".into();Ok(())},
+                        StreamEvent::RoomJoining(channel)=> {
+                            let saved=store.begin_session_at(vec![channel.clone()],source_at).await;
                             match saved {
                                 Ok(id)=> {
                                     sessions.insert(channel.clone(),id);
@@ -193,7 +206,7 @@ async fn run_endpoint(
                                 Err(error)=>Err(error),
                             }
                         },
-                        Some(StreamEvent::RoomReady(channel))=> {
+                        StreamEvent::RoomReady(channel)=> {
                             match sessions.get(&channel).copied() {
                                 Some(id)=> {
                                     let saved=store.room_state(id,channel.clone(),true).await;
@@ -206,15 +219,15 @@ async fn run_endpoint(
                                 None=>Err(crate::store::StoreError::Invalid),
                             }
                         },
-                        Some(StreamEvent::RoomUnavailable(channel))|Some(StreamEvent::RoomLeft(channel))=> {
+                        StreamEvent::RoomUnavailable(channel)|StreamEvent::RoomLeft(channel)=> {
                             // The transport marks an unavailable room before its retry; removing
                             // the room has the same evidence boundary and cannot extend a visit.
                             let desired=channels.borrow().clone();
                             let unavailable=desired.contains(&channel);
-                            let mut saved=flush_pending(&store,&sessions,&mut pending).await;
+                            let mut saved=flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await;
                             if saved.is_ok() {
                                 if let Some(id)=sessions.remove(&channel) {
-                                    saved=store.end_session(id,if unavailable {"membership_unavailable"} else {"configuration_changed"}.into()).await;
+                                    saved=store.end_session_at(id,if unavailable {"membership_unavailable"} else {"configuration_changed"}.into(),source_at).await;
                                 }
                             }
                             if saved.is_ok() {
@@ -225,16 +238,16 @@ async fn run_endpoint(
                             }
                             saved
                         },
-                        Some(StreamEvent::Observations(events))=> {
+                        StreamEvent::Observations(events)=> {
+                            pending_permits.push(permit);
                             for event in &events {
                                 if matches!(event.kind.as_str(),"names"|"join") {
                                     if let Some(room)=rooms.get_mut(&event.channel) {room.last_positive_at=Some(event.received_at.clone());}
                                 }
                             }
                             pending.extend(events);
-                            if pending.len()>=512 {flush_pending(&store,&sessions,&mut pending).await} else {Ok(())}
+                            if pending.len()>=512 {flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await} else {Ok(())}
                         },
-                        None=>break,
                     }
                 },
             };
@@ -249,7 +262,7 @@ async fn run_endpoint(
             }
         }
         if !storage_failure
-            && flush_pending(&store, &sessions, &mut pending)
+            && flush_pending(&store, &sessions, &mut pending, &mut pending_permits)
                 .await
                 .is_err()
         {
@@ -269,8 +282,17 @@ async fn run_endpoint(
         };
         let failed = worker_error.is_some();
         let end_reason = session_end_reason(reason, worker_error);
+        let ended_at = transport_end.lock().ok().and_then(|at| at.clone());
         for (_, id) in sessions {
-            if store.end_session(id, end_reason.clone()).await.is_err() {
+            let saved = match &ended_at {
+                Some(at) => {
+                    store
+                        .end_session_at(id, end_reason.clone(), at.clone())
+                        .await
+                }
+                None => store.end_session_uncertain(id, end_reason.clone()).await,
+            };
+            if saved.is_err() {
                 storage_failure = true;
             }
         }
@@ -522,3 +544,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "collector_buffer_tests.rs"]
+mod buffer_tests;
