@@ -82,7 +82,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 - Preserve the existing database and DPAPI credentials, verify the copied history, then validate optional metadata on genuinely live channels.
 - Check both search directions, historical migration, separate visits, range filters, themes and collection policy on the real package.
 - Login startup/recovery needs an explicitly selected opt-in task on the intended Windows account. It is implemented but is not installed without that choice.
-- Real extended trials at 10/25/50 channels, resource/growth/query measurements and a 24-hour trial remain pending. See [performance evidence](performance.md). Short trials and CI cannot establish these results.
+- Short, intensive 10/25/50-channel performance benchmarks and measured optimization are the current request. Long reliability trials are owner-managed and are not a gate for that work. See [performance evidence](performance.md). Short trials and CI do not establish long-run reliability.
 - Reconsider Community sampling only if a reproducible, permitted autonomous source is demonstrated. Validate freshness, caching, selection bias, population identity and correlation before introducing statistical estimates or adapting sample cadence.
 
 ## Current development evidence

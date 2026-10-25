@@ -54,6 +54,14 @@ jobs:
         run: |
           .\target\release\veylurk.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Application help check failed' }
+      - name: Verify offline performance harness with a small isolated workload
+        shell: pwsh
+        run: |
+          $benchDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-bench-smoke-' + [guid]::NewGuid().ToString('N'))
+          .\target\release\veylurk-perf-bench.exe --output-dir $benchDirectory --channels 2 --events-per-channel 200 --query-repetitions 1 --max-seconds 120
+          if ($LASTEXITCODE -ne 0) { throw 'Offline performance harness failed' }
+          $benchReport = Get-Content -LiteralPath (Join-Path $benchDirectory 'report.json') -Raw | ConvertFrom-Json
+          if (-not $benchReport.success -or $benchReport.provenance.network_used -or $benchReport.correctness.observed.observations -ne 400 -or -not $benchReport.files.settings_unchanged_and_full_durability) { throw 'Offline performance report contract was invalid' }
       - name: Verify packaged application startup and graceful exit without Twitch
         shell: pwsh
         run: |
@@ -172,6 +180,12 @@ jobs:
         with:
           name: veylurk-irc-probe-windows-x64
           path: target/release/veylurk-irc-probe.exe
+          if-no-files-found: error
+      - name: Upload offline Windows performance harness
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylurk-perf-bench-windows-x64
+          path: target/release/veylurk-perf-bench.exe
           if-no-files-found: error
       - name: Upload Windows prototype
         uses: actions/upload-artifact@v4

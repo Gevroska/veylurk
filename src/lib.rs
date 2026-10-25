@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
 pub mod app;
+pub mod benchmark;
 pub mod browser;
 pub mod collector;
 pub mod diagnostics;

@@ -21,6 +21,10 @@ path = "src/bin/irc_probe.rs"
 name = "veylurk"
 path = "src/bin/veylurk.rs"
 
+[[bin]]
+name = "veylurk-perf-bench"
+path = "src/bin/perf_bench.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -35,7 +39,7 @@ axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled", "hooks"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"
