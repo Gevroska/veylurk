@@ -4,8 +4,67 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
-async fn actual_append_interrupt_stops_collector_retains_baseline_and_closes_explicit_failure_gap()
-{
+async fn collector_keeps_same_session_when_durable_append_outlives_old_query_budget() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("collector-durable-budget.sqlite3")).await.unwrap();
+        store.track(vec!["test".into()], true).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (_channels, receive_channels) = watch::channel(vec!["test".into()]);
+        let (shutdown, receive_shutdown) = watch::channel(false);
+        let health = status(&store);
+        let collector = tokio::spawn(run_endpoint(store.clone(), receive_channels, receive_shutdown, health.clone(), endpoint));
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut peer = tokio_tungstenite::accept_async(stream).await.unwrap();
+        assert_eq!(peer.next().await.unwrap().unwrap(), Message::text("CAP REQ :twitch.tv/membership\r\n"));
+        assert_eq!(peer.next().await.unwrap().unwrap(), Message::text("PASS SCHMOOPIIE\r\n"));
+        let nick = peer.next().await.unwrap().unwrap().into_text().unwrap();
+        let guest = nick.strip_prefix("NICK ").unwrap().trim();
+        peer.send(Message::text(format!(":tmi.twitch.tv CAP * ACK :twitch.tv/membership\r\n:tmi.twitch.tv 001 {guest} :Welcome\r\n"))).await.unwrap();
+        assert_eq!(peer.next().await.unwrap().unwrap(), Message::text("JOIN #test\r\n"));
+        peer.send(Message::text(format!(":tmi.twitch.tv 353 {guest} = #test :baseline\r\n:tmi.twitch.tv 366 {guest} #test :End\r\n"))).await.unwrap();
+        let budget = loop {
+            let ready = health.read().await.clone();
+            if store.stats().await.unwrap().observation_count == 2 && ready.state == "collecting" {
+                if let Some(budget) = ready.receive_budget.filter(|budget| budget.available_permits() == 32_768) { break budget; }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let baseline_session = store.history("test".into(), None, 10).await.unwrap()[0].id;
+        let expired = store.expire_next_append_for_test();
+        peer.send(Message::text(":newaccount!newaccount@newaccount.tmi.twitch.tv JOIN #test\r\n")).await.unwrap();
+        loop {
+            if store.stats().await.unwrap().observation_count == 3 && budget.available_permits() == 32_768 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(expired.load(std::sync::atomic::Ordering::Relaxed));
+        let current = health.read().await.clone();
+        assert_eq!(current.state, "collecting");
+        assert_eq!(current.connected_channels, 1);
+        assert!(current.last_error.is_none());
+        assert!(Arc::ptr_eq(&budget, current.receive_budget.as_ref().unwrap()));
+        let sessions = store.history("test".into(), None, 10).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, baseline_session);
+        assert!(sessions[0].ended_at.is_none());
+        let open_visits: i64 = store.call_read(Operation::Query, |conn| Ok(conn.query_row("SELECT COUNT(*) FROM history_visits WHERE end_basis IS NULL", [], |row| row.get(0))?)).await.unwrap();
+        assert_eq!(open_visits, 2, "both committed accounts remain within the same coverage session");
+        assert!(store.diagnostics().first_failure.is_none());
+        shutdown.send(true).unwrap();
+        assert_eq!(peer.next().await.unwrap().unwrap(), Message::text("PART #test\r\n"));
+        assert!(matches!(peer.next().await.unwrap().unwrap(), Message::Close(_)));
+        let _ = peer.flush().await;
+        collector.await.unwrap();
+        let ended = store.history("test".into(), None, 10).await.unwrap();
+        assert_eq!(ended[0].id, baseline_session);
+        assert_eq!(ended[0].end_reason.as_deref(), Some("shutdown"));
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn actual_append_progress_callback_interrupt_stops_collector_retains_baseline_and_closes_explicit_failure_gap(
+) {
     tokio::time::timeout(Duration::from_secs(15), async {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("collector-interruption.sqlite3")).await.unwrap();
@@ -29,7 +88,7 @@ async fn actual_append_interrupt_stops_collector_retains_baseline_and_closes_exp
             if store.stats().await.unwrap().observation_count == 2 && health.read().await.state == "collecting" { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        store.expire_next_append_for_test();
+        store.interrupt_next_append_for_test();
         peer.send(Message::text(":newaccount!newaccount@newaccount.tmi.twitch.tv JOIN #test\r\n")).await.unwrap();
         let closing = tokio::spawn(async move {
             let mut parted = false;
@@ -65,6 +124,7 @@ async fn actual_append_interrupt_stops_collector_retains_baseline_and_closes_exp
         assert_eq!(record.operation, Operation::Append);
         assert_eq!(record.category, Category::SqliteInterrupt);
         assert_eq!(record.sqlite_extended_code, Some(rusqlite::ffi::SQLITE_INTERRUPT));
-        assert!(record.progress_interrupt_requested);
+        assert_eq!(record.job_class, Some(crate::diagnostics::JobClass::DurableMutation));
+        assert!(!record.progress_interrupt_requested, "injected SQLite interruption did not originate from a query budget");
     }).await.unwrap();
 }

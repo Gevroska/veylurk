@@ -1,5 +1,8 @@
 //! Versioned, recomputable summaries of received IRC evidence, never watch time.
-use crate::store::{normalize, Store, StoreError};
+use crate::{
+    diagnostics::Operation,
+    store::{normalize, Store, StoreError},
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -248,7 +251,7 @@ impl Store {
         {
             return Err(StoreError::Invalid);
         }
-        self.call(move |conn| {
+        self.call_read(Operation::Query, move |conn| {
             let mut sql = format!("SELECT {VISIT_COLUMNS} FROM history_visits v WHERE v.id<?");
             let mut values = vec![rusqlite::types::Value::Integer(
                 query.before.unwrap_or(i64::MAX),
@@ -297,7 +300,7 @@ impl Store {
         if limit == 0 || limit > 501 || offset > 1_000_000 {
             return Err(StoreError::Invalid);
         }
-        self.call(move|conn| {
+        self.call_read(Operation::Query, move|conn| {
             // Require the session's receipt evidence to cover the requested instant. No inference
             // past its recorded end, a PART, a gap, or a backwards-clock boundary.
             let mut stmt=conn.prepare("WITH candidates AS (SELECT v.*,EXISTS(SELECT 1 FROM observations o WHERE o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.kind IN ('names','join') AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.received_at_utc=?1) AS exact FROM history_visits v JOIN sessions s ON s.id=v.session_id WHERE v.channel=?2 AND (?3 IS NULL OR v.account=?3) AND v.first_observed_at<=?1 AND (EXISTS(SELECT 1 FROM observations o WHERE o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.kind IN ('names','join') AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.received_at_utc=?1) OR ((s.ended_at IS NULL OR s.ended_at>?1) AND (v.closed_at IS NULL OR v.closed_at>?1) AND COALESCE(v.end_basis,'open')<>'out_of_order' AND v.start_basis<>'uncertain_names' AND v.out_of_order=0))),ranked AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY account ORDER BY exact DESC,id DESC) AS rank FROM candidates) SELECT v.account,v.session_id,(SELECT MAX(received_at_utc) FROM observations o WHERE o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.kind IN ('names','join') AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.received_at_utc<=?1),v.exact FROM ranked v WHERE rank=1 ORDER BY v.account LIMIT ?4 OFFSET ?5")?;
@@ -534,7 +537,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .call(|conn| {
+            .call_write(Operation::Initialize, |conn| {
                 conn.execute(
                     "UPDATE history_boundaries SET recorded_at='2026-01-01T00:01:00.000Z'",
                     [],
@@ -568,7 +571,10 @@ mod tests {
         assert_eq!(before.len(), 3);
         assert_eq!(before[2].end_basis, "coverage_gap");
         assert_eq!(before[1].end_basis, "session_end");
-        store.call(recompute).await.unwrap();
+        store
+            .call_write(Operation::Initialize, recompute)
+            .await
+            .unwrap();
         let after = all(&store).await;
         assert_eq!(
             serde_json::to_value(before).unwrap(),
@@ -661,14 +667,13 @@ mod tests {
         let (_dir, store, session) = fixture().await;
         // Isolated synthetic derived history reproduces a long-retained room without
         // spending this test's time generating a hundred thousand source receipts.
-        store.call(|conn| {
+        store.call_write(Operation::Initialize, |conn| {
             conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000) INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,end_basis,end_reason,positive_observation_count) SELECT 1000000+x,'old'||x,'example',999,'2024-01-01T00:00:00.000Z','2024-01-01T00:00:00.000Z',1000000+x,1000000+x,'join','session_end','shutdown',1 FROM n;")?;Ok(())
         }).await.unwrap();
         let observations = (0..512)
             .map(|n| event(&format!("new{n}"), "names", "00:00:00"))
             .collect();
-        // Indexed instruction work must fit the storage progress budget; that budget
-        // cannot interrupt a blocked filesystem flush.
+        // The retained-history index keeps this bounded append independent of older sessions.
         store.append(session, observations).await.unwrap();
         assert_eq!(store.stats().await.unwrap().observation_count, 512);
         assert_eq!(
@@ -812,7 +817,7 @@ mod tests {
         );
         let metadata_writing = std::time::Instant::now();
         let metadata = crate::metadata::initialize(store.clone()).await.unwrap();
-        store.call(|conn| {
+        store.call_write(Operation::MetadataWrite, |conn| {
             conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<2999) INSERT INTO metadata_checks(channel,checked_at,state,viewer_count) SELECT 'channel0',strftime('%Y-%m-%dT%H:%M:%fZ','2024-01-01','+'||x||' hours'),'live',100+x FROM n;")?;Ok(())
         }).await.unwrap();
         eprintln!(

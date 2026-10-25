@@ -363,11 +363,12 @@
       panel.append(node("h3", heading));
       detail(fault, "Recorded", timestamp(record.occurred_at_utc));
       detail(fault, "Operation", label(record.operation));
+      detail(fault, "Execution policy", record.job_class == null ? "Not recorded" : label(record.job_class));
       detail(fault, "Category", label(record.category));
       detail(fault, "Elapsed milliseconds", count(record.elapsed_ms));
       detail(fault, "SQLite primary code", record.sqlite_primary_code);
       detail(fault, "SQLite extended code", record.sqlite_extended_code);
-      detail(fault, "Deadline interruption requested", record.progress_interrupt_requested === true ? "Yes" : record.progress_interrupt_requested === false ? "No" : "Unknown");
+      detail(fault, "Query budget interruption requested", record.progress_interrupt_requested === true ? "Yes" : record.progress_interrupt_requested === false ? "No" : "Unknown");
       detail(fault, "SQLite transaction active after operation", record.autocommit_after === true ? "No" : record.autocommit_after === false ? "Yes" : "Unknown");
       panel.append(fault);
     }

@@ -418,7 +418,7 @@ async fn visits(
     let mut channel = query.channel;
     if let Some(id) = query.broadcast_id {
         use rusqlite::OptionalExtension;
-        let broadcast=state.store.call(move|conn|Ok(conn.query_row("SELECT channel,started_at,last_live_at FROM metadata_broadcasts WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?)).await?.ok_or(StoreError::NotFound)?;
+        let broadcast=state.store.call_read(crate::diagnostics::Operation::Query,move|conn|Ok(conn.query_row("SELECT channel,started_at,last_live_at FROM metadata_broadcasts WHERE id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?)).await?.ok_or(StoreError::NotFound)?;
         if channel
             .as_deref()
             .is_some_and(|c| !c.eq_ignore_ascii_case(&broadcast.0))

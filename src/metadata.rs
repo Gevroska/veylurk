@@ -1,5 +1,6 @@
 //! Optional official broadcast metadata. IRC collection does not depend on this worker.
 use crate::{
+    diagnostics::Operation,
     history::{TimeRange, MODEL_VERSION},
     store::{self, Store, StoreError},
 };
@@ -66,7 +67,7 @@ struct Health {
 
 pub async fn initialize(store: Store) -> Result<Metadata, StoreError> {
     store
-        .call(|conn| {
+        .call_write(Operation::MetadataInitialize, |conn| {
             conn.execute_batch(SCHEMA)?;
             Ok(())
         })
@@ -208,7 +209,7 @@ impl Metadata {
     pub async fn channel_states(&self) -> Result<Vec<ChannelState>, StoreError> {
         let health = self.health.read().await.clone();
         let available = health.configured && health.state == "ready";
-        self.store.call(move|conn| {
+        self.store.call_read(Operation::Query, move|conn| {
             let mut stmt=conn.prepare("SELECT c.login,m.state,m.checked_at,m.broadcast_id,m.viewer_count FROM channels c LEFT JOIN metadata_checks m ON m.id=(SELECT MAX(id) FROM metadata_checks WHERE channel=c.login) WHERE c.tracked=1 ORDER BY c.login")?;
             let rows=stmt.query_map([],|row| {
                 let checked_at:Option<String>=row.get(2)?;
@@ -269,7 +270,7 @@ impl Metadata {
             };
             let saved = self
                 .store
-                .call(move |conn| {
+                .call_write(Operation::MetadataWrite, move |conn| {
                     record_check(conn, &requested, &checked_at, result)?;
                     Ok(())
                 })
@@ -312,7 +313,7 @@ async fn status(State(service): State<Metadata>) -> ApiResult {
 async fn broadcasts(State(service): State<Metadata>, Query(query): Query<Search>) -> ApiResult {
     let query = query.normalized()?;
     let limit = query.limit.unwrap_or(100) as usize;
-    let mut rows = service.store.call(move |conn| {
+    let mut rows = service.store.call_read(Operation::Query, move |conn| {
         let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE (?1 IS NULL OR b.channel=?1) AND (?2 IS NULL OR b.id<?2) AND (?3 IS NULL OR EXISTS(SELECT 1 FROM observations o WHERE o.channel=b.channel AND o.account=?3 AND o.kind IN ('names','join') AND o.received_at_utc>=b.started_at AND o.received_at_utc<=b.last_live_at AND (?5 IS NULL OR o.received_at_utc>=?5) AND (?6 IS NULL OR o.received_at_utc<?6)) OR EXISTS(SELECT 1 FROM history_visits v JOIN sessions s ON s.id=v.session_id WHERE v.channel=b.channel AND v.account=?3 AND v.first_observed_at<MAX(b.started_at,COALESCE(?5,b.started_at)) AND v.start_basis<>'uncertain_names' AND v.out_of_order=0 AND COALESCE(v.end_basis,'open')<>'out_of_order' AND (v.closed_at IS NULL OR v.closed_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (s.ended_at IS NULL OR s.ended_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (?6 IS NULL OR MAX(b.started_at,COALESCE(?5,b.started_at))<?6))) AND (?5 IS NULL OR b.last_live_at>=?5) AND (?6 IS NULL OR b.started_at<?6) ORDER BY b.id DESC LIMIT ?4");
         let mut statement = conn.prepare(&sql)?;
         let rows = statement.query_map(params![query.channel,query.before,query.account,limit+1,query.from,query.to], broadcast_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -340,7 +341,7 @@ async fn broadcast_observations(
         return Err(bad_query());
     }
     let limit = query.limit.unwrap_or(100) as usize;
-    let result = service.store.call(move |conn| {
+    let result = service.store.call_read(Operation::Query, move |conn| {
         let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE b.id=?1");
         let broadcast = conn.query_row(&sql, [id], broadcast_row).optional()?;
         let Some(broadcast) = broadcast else { return Ok(None); };
@@ -370,7 +371,7 @@ async fn metadata_history(
     let login = store::normalize(&login).map_err(|_| bad_query())?;
     let limit = query.limit.unwrap_or(100) as usize;
     let offset = query.offset.unwrap_or(0);
-    let mut rows=service.store.call(move|conn| {
+    let mut rows=service.store.call_read(Operation::Query, move|conn| {
         let mut stmt=conn.prepare("SELECT m.id,m.checked_at,m.state,m.broadcast_id,m.viewer_count,m.error_code,t.title,t.game_name,t.language FROM metadata_checks m LEFT JOIN metadata_titles t ON t.id=(SELECT id FROM metadata_titles WHERE broadcast_id=m.broadcast_id AND seen_at<=m.checked_at ORDER BY seen_at DESC,id DESC LIMIT 1) WHERE m.channel=?1 AND (?2 IS NULL OR m.checked_at>=?2) AND (?3 IS NULL OR m.checked_at<?3) AND (?4 IS NULL OR m.id<?4) ORDER BY m.id DESC LIMIT ?5 OFFSET ?6")?;
         let rows=stmt.query_map(params![login,query.from,query.to,query.before,limit+1,offset as i64],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"checked_at":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"broadcast_id":r.get::<_,Option<i64>>(3)?,"viewer_count":r.get::<_,Option<i64>>(4)?,"error_code":r.get::<_,Option<String>>(5)?,"title":r.get::<_,Option<String>>(6)?,"game_name":r.get::<_,Option<String>>(7)?,"language":r.get::<_,Option<String>>(8)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;Ok(rows)
     }).await.map_err(database_error)?;
@@ -401,7 +402,7 @@ async fn broadcast_accounts(
     }
     let limit = query.limit.unwrap_or(100) as usize;
     let offset = query.offset.unwrap_or(0);
-    let result=service.store.call(move|conn| {
+    let result=service.store.call_read(Operation::Query, move|conn| {
         let broadcast=conn.query_row(&format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE b.id=?1"),[id],broadcast_row).optional()?;
         let Some(broadcast)=broadcast else{return Ok(None);};
         let mut stmt=conn.prepare(&format!("{ACCOUNT_CTE} SELECT account,first_observed_at,last_observed_at,positive_observation_count,visit_count,prior_observed_at FROM grouped ORDER BY account LIMIT ?5 OFFSET ?6"))?;
@@ -998,7 +999,7 @@ mod tests {
         store.append(session, rows).await.unwrap();
         let service = initialize(store.clone()).await.unwrap();
         let broadcast_id = store
-            .call(|conn| {
+            .call_write(Operation::MetadataWrite, |conn| {
                 record_check(
                     conn,
                     &["example".into()],
@@ -1096,7 +1097,7 @@ mod tests {
         store.append(session, events).await.unwrap();
         let service = initialize(store.clone()).await.unwrap();
         store
-            .call(|conn| {
+            .call_write(Operation::MetadataWrite, |conn| {
                 record_check(
                     conn,
                     &["example".into()],
@@ -1173,7 +1174,7 @@ mod tests {
             .unwrap();
         let service = initialize(store.clone()).await.unwrap();
         store
-            .call(|conn| {
+            .call_write(Operation::MetadataWrite, |conn| {
                 record_check(
                     conn,
                     &["example".into()],
@@ -1256,13 +1257,13 @@ mod tests {
             health.configured = true;
             health.state = "ready";
         }
-        store.call(|conn|{conn.execute("INSERT INTO metadata_checks(channel,checked_at,state) VALUES('example',?1,'offline')",[store::now()])?;Ok(())}).await.unwrap();
+        store.call_write(Operation::MetadataWrite, |conn|{conn.execute("INSERT INTO metadata_checks(channel,checked_at,state) VALUES('example',?1,'offline')",[store::now()])?;Ok(())}).await.unwrap();
         assert_eq!(service.channel_states().await.unwrap()[0].state, "offline");
         service.health.write().await.state = "error";
         assert_eq!(service.channel_states().await.unwrap()[0].state, "unknown");
         service.health.write().await.state = "ready";
         store
-            .call(|conn| {
+            .call_write(Operation::MetadataWrite, |conn| {
                 conn.execute(
                     "UPDATE metadata_checks SET checked_at='2020-01-01T00:00:00.000Z'",
                     [],
@@ -1273,7 +1274,7 @@ mod tests {
             .unwrap();
         assert!(service.channel_states().await.unwrap()[0].stale);
         store
-            .call(|conn| {
+            .call_write(Operation::MetadataWrite, |conn| {
                 conn.execute(
                     "UPDATE metadata_checks SET checked_at='2099-01-01T00:00:00.000Z'",
                     [],

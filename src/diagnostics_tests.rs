@@ -17,13 +17,15 @@ fn diagnostics_preserve_first_storage_failure_and_never_serialize_error_messages
     let secret = "SECRET_sql_account_path_authorization_bearer";
     diagnostics.storage_failure(
         Operation::Append,
+        JobClass::DurableMutation,
         &sqlite_error(9, secret),
         Duration::from_millis(7),
-        true,
+        false,
         Some(true),
     );
     diagnostics.storage_failure(
         Operation::Checkpoint,
+        JobClass::DurableMutation,
         &StoreError::CheckpointBusy,
         Duration::ZERO,
         false,
@@ -34,7 +36,8 @@ fn diagnostics_preserve_first_storage_failure_and_never_serialize_error_messages
     let first = snapshot.first_failure.as_ref().unwrap();
     assert_eq!(first.operation, Operation::Append);
     assert_eq!(first.sqlite_primary_code, Some(9));
-    assert!(first.progress_interrupt_requested);
+    assert!(!first.progress_interrupt_requested);
+    assert_eq!(first.job_class, Some(JobClass::DurableMutation));
     assert_eq!(
         snapshot.latest.as_ref().unwrap().operation,
         Operation::Checkpoint
@@ -57,7 +60,8 @@ fn diagnostics_preserve_first_storage_failure_and_never_serialize_error_messages
     drop(diagnostics);
     let reopened = Diagnostics::new(&database);
     reopened.storage_failure(
-        Operation::Generic,
+        Operation::Query,
+        JobClass::Query,
         &StoreError::Invalid,
         Duration::ZERO,
         false,
@@ -76,6 +80,7 @@ fn diagnostics_journal_rotation_and_per_run_limit_are_bounded() {
     let diagnostics = Diagnostics::new(&database);
     diagnostics.storage_failure(
         Operation::Append,
+        JobClass::DurableMutation,
         &StoreError::Invalid,
         Duration::ZERO,
         false,
@@ -95,7 +100,8 @@ fn diagnostics_journal_rotation_and_per_run_limit_are_bounded() {
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     for _ in 1..RUN_RECORDS {
         diagnostics.storage_failure(
-            Operation::Generic,
+            Operation::Query,
+            JobClass::Query,
             &StoreError::Invalid,
             Duration::ZERO,
             false,
@@ -105,6 +111,7 @@ fn diagnostics_journal_rotation_and_per_run_limit_are_bounded() {
     }
     diagnostics.storage_failure(
         Operation::Checkpoint,
+        JobClass::DurableMutation,
         &StoreError::CheckpointBusy,
         Duration::ZERO,
         false,
@@ -124,6 +131,7 @@ fn diagnostics_failed_writes_and_full_queue_are_honest_and_nonblocking() {
     let diagnostics = Diagnostics::new(&database);
     diagnostics.storage_failure(
         Operation::Append,
+        JobClass::DurableMutation,
         &sqlite_error(19, "secret"),
         Duration::ZERO,
         false,
@@ -148,14 +156,16 @@ fn diagnostics_failed_writes_and_full_queue_are_honest_and_nonblocking() {
         writer,
     };
     stalled.storage_failure(
-        Operation::Generic,
+        Operation::Query,
+        JobClass::Query,
         &StoreError::Invalid,
         Duration::ZERO,
         false,
         None,
     );
     stalled.storage_failure(
-        Operation::Generic,
+        Operation::Query,
+        JobClass::Query,
         &StoreError::Invalid,
         Duration::ZERO,
         false,

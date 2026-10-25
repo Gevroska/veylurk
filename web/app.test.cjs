@@ -427,8 +427,8 @@ test("fault details preserve the first cause, distinguish callback interruption,
     if (target.pathname === "/api/status") return {
       state: "storage_error", storage_health: "unavailable",
       diagnostics: {
-        first_failure: { sequence: 1, occurred_at_utc: received, operation: "append", category: hostile, elapsed_ms: 5010, sqlite_primary_code: 9, sqlite_extended_code: 9, progress_interrupt_requested: true, autocommit_after: true },
-        latest: { sequence: 2, occurred_at_utc: received, operation: "checkpoint", category: "checkpoint_busy", elapsed_ms: 2, sqlite_primary_code: null, sqlite_extended_code: null, progress_interrupt_requested: false, autocommit_after: null },
+        first_failure: { sequence: 1, occurred_at_utc: received, operation: "query", job_class: "query", category: hostile, elapsed_ms: 5010, sqlite_primary_code: 9, sqlite_extended_code: 9, progress_interrupt_requested: true, autocommit_after: true },
+        latest: { sequence: 2, occurred_at_utc: received, operation: "checkpoint", job_class: "durable_mutation", category: "checkpoint_busy", elapsed_ms: 2, sqlite_primary_code: null, sqlite_extended_code: null, progress_interrupt_requested: false, autocommit_after: null },
         persistence: { state: "failed", failure_count: 1, dropped_count: 2 },
       },
     };
@@ -437,9 +437,11 @@ test("fault details preserve the first cause, distinguish callback interruption,
   const health = app.get("health-results");
   assert.match(health.textContent, /First storage failure/);
   assert.match(health.textContent, /Latest recorded fault/);
-  assert.ok(health.textContent.indexOf("Append") < health.textContent.indexOf("Checkpoint"));
-  assert.match(health.textContent, /Deadline interruption requestedYes/);
-  assert.match(health.textContent, /Deadline interruption requestedNo/);
+  assert.ok(health.textContent.indexOf("Query") < health.textContent.indexOf("Checkpoint"));
+  assert.match(health.textContent, /Execution policyQuery/);
+  assert.match(health.textContent, /Execution policyDurable mutation/);
+  assert.match(health.textContent, /Query budget interruption requestedYes/);
+  assert.match(health.textContent, /Query budget interruption requestedNo/);
   assert.match(health.textContent, /transaction active after operationNo/);
   assert.match(health.textContent, /transaction active after operationUnknown/);
   assert.ok(health.textContent.includes(hostile));

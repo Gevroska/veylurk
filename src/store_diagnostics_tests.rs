@@ -17,8 +17,8 @@ async fn counts(store: &Store) -> (i64, i64, i64, i64) {
 }
 
 #[tokio::test]
-async fn actual_append_progress_interrupt_rolls_back_raw_derived_and_totals_and_next_job_is_fresh()
-{
+async fn actual_append_progress_callback_interrupt_rolls_back_raw_derived_and_totals_and_next_job_is_fresh(
+) {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("append.sqlite3");
     let store = Store::open(&database).await.unwrap();
@@ -41,7 +41,7 @@ async fn actual_append_progress_interrupt_rolls_back_raw_derived_and_totals_and_
     let baseline = counts(&store).await;
     assert_eq!(baseline, (1, 1, 1, 1));
 
-    store.expire_next_append_for_test();
+    store.interrupt_next_append_for_test();
     let error = store
         .append_sessions(vec![
             (alpha, vec![receipt("alpha", "newalpha")]),
@@ -59,7 +59,11 @@ async fn actual_append_progress_interrupt_rolls_back_raw_derived_and_totals_and_
     assert_eq!(first.operation, Operation::Append);
     assert_eq!(first.category, Category::SqliteInterrupt);
     assert_eq!(first.sqlite_primary_code, Some(9));
-    assert!(first.progress_interrupt_requested);
+    assert_eq!(first.job_class, Some(JobClass::DurableMutation));
+    assert!(
+        !first.progress_interrupt_requested,
+        "independent fault injection is not a query-budget cancellation"
+    );
     assert_eq!(first.autocommit_after, Some(true));
     assert_eq!(
         counts(&store).await,
@@ -89,7 +93,76 @@ async fn actual_append_progress_interrupt_rolls_back_raw_derived_and_totals_and_
     let mut journal = database.as_os_str().to_owned();
     journal.push(".diagnostics.jsonl");
     let retained = std::fs::read_to_string(PathBuf::from(journal)).unwrap();
-    assert!(retained.contains("\"progress_interrupt_requested\":true"));
+    assert!(retained.contains("\"progress_interrupt_requested\":false"));
+}
+
+#[tokio::test]
+async fn bounded_durable_append_survives_expired_old_query_budget_without_sleeping() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("durable-budget.sqlite3"))
+        .await
+        .unwrap();
+    store
+        .track(vec!["alpha".into(), "beta".into()], true)
+        .await
+        .unwrap();
+    let alpha = store
+        .begin_session_at(vec!["alpha".into()], "2026-01-01T00:00:00Z".into())
+        .await
+        .unwrap();
+    let beta = store
+        .begin_session_at(vec!["beta".into()], "2026-01-01T00:00:00Z".into())
+        .await
+        .unwrap();
+    let expired = store.expire_next_append_for_test();
+    let groups = [(alpha, "alpha"), (beta, "beta")]
+        .into_iter()
+        .enumerate()
+        .map(|(room, (session, channel))| {
+            let rows = (0..256)
+                .map(|index| receipt(channel, &format!("room{room}account{index}")))
+                .collect();
+            (session, rows)
+        })
+        .collect();
+    store.append_sessions(groups).await.unwrap();
+    assert!(
+        expired.load(Ordering::Relaxed),
+        "clock advanced after real transaction writes and before callback-sized SQL"
+    );
+    assert_eq!(counts(&store).await, (512, 512, 512, 512));
+    assert!(store.diagnostics().first_failure.is_none());
+    store.checkpoint().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_deadline_still_interrupts_real_sql_and_next_query_and_append_have_fresh_budgets() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("query-budget.sqlite3"))
+        .await
+        .unwrap();
+    store.track(vec!["alpha".into()], true).await.unwrap();
+    let session = store
+        .begin_session_at(vec!["alpha".into()], "2026-01-01T00:00:00Z".into())
+        .await
+        .unwrap();
+    store.expire_next_query_for_test();
+    let error = store.call_read(Operation::Query, |conn| Ok(conn.query_row("WITH RECURSIVE work(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM work WHERE x<100000) SELECT SUM(x) FROM work", [], |row| row.get::<_, i64>(0))?)).await.unwrap_err();
+    assert!(
+        matches!(error, StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_INTERRUPT)
+    );
+    let first = store.diagnostics().first_failure.unwrap();
+    assert_eq!(first.job_class, Some(JobClass::Query));
+    assert_eq!(first.operation, Operation::Query);
+    assert!(first.progress_interrupt_requested);
+    let sum: i64 = store.call_read(Operation::Query, |conn| Ok(conn.query_row("WITH RECURSIVE work(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM work WHERE x<100000) SELECT SUM(x) FROM work", [], |row| row.get(0))?)).await.unwrap();
+    assert_eq!(sum, 5_000_050_000);
+    store
+        .append(session, vec![receipt("alpha", "fresh")])
+        .await
+        .unwrap();
+    assert_eq!(counts(&store).await, (1, 1, 1, 1));
+    assert_eq!(store.diagnostics().first_failure.unwrap(), first);
 }
 
 #[tokio::test]

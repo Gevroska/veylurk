@@ -1,5 +1,5 @@
 //! Serialized SQLite access. Account logins are observations, not permanent account IDs.
-use crate::diagnostics::{Diagnostics, Operation};
+use crate::diagnostics::{Diagnostics, JobClass, Operation};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -57,6 +57,10 @@ pub struct Store {
     diagnostics: Diagnostics,
     #[cfg(test)]
     append_expiry: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
+    #[cfg(test)]
+    query_expiry: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
+    #[cfg(test)]
+    append_interrupt: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,21 +229,22 @@ impl Store {
                         job(&mut conn);
                     }
                     if let Err(error) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                        worker_diagnostics.storage_failure(Operation::Checkpoint, &error.into(), Duration::ZERO, false, Some(conn.is_autocommit()));
+                        worker_diagnostics.storage_failure(Operation::Checkpoint, JobClass::DurableMutation, &error.into(), Duration::ZERO, false, Some(conn.is_autocommit()));
                     }
                 }
                 Err(error) => {
-                    worker_diagnostics.storage_failure(Operation::Initialize, &error, initializing.elapsed(), false, None);
+                    worker_diagnostics.storage_failure(Operation::Initialize, JobClass::DurableMutation, &error, initializing.elapsed(), false, None);
                     let _ = ready_tx.send(Err(error));
                 }
             }
         }).map_err(|_| {
-            diagnostics.storage_failure(Operation::Initialize, &StoreError::Initialize, initializing.elapsed(), false, None);
+            diagnostics.storage_failure(Operation::Initialize, JobClass::DurableMutation, &StoreError::Initialize, initializing.elapsed(), false, None);
             StoreError::Initialize
         })?;
         ready_rx.await.map_err(|_| {
             diagnostics.storage_failure(
                 Operation::Initialize,
+                JobClass::DurableMutation,
                 &StoreError::Unavailable,
                 initializing.elapsed(),
                 false,
@@ -253,6 +258,10 @@ impl Store {
             diagnostics,
             #[cfg(test)]
             append_expiry: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            query_expiry: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            append_interrupt: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -265,24 +274,73 @@ impl Store {
     }
 
     pub(crate) fn record_failure(&self, operation: Operation, error: &StoreError) {
-        self.diagnostics
-            .storage_failure(operation, error, Duration::ZERO, false, None);
+        self.diagnostics.storage_failure(
+            operation,
+            JobClass::DurableMutation,
+            error,
+            Duration::ZERO,
+            false,
+            None,
+        );
     }
 
     #[cfg(test)]
-    pub(crate) fn expire_next_append_for_test(&self) {
-        *self.append_expiry.lock().unwrap() = Some(Arc::new(AtomicBool::new(false)));
+    pub(crate) fn expire_next_append_for_test(&self) -> Arc<AtomicBool> {
+        let clock = Arc::new(AtomicBool::new(false));
+        *self.append_expiry.lock().unwrap() = Some(clock.clone());
+        clock
     }
 
+    #[cfg(test)]
+    pub(crate) fn interrupt_next_append_for_test(&self) {
+        self.append_interrupt.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_next_query_for_test(&self) {
+        *self.query_expiry.lock().unwrap() = Some(Arc::new(AtomicBool::new(true)));
+    }
+
+    /// Compatibility for isolated legacy fixtures only. Production jobs declare their class.
+    #[cfg(test)]
     pub async fn call<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
-        self.call_named(Operation::Generic, operation).await
+        self.call_read(Operation::Query, operation).await
     }
 
-    async fn call_named<T, F>(&self, name: Operation, operation: F) -> Result<T, StoreError>
+    /// A cancellable query, with a fresh five-second execution budget after dequeue.
+    pub async fn call_read<T, F>(&self, name: Operation, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        self.call_named(name, JobClass::Query, operation).await
+    }
+
+    /// Durable mutations retain SQLite's own errors and busy timeout, but are never aborted
+    /// because filesystem or statement work consumed a query's elapsed-time budget.
+    pub(crate) async fn call_write<T, F>(
+        &self,
+        name: Operation,
+        operation: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        self.call_named(name, JobClass::DurableMutation, operation)
+            .await
+    }
+
+    async fn call_named<T, F>(
+        &self,
+        name: Operation,
+        class: JobClass,
+        operation: F,
+    ) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
@@ -292,6 +350,8 @@ impl Store {
         #[cfg(test)]
         let fake_expiry = if name == Operation::Append {
             self.append_expiry.lock().unwrap().take()
+        } else if class == JobClass::Query {
+            self.query_expiry.lock().unwrap().take()
         } else {
             None
         };
@@ -302,26 +362,30 @@ impl Store {
                 let deadline = started + Duration::from_secs(5);
                 let interrupted = Arc::new(AtomicBool::new(false));
                 let callback_interrupted = interrupted.clone();
-                conn.progress_handler(
-                    10_000,
-                    Some(move || {
-                        let expired = std::time::Instant::now() >= deadline;
-                        #[cfg(test)]
-                        let expired = expired
-                            || fake_expiry
-                                .as_ref()
-                                .is_some_and(|clock| clock.load(Ordering::Relaxed));
-                        if expired {
-                            callback_interrupted.store(true, Ordering::Relaxed);
-                        }
-                        expired
-                    }),
-                );
+                conn.progress_handler(0, None::<fn() -> bool>);
+                if class == JobClass::Query {
+                    conn.progress_handler(
+                        10_000,
+                        Some(move || {
+                            let expired = std::time::Instant::now() >= deadline;
+                            #[cfg(test)]
+                            let expired = expired
+                                || fake_expiry
+                                    .as_ref()
+                                    .is_some_and(|clock| clock.load(Ordering::Relaxed));
+                            if expired {
+                                callback_interrupted.store(true, Ordering::Relaxed);
+                            }
+                            expired
+                        }),
+                    );
+                }
                 let result = operation(conn);
                 conn.progress_handler(0, None::<fn() -> bool>);
                 if let Err(error) = &result {
                     diagnostics.storage_failure(
                         name,
+                        class,
                         error,
                         started.elapsed(),
                         interrupted.load(Ordering::Relaxed),
@@ -333,17 +397,31 @@ impl Store {
             }))
             .await;
         if sent.is_err() {
-            self.record_failure(name, &StoreError::Unavailable);
+            self.diagnostics.storage_failure(
+                name,
+                class,
+                &StoreError::Unavailable,
+                Duration::ZERO,
+                false,
+                None,
+            );
             return Err(StoreError::Unavailable);
         }
         rx.await.map_err(|_| {
-            self.record_failure(name, &StoreError::Unavailable);
+            self.diagnostics.storage_failure(
+                name,
+                class,
+                &StoreError::Unavailable,
+                Duration::ZERO,
+                false,
+                None,
+            );
             StoreError::Unavailable
         })?
     }
 
     pub async fn channels(&self) -> Result<Vec<Channel>, StoreError> {
-        self.call(|conn| {
+        self.call_read(Operation::Query, |conn| {
             let mut stmt = conn.prepare("SELECT c.login,c.tracked,c.enabled,c.created_at,c.updated_at,
                 (SELECT MAX(s.id) FROM sessions s JOIN session_channels sc ON sc.session_id=s.id WHERE sc.channel=c.login AND s.ended_at IS NULL),
                 (SELECT received_at FROM observations o WHERE o.channel=c.login AND o.account IS NOT NULL ORDER BY id DESC LIMIT 1),
@@ -356,7 +434,7 @@ impl Store {
     }
 
     pub async fn enabled(&self) -> Result<Vec<String>, StoreError> {
-        self.call(|conn| {
+        self.call_read(Operation::Query, |conn| {
             let mut stmt = conn.prepare(
                 "SELECT login FROM channels WHERE tracked=1 AND enabled=1 ORDER BY login",
             )?;
@@ -376,7 +454,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         normalized.sort();
         normalized.dedup();
-        self.call(move |conn| {
+        self.call_write(Operation::ChannelConfiguration, move |conn| {
             let tx=conn.transaction()?;
             let stamp=now();
             for login in normalized {
@@ -395,7 +473,7 @@ impl Store {
         remove: bool,
     ) -> Result<(), StoreError> {
         let login = normalize(&login)?;
-        self.call(move |conn| {
+        self.call_write(Operation::ChannelConfiguration, move |conn| {
             let changed=conn.execute("UPDATE channels SET enabled=?1,tracked=?2,updated_at=?3 WHERE login=?4 AND tracked=1",params![enabled,!remove,now(),login])?;
             if changed==0 { return Err(StoreError::NotFound); }
             Ok(())
@@ -414,7 +492,7 @@ impl Store {
     ) -> Result<i64, StoreError> {
         let at = crate::history::utc(&at)
             .inspect_err(|error| self.record_failure(Operation::SessionBegin, error))?;
-        self.call_named(Operation::SessionBegin, move |conn| {
+        self.call_write(Operation::SessionBegin, move |conn| {
             let tx = conn.transaction()?;
             tx.execute("INSERT INTO sessions(started_at) VALUES (?1)", [at])?;
             let id = tx.last_insert_rowid();
@@ -447,7 +525,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let at = crate::history::utc(&at)
             .inspect_err(|error| self.record_failure(Operation::SessionEnd, error))?;
-        self.call_named(Operation::SessionEnd, move |conn| {
+        self.call_write(Operation::SessionEnd, move |conn| {
             close_session(conn, id, &reason, Some(at), false)
         })
         .await
@@ -456,7 +534,7 @@ impl Store {
     /// Fallback only when a failed transport cannot provide its terminal receipt clock.
     /// The last retained receipt (or start for an empty session) is an uncertain cutoff.
     pub async fn end_session_uncertain(&self, id: i64, reason: String) -> Result<(), StoreError> {
-        self.call_named(Operation::SessionEnd, move |conn| {
+        self.call_write(Operation::SessionEnd, move |conn| {
             close_session(conn, id, &reason, None, true)
         })
         .await
@@ -468,7 +546,7 @@ impl Store {
         channel: String,
         ready: bool,
     ) -> Result<(), StoreError> {
-        self.call_named(Operation::RoomState, move |conn| {
+        self.call_write(Operation::RoomState, move |conn| {
             let tx=conn.transaction()?;
             let state=if ready {"collecting"} else {"unavailable"};
             let error=if ready {None} else {Some("Membership unavailable for this room; healthy rooms continue collecting.")};
@@ -516,7 +594,9 @@ impl Store {
         }
         #[cfg(test)]
         let fake_expiry = self.append_expiry.lock().unwrap().clone();
-        self.call_named(Operation::Append, move |conn| {
+        #[cfg(test)]
+        let inject_interrupt = self.append_interrupt.swap(false, Ordering::Relaxed);
+        self.call_write(Operation::Append, move |conn| {
             let started=std::time::Instant::now();
             let tx=conn.transaction()?;
             { let mut stmt=tx.prepare_cached("INSERT INTO observations(session_id,channel,account,kind,received_at,received_at_utc) VALUES (?1,?2,?3,?4,?5,?6)")?;
@@ -536,11 +616,21 @@ impl Store {
               } } }
             tx.execute("UPDATE collection_totals SET observation_count=observation_count+?1 WHERE id=1",[count as i64])?;
             #[cfg(test)]
-            if let Some(clock) = &fake_expiry {
-                // Advance only after real raw, derived and aggregate writes in the append transaction.
-                // Enough SQL work then reaches the actual production callback without sleeping.
-                clock.store(true, Ordering::Relaxed);
-                tx.query_row("WITH RECURSIVE work(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM work WHERE x<100000) SELECT SUM(x) FROM work", [], |row| row.get::<_, i64>(0))?;
+            {
+                if let Some(clock) = &fake_expiry {
+                    // Advance only after actual raw, derived and aggregate writes began.
+                    // If a query budget were incorrectly installed on this durable job,
+                    // the SQL below would reach its expired production callback.
+                    clock.store(true, Ordering::Relaxed);
+                }
+                if inject_interrupt {
+                    // Independent fault injection: cause a real SQLite interruption while
+                    // executing SQL, without claiming the production query budget requested it.
+                    tx.progress_handler(10_000, Some(|| true));
+                }
+                if fake_expiry.is_some() || inject_interrupt {
+                    tx.query_row("WITH RECURSIVE work(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM work WHERE x<100000) SELECT SUM(x) FROM work", [], |row| row.get::<_, i64>(0))?;
+                }
             }
             let sql_time=started.elapsed();let committing=std::time::Instant::now();
             tx.commit()?; Ok((sql_time,committing.elapsed()))
@@ -574,7 +664,7 @@ impl Store {
     ) -> Result<Vec<Observation>, StoreError> {
         let account = account.map(|a| normalize(&a)).transpose()?;
         let channel = channel.map(|c| normalize(&c)).transpose()?;
-        self.call(move |conn| {
+        self.call_read(Operation::Query, move |conn| {
             let mut sql="SELECT id,session_id,channel,account,kind,received_at,received_at_utc FROM observations WHERE id<?".to_owned();
             let mut values=vec![rusqlite::types::Value::Integer(before.unwrap_or(i64::MAX))];
             if let Some(account)=account {sql.push_str(" AND account=?");values.push(account.into());}
@@ -605,7 +695,7 @@ impl Store {
         range: crate::history::TimeRange,
     ) -> Result<Vec<Session>, StoreError> {
         let channel = normalize(&channel)?;
-        self.call(move |conn| {
+        self.call_read(Operation::Query, move |conn| {
             let mut stmt=conn.prepare("SELECT s.id,sc.channel,s.started_at,s.ended_at,s.end_reason,(SELECT COUNT(*) FROM observations o WHERE o.session_id=s.id AND o.channel=sc.channel),s.end_uncertain,s.closed_recorded_at FROM sessions s JOIN session_channels sc ON s.id=sc.session_id WHERE sc.channel=?1 AND s.id<?2 AND (?4 IS NULL OR COALESCE(s.ended_at,'9999')>?4) AND (?5 IS NULL OR s.started_at<?5) ORDER BY s.id DESC LIMIT ?3")?;
             let rows=stmt.query_map(params![channel,before.unwrap_or(i64::MAX),limit.min(501) as i64,range.from,range.to],|r|Ok(Session{id:r.get(0)?,channel:r.get(1)?,started_at:r.get(2)?,ended_at:r.get(3)?,end_reason:r.get(4)?,observation_count:r.get(5)?,end_uncertain:r.get(6)?,closed_recorded_at:r.get(7)?}))?;
             Ok(rows.collect::<Result<Vec<_>,_>>()?)
@@ -638,7 +728,7 @@ impl Store {
     ) -> Result<Vec<Relationship>, StoreError> {
         let account = account.map(|a| normalize(&a)).transpose()?;
         let channel = channel.map(|c| normalize(&c)).transpose()?;
-        self.call(move |conn| {
+        self.call_read(Operation::Query, move |conn| {
             let filtered=range.from.is_some()||range.to.is_some();
             let mut sql=if filtered {"SELECT channel,account,MIN(received_at_utc),MAX(received_at_utc),COUNT(*) FROM observations WHERE account IS NOT NULL"}else{"SELECT channel,account,first_observed_at,last_observed_at,observation_count FROM relationships WHERE 1=1"}.to_owned();
             let mut values=Vec::<rusqlite::types::Value>::new();
@@ -656,7 +746,7 @@ impl Store {
 
     pub async fn stats(&self) -> Result<StorageStats, StoreError> {
         let path = self.path.clone();
-        self.call(move |conn| {
+        self.call_read(Operation::Query, move |conn| {
             let (observation_count, session_count) = conn.query_row(
                 "SELECT observation_count,session_count FROM collection_totals WHERE id=1",
                 [],
@@ -680,7 +770,7 @@ impl Store {
     }
 
     pub async fn checkpoint(&self) -> Result<(), StoreError> {
-        self.call_named(Operation::Checkpoint, |conn| {
+        self.call_write(Operation::Checkpoint, |conn| {
             let state: (i64, i64, i64) =
                 conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -805,7 +895,10 @@ mod tests {
             )
             .await
             .unwrap();
-        store.call(crate::history::recompute).await.unwrap();
+        store
+            .call_write(Operation::Initialize, crate::history::recompute)
+            .await
+            .unwrap();
         assert!(store
             .presence("example".into(), None, "2026-01-01T00:01:30Z".into(), 0, 10)
             .await
@@ -887,7 +980,10 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        store.call(crate::history::recompute).await.unwrap();
+        store
+            .call_write(Operation::Initialize, crate::history::recompute)
+            .await
+            .unwrap();
         assert!(store.visits(query()).await.unwrap()[0].out_of_order);
         let empty = store
             .begin_session_at(vec!["example".into()], "2026-01-01T00:10:00Z".into())
@@ -959,7 +1055,10 @@ mod tests {
             .unwrap();
         for recompute in [false, true] {
             if recompute {
-                store.call(crate::history::recompute).await.unwrap();
+                store
+                    .call_write(Operation::Initialize, crate::history::recompute)
+                    .await
+                    .unwrap();
             }
             let (closed,retained_gap,part)=store.call(move|conn|Ok((conn.query_row("SELECT closed_at FROM history_visits WHERE session_id=?1 AND account='alice'",[session],|row|row.get::<_,String>(0))?,conn.query_row("SELECT recorded_at FROM history_boundaries WHERE session_id=?1",[session],|row|row.get::<_,String>(0))?,conn.query_row("SELECT end_observed_at FROM history_visits WHERE session_id=?1 AND account='bob'",[session],|row|row.get::<_,String>(0))?))).await.unwrap();
             assert_eq!(closed, "2026-01-01T00:01:00.000Z");

@@ -18,13 +18,25 @@ const QUEUED_RECORDS: usize = 16;
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Initialize,
-    Generic,
+    Query,
+    ChannelConfiguration,
+    MetadataInitialize,
+    MetadataWrite,
+    SettingsInitialize,
+    SettingsWrite,
     Append,
     SessionBegin,
     SessionEnd,
     RoomState,
     Checkpoint,
     SignalRegistration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobClass {
+    Query,
+    DurableMutation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,12 +82,14 @@ pub struct Record {
     pub event: Event,
     pub phase: Phase,
     pub operation: Operation,
+    pub job_class: Option<JobClass>,
     pub category: Category,
     pub elapsed_ms: u64,
     pub sqlite_primary_code: Option<i32>,
     pub sqlite_extended_code: Option<i32>,
     pub os_error_code: Option<i32>,
-    /// True only when this job's actual progress callback requested interruption.
+    /// True only when the production query-budget callback requested interruption.
+    /// An independently injected SQLite interruption does not set this flag.
     pub progress_interrupt_requested: bool,
     /// Observed after the operation returned; this alone does not establish rollback.
     pub autocommit_after: Option<bool>,
@@ -207,6 +221,7 @@ impl Diagnostics {
     pub(crate) fn storage_failure(
         &self,
         operation: Operation,
+        job_class: JobClass,
         error: &StoreError,
         elapsed: Duration,
         progress_interrupt_requested: bool,
@@ -241,12 +256,18 @@ impl Diagnostics {
             process_id: std::process::id(),
             occurred_at_utc: crate::store::now(),
             event: Event::StorageFailure,
-            phase: if operation == Operation::Initialize {
+            phase: if matches!(
+                operation,
+                Operation::Initialize
+                    | Operation::MetadataInitialize
+                    | Operation::SettingsInitialize
+            ) {
                 Phase::Initialization
             } else {
                 Phase::Storage
             },
             operation,
+            job_class: Some(job_class),
             category,
             elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
             sqlite_primary_code,
@@ -266,6 +287,7 @@ impl Diagnostics {
             event: Event::SignalUnavailable,
             phase: Phase::Shutdown,
             operation: Operation::SignalRegistration,
+            job_class: None,
             category: Category::SignalUnavailable,
             elapsed_ms: 0,
             sqlite_primary_code: None,

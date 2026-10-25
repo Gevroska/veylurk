@@ -1,5 +1,6 @@
 //! Local operating policy and graceful control. Metadata uncertainty never means offline.
 use crate::{
+    diagnostics::Operation,
     metadata::Metadata,
     store::{Store, StoreError},
 };
@@ -62,7 +63,7 @@ impl Runtime {
         shutdown: watch::Sender<bool>,
         port: u16,
     ) -> Result<Self, StoreError> {
-        let mode = store.call(|conn| {
+        let mode = store.call_write(Operation::SettingsInitialize, |conn| {
             conn.execute_batch("CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT OR IGNORE INTO app_settings VALUES ('collection_mode','all');")?;
             let value: String = conn.query_row("SELECT value FROM app_settings WHERE key='collection_mode'", [], |row| row.get(0))?;
             match value.as_str() { "all" => Ok(CollectionMode::All), "live_only" => Ok(CollectionMode::LiveOnly), _ => Err(StoreError::Invalid) }
@@ -180,7 +181,7 @@ async fn update_settings(
     let modes = runtime.mode.clone();
     runtime
         .store
-        .call(move |conn| {
+        .call_write(Operation::SettingsWrite, move |conn| {
             conn.execute(
                 "UPDATE app_settings SET value=?1 WHERE key='collection_mode'",
                 [value],
