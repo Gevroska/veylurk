@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn migration_retains_raw_evidence_and_streams_recomputable_results() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE sessions(id INTEGER PRIMARY KEY,ended_at TEXT,end_reason TEXT);INSERT INTO sessions VALUES(1,'2026-01-01T00:03:00.000Z','shutdown');CREATE TABLE observations(id INTEGER PRIMARY KEY,session_id INTEGER,channel TEXT,account TEXT,kind TEXT,received_at TEXT);INSERT INTO observations VALUES(1,1,'example','alice','names','2026-01-01T02:00:00+02:00'),(2,1,'example','alice','part','2026-01-01T00:02:00Z'),(3,1,'example','bad','names','legacy-invalid-timestamp');").unwrap();
+        conn.execute_batch("CREATE TABLE sessions(id INTEGER PRIMARY KEY,started_at TEXT NOT NULL,ended_at TEXT,end_reason TEXT,end_uncertain INTEGER NOT NULL DEFAULT 0,closed_recorded_at TEXT);INSERT INTO sessions VALUES(1,'2026-01-01T00:00:00.000Z','2026-01-01T00:03:00.000Z','shutdown',0,'2026-01-01T00:03:00.000Z');CREATE TABLE observations(id INTEGER PRIMARY KEY,session_id INTEGER,channel TEXT,account TEXT,kind TEXT,received_at TEXT);INSERT INTO observations VALUES(1,1,'example','alice','names','2026-01-01T02:00:00+02:00'),(2,1,'example','alice','part','2026-01-01T00:02:00Z'),(3,1,'example','bad','names','legacy-invalid-timestamp');").unwrap();
         initialize(&mut conn).unwrap();
         recompute(&mut conn).unwrap();
         let row: (String, String) = conn
