@@ -147,14 +147,140 @@ where
     }
 }
 
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryStage {
+    InitialRooms,
+    AfterFirstStall,
+    AfterSecondStall,
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryTarget<'a> {
+    observations: usize,
+    stage: RecoveryStage,
+    original_budget: Option<&'a Arc<Semaphore>>,
+}
+
+#[derive(serde::Serialize)]
+struct RecoveryStats {
+    observations: i64,
+    sessions: i64,
+    completed_elapsed_ms: u64,
+}
+
+#[derive(Default)]
+struct RecoveryProgress {
+    stats_requests: usize,
+    stats_request_pending: bool,
+    last_stats: Option<RecoveryStats>,
+    last_observation_progress_elapsed_ms: Option<u64>,
+}
+
+fn recovery_health(
+    current: &CollectorStatus,
+    original_budget: Option<&Arc<Semaphore>>,
+) -> serde_json::Value {
+    // Copy only aggregate values and an allowlisted state. Full status contains paths,
+    // channel identities and free-text errors, none of which belong in failure output.
+    let state = match current.state.as_str() {
+        "starting" => "starting",
+        "idle" => "idle",
+        "connecting" => "connecting",
+        "joining" => "joining",
+        "collecting" => "collecting",
+        "membership_unavailable" => "membership_unavailable",
+        "storage_error" => "storage_error",
+        "backoff" => "backoff",
+        "stopped" => "stopped",
+        _ => "other",
+    };
+    serde_json::json!({
+        "state": state,
+        "enabled_rooms": current.enabled_channels,
+        "connected_rooms": current.connected_channels,
+        "has_error": current.last_error.is_some(),
+        "rooms": current.rooms.len(),
+        "collecting_rooms": current.rooms.iter().filter(|room| room.state == "collecting").count(),
+        "gap_rooms": current.rooms.iter().filter(|room| room.state == "gap").count(),
+        "unavailable_rooms": current.rooms.iter().filter(|room| room.state == "unavailable").count(),
+        "rooms_with_error": current.rooms.iter().filter(|room| room.last_error.is_some()).count(),
+        "available_receive_permits": current.receive_budget.as_ref().map(|budget| budget.available_permits()),
+        "same_receive_budget": original_budget.and_then(|original| current.receive_budget.as_ref().map(|budget| Arc::ptr_eq(original, budget))),
+    })
+}
+
+fn recovery_failure_context(
+    store: &Store,
+    health: &SharedStatus,
+    target: RecoveryTarget<'_>,
+    began: Instant,
+    progress: &RecoveryProgress,
+) -> String {
+    let elapsed_ms = began.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    // Never queue another database job or await a status lock after the acceptance deadline.
+    // If SQLite is still blocked, last_stats is explicitly a completed earlier sample.
+    let current = health
+        .try_read()
+        .ok()
+        .map(|state| recovery_health(&state, target.original_budget));
+    serde_json::json!({
+        "schema_version": 1,
+        "stage": target.stage,
+        "recovery_elapsed_ms": elapsed_ms,
+        "expected_observations": target.observations,
+        "expected_sessions": ROOMS,
+        "receive_capacity": RECEIVE_UNITS,
+        "stats_requests": progress.stats_requests,
+        "stats_request_pending": progress.stats_request_pending,
+        "last_completed_stats": progress.last_stats,
+        "last_completed_stats_age_ms": progress.last_stats.as_ref().map(|stats| elapsed_ms.saturating_sub(stats.completed_elapsed_ms)),
+        "last_observation_progress_age_ms": progress.last_observation_progress_elapsed_ms.map(|at| elapsed_ms.saturating_sub(at)),
+        "original_available_receive_permits": target.original_budget.map(|budget| budget.available_permits()),
+        "collector": current,
+        "diagnostics": store.diagnostics(),
+    }).to_string()
+}
+
 async fn recovered(
     store: &Store,
     health: &SharedStatus,
     observations: usize,
+    stage: RecoveryStage,
+    original_budget: Option<&Arc<Semaphore>>,
 ) -> Arc<tokio::sync::Semaphore> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let target = RecoveryTarget {
+        observations,
+        stage,
+        original_budget,
+    };
+    let began = Instant::now();
+    let mut progress = RecoveryProgress::default();
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let stats = store.stats().await.unwrap();
+            progress.stats_requests += 1;
+            progress.stats_request_pending = true;
+            let stats_result = store.stats().await;
+            progress.stats_request_pending = false;
+            let stats = stats_result.unwrap_or_else(|_| {
+                panic!(
+                    "recovery storage statistics failed: {}",
+                    recovery_failure_context(store, health, target, began, &progress)
+                );
+            });
+            let elapsed_ms = began.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            if progress
+                .last_stats
+                .as_ref()
+                .is_none_or(|last| last.observations != stats.observation_count)
+            {
+                progress.last_observation_progress_elapsed_ms = Some(elapsed_ms);
+            }
+            progress.last_stats = Some(RecoveryStats {
+                observations: stats.observation_count,
+                sessions: stats.session_count,
+                completed_elapsed_ms: elapsed_ms,
+            });
             let state = health.read().await;
             let budget = state.receive_budget.clone();
             if stats.observation_count == observations as i64
@@ -180,8 +306,45 @@ async fn recovered(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("all receipts became durable and all receive permits recovered")
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "all receipts became durable and all receive permits recovered: {}",
+            recovery_failure_context(store, health, target, began, &progress)
+        );
+    })
+}
+
+#[test]
+fn recovery_timeout_health_context_contains_only_finite_state_and_aggregates() {
+    let secret = "SECRET_channel_account_path_error";
+    let budget = Arc::new(Semaphore::new(RECEIVE_UNITS - 512));
+    let current = CollectorStatus {
+        state: secret.into(),
+        started_at: secret.into(),
+        storage_path: secret.into(),
+        last_error: Some(secret.into()),
+        active_session_id: Some(1),
+        enabled_channels: ROOMS,
+        connected_channels: ROOMS - 1,
+        evidence_scope: secret,
+        broadcast_metadata: secret,
+        rooms: vec![RoomStatus {
+            channel: secret.into(),
+            state: "gap".into(),
+            last_positive_at: Some(secret.into()),
+            last_error: Some(secret.into()),
+            coverage: secret,
+        }],
+        receive_budget: Some(budget.clone()),
+    };
+    let context = recovery_health(&current, Some(&budget));
+    assert_eq!(context["state"], "other");
+    assert_eq!(context["gap_rooms"], 1);
+    assert_eq!(context["available_receive_permits"], RECEIVE_UNITS - 512);
+    assert_eq!(context["same_receive_budget"], true);
+    assert!(!context.to_string().contains(secret));
+    assert!(context.to_string().len() < 1024);
 }
 
 #[derive(Default)]
@@ -312,7 +475,7 @@ async fn fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls(
             }
             peer.send(Message::text(response)).await.unwrap();
         }
-        let budget = recovered(&store, &health, ROOMS).await;
+        let budget = recovered(&store, &health, ROOMS, RecoveryStage::InitialRooms, None).await;
         assert_durable_integrity(&store, 0, false).await;
 
         for round in 0..2 {
@@ -413,7 +576,8 @@ async fn fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls(
             peer = writer.reunite(reader).expect("reunite the same local WebSocket");
 
             let expected_joins = (round + 1) * RECEIPTS_PER_ROUND;
-            let recovered_budget = recovered(&store, &health, ROOMS + expected_joins).await;
+            let stage = if round == 0 { RecoveryStage::AfterFirstStall } else { RecoveryStage::AfterSecondStall };
+            let recovered_budget = recovered(&store, &health, ROOMS + expected_joins, stage, Some(&budget)).await;
             assert!(Arc::ptr_eq(&budget, &recovered_budget), "the transport did not reconnect");
             assert_durable_integrity(&store, expected_joins, false).await;
         }
