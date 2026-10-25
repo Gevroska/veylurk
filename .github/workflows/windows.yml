@@ -92,6 +92,10 @@ jobs:
             if (-not $ready -or $ready.state -ne 'idle' -or $ready.enabled_channels -ne 0 -or $ready.session_count -ne 0 -or $ready.observation_count -ne 0 -or $ready.storage_health -ne 'available') { throw 'Empty application startup status was invalid' }
             $metadata = Invoke-RestMethod -Uri "$baseUrl/api/metadata/status" -TimeoutSec 2
             if ($metadata.configured -or $metadata.channels.Count -ne 0) { throw 'Offline smoke unexpectedly enabled metadata' }
+            foreach ($kind in @('account', 'channel')) {
+              $suggestions = Invoke-RestMethod -Uri "$baseUrl/api/suggestions?kind=$kind&prefix=fixture&limit=8" -TimeoutSec 2
+              if ($suggestions.kind -cne $kind -or $null -eq $suggestions.suggestions -or @($suggestions.suggestions).Count -ne 0) { throw 'Packaged empty login suggestions contract was invalid' }
+            }
             $timeline = Invoke-RestMethod -Uri "$baseUrl/api/timeline?account=fixture_account" -TimeoutSec 2
             if ($timeline.account -ne 'fixture_account' -or $timeline.intervals.Count -ne 0 -or $timeline.has_more -or $null -ne $timeline.confidence -or $timeline.confidence_status -ne 'not_calibrated' -or $timeline.effective_range.from -ge $timeline.effective_range.to) { throw 'Packaged empty account timeline contract was invalid' }
             $page = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 2

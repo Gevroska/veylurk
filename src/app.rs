@@ -104,6 +104,7 @@ pub fn router(state: AppState, additional: Router) -> Router {
         .route("/api/channels/{login}", patch(enable).delete(remove))
         .route("/api/channels/{login}/history", get(history))
         .route("/api/search", get(search))
+        .route("/api/suggestions", get(suggestions))
         .route("/api/relationships", get(relationships))
         .route("/api/history", get(visits))
         .route("/api/timeline", get(timeline))
@@ -305,6 +306,38 @@ struct Filters {
     at: Option<String>,
     broadcast_id: Option<i64>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuggestionQuery {
+    kind: crate::store::SuggestionKind,
+    prefix: String,
+    limit: Option<usize>,
+}
+
+async fn suggestions(
+    State(state): State<AppState>,
+    query: Result<Query<SuggestionQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let invalid = || {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Supply account or channel, a valid login prefix, and a limit from 1 to 10.",
+        )
+    };
+    let query = query.map_err(|_| invalid())?.0;
+    let rows = state
+        .store
+        .suggestions(query.kind, query.prefix, query.limit.unwrap_or(8))
+        .await
+        .map_err(|error| match error {
+            StoreError::Invalid => invalid(),
+            error => error.into(),
+        })?;
+    Ok(Json(json!({"kind":query.kind,"suggestions":rows})))
+}
+
 fn query_filters(query: Result<Query<Filters>, QueryRejection>) -> Result<Filters, ApiError> {
     query.map(|v| v.0).map_err(|_| {
         ApiError(
@@ -506,6 +539,10 @@ async fn presence(
         json!({"accounts":rows,"at":at,"has_more":more,"next_offset":if more{Some(offset+limit)}else{None},"model_version":crate::history::MODEL_VERSION,"explanation":crate::history::PRESENCE_EXPLANATION}),
     ))
 }
+
+#[cfg(test)]
+#[path = "app_suggestions_tests.rs"]
+mod suggestions_tests;
 
 #[cfg(test)]
 mod tests {

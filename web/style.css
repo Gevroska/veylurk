@@ -156,6 +156,14 @@ main { max-width: 1280px; margin: auto; padding: 1.5rem 1.25rem 3rem; min-height
 .search-form { display: grid; grid-template-columns: 1fr 1fr 140px auto; gap: 1rem; align-items: end; }
 .full-width { grid-column: 1/-1; }
 .field { min-width: 0; }
+.login-autocomplete { position: relative; }
+.login-suggestions { position: absolute; top: calc(100% + .25rem); left: 0; right: 0; z-index: 5; max-height: min(22rem, 55vh); overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--input-border); border-radius: 7px; background: var(--panel); color: var(--text); box-shadow: 0 .35rem .8rem var(--border-soft); scrollbar-color: var(--input-border) var(--panel); }
+.login-suggestions ul { list-style: none; margin: 0; padding: .25rem; }
+.login-suggestions ul:empty { display: none; }
+.login-suggestion { padding: .6rem .7rem; min-height: 44px; border-radius: 4px; overflow-wrap: anywhere; cursor: pointer; }
+.login-suggestion:hover { background: var(--secondary-hover); }
+.login-suggestion[aria-selected="true"] { background: var(--selection); outline: 2px solid var(--focus); outline-offset: -2px; }
+.suggestion-status { padding: .6rem .85rem; margin: 0; color: var(--muted); font-size: .8rem; overflow-wrap: anywhere; }
 .inline-message { min-height: 1.5rem; font-size: .9rem; margin: .75rem 0; }
 .inline-message.error, .notice.error { color: var(--bad-text); }
 .inline-message.success { color: var(--good-text); }

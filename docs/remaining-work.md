@@ -34,6 +34,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Departure and later return | Evidence-supported visits split at PART and collection boundaries. Post-PART delayed NAMES become ambiguous observation-only segments until a JOIN supports a new visit. All boundaries remain uncertain. |
 | Statistical absence estimates | Source-blocked. Silence alone does not close a visit or prove absence. |
 | Search account to channels/broadcasts and reverse | Implemented exact-login filters, range queries and bounded pagination. Broadcast summaries distinguish positive receipts inside the window from uncertain earlier-connected candidates. |
+| Suggest known account and channel logins while typing | Current increment: bounded prefix suggestions from stored names beneath the history and broadcast search fields, with mouse and keyboard selection. Suggestions never query Twitch or change collection settings. Source, automated, packaged and live acceptance remain separate. |
 | Date/time searches | Implemented inclusive From / exclusive Until filters, normalized to UTC with validation. Broadcast intersections cannot leak disjoint time ranges. |
 | Who was present at an instant | Implemented evidence-only view: exact positive receipt / inferred candidate / unknown; future times are rejected, collection outages and departures are not bridged. |
 | Readable timelines | Separate visits retain positive receipt bounds and uncertain ends. The account chart compares channels on a shared axis and clips an account's chart to a selected broadcast. Direct receipt points, patterned inference, departures and unknown periods remain distinct. Automated validation and live rollout are separate gates. See [timeline interpretation](timeline.md). |
@@ -82,7 +83,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 - Preserve the existing database and DPAPI credentials, verify the copied history, then validate optional metadata on genuinely live channels.
 - Check both search directions, historical migration, separate visits, range filters, themes and collection policy on the real package.
 - Login startup/recovery needs an explicitly selected opt-in task on the intended Windows account. It is implemented but is not installed without that choice.
-- Short, intensive 10/25/50-channel performance benchmarks and measured optimization are the current request. Long reliability trials are owner-managed and are not a gate for that work. See [performance evidence](performance.md). Short trials and CI do not establish long-run reliability.
+- The short performance increment passed Windows CI at `88a72ba0`; its owner-approved local rollout preserved history and credentials. Long reliability trials remain owner-managed. See [performance evidence](performance.md). Short trials and CI do not establish long-run reliability. The current interface increment adds stored-login suggestions; validate it separately from the earlier release.
 - Reconsider Community sampling only if a reproducible, permitted autonomous source is demonstrated. Validate freshness, caching, selection bias, population identity and correlation before introducing statistical estimates or adapting sample cadence.
 
 ## Current development evidence

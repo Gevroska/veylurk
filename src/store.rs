@@ -13,6 +13,10 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+#[path = "store_suggestions.rs"]
+mod suggestions;
+pub use suggestions::SuggestionKind;
+
 // Checkpoint less often than SQLite's default 1000 frames: the 50-room retained-history
 // workload measured durable database-file flushes dominating commit time on Windows.
 // At the normal 4096-byte page size this targets about 32 MiB of active WAL. FULL sync

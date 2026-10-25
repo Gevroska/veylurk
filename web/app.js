@@ -8,6 +8,7 @@
   const timelineTime = new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
   const numbers = new Intl.NumberFormat();
   const pendingChannels = new Set();
+  const loginSuggestions = [];
   let channels = [];
   let metadata = null;
   let refreshInProgress = false;
@@ -122,6 +123,11 @@
       throw new Error("Open this interface from the Veylurk local address.");
     }
     const controller = new AbortController();
+    const cancel = () => controller.abort();
+    if (options.signal) {
+      if (options.signal.aborted) controller.abort();
+      else options.signal.addEventListener("abort", cancel, { once: true });
+    }
     const deadline = setTimeout(() => controller.abort(), 15000);
     try {
       const response = await fetch(target.href, {
@@ -142,7 +148,129 @@
       if (error && error.name === "AbortError") throw new Error("The local app took too long to respond. Try again.");
       if (error instanceof TypeError) throw new Error("Cannot reach the local app. Check that Veylurk is still running, then retry.");
       throw error;
-    } finally { clearTimeout(deadline); }
+    } finally {
+      clearTimeout(deadline);
+      if (options.signal) options.signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  function attachLoginSuggestions(id, kind, section, onSelect) {
+    const input = $(id);
+    const popup = $(id + "-suggestions");
+    const list = $(id + "-listbox");
+    const status = $(id + "-suggestion-status");
+    let timer = null;
+    let controller = null;
+    let generation = 0;
+    let dismissed = true;
+    let requestedPrefix = "";
+    let suggestions = [];
+    let highlighted = -1;
+    const prefix = () => input.value.trim().toLowerCase();
+    const current = (request, query) => request === generation && !dismissed &&
+      document.activeElement === input && !document.hidden && !$("section-" + section).hidden &&
+      !input.disabled && prefix() === query;
+
+    function dismiss() {
+      generation += 1;
+      dismissed = true;
+      requestedPrefix = "";
+      clearTimeout(timer); timer = null;
+      if (controller) controller.abort();
+      controller = null;
+      suggestions = [];
+      highlighted = -1;
+      popup.hidden = true;
+      list.replaceChildren();
+      status.textContent = "";
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+    }
+
+    function select(index) {
+      if (!current(generation, requestedPrefix) || popup.hidden || !suggestions[index]) return;
+      input.value = suggestions[index];
+      dismiss();
+      onSelect();
+    }
+
+    function render(text, values = []) {
+      suggestions = values;
+      highlighted = -1;
+      input.removeAttribute("aria-activedescendant");
+      list.replaceChildren(...values.map((value, index) => {
+        const option = node("li", value, "login-suggestion");
+        option.id = id + "-suggestion-" + index;
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", "false");
+        // Keep input focus for keyboard and assistive-technology navigation.
+        option.addEventListener("pointerdown", (event) => event.preventDefault());
+        option.addEventListener("click", () => select(index));
+        return option;
+      }));
+      status.textContent = text;
+      popup.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+    }
+
+    function schedule() {
+      dismiss();
+      const query = prefix();
+      if (!/^[a-z0-9_]{1,25}$/.test(query) || document.activeElement !== input ||
+          document.hidden || $("section-" + section).hidden || input.disabled) return;
+      dismissed = false;
+      requestedPrefix = query;
+      const request = generation;
+      timer = setTimeout(async () => {
+        timer = null;
+        if (!current(request, query)) return;
+        const pending = new AbortController();
+        controller = pending;
+        render("Looking for stored " + (kind === "account" ? "accounts" : "channels") + "…");
+        try {
+          const data = await api(url("/api/suggestions", { kind, prefix: query, limit: 8 }), { signal: pending.signal });
+          if (!current(request, query)) return;
+          const values = rows(data, "suggestions");
+          if (data.kind !== kind || values.length > 8 || values.some((value, index) =>
+            typeof value !== "string" || !/^[a-z0-9_]{1,25}$/.test(value) ||
+            !value.startsWith(query) || (index > 0 && values[index - 1] >= value))) {
+            throw new Error("Unexpected login suggestions.");
+          }
+          render(values.length ? `${values.length} stored ${kind}${values.length === 1 ? "" : "s"}. Use the arrow keys to choose.` : `No stored ${kind}s match. You can still enter an exact login.`, values);
+        } catch (_) {
+          if (current(request, query)) render("Suggestions unavailable. You can still enter an exact login.");
+        } finally { if (controller === pending) controller = null; }
+      }, 180);
+    }
+
+    input.addEventListener("input", schedule);
+    input.addEventListener("focus", schedule);
+    input.addEventListener("blur", dismiss);
+    input.addEventListener("keydown", (event) => {
+      if (event.isComposing) return;
+      if (event.key === "Escape") {
+        if (!dismissed) event.preventDefault();
+        dismiss();
+      } else if (event.key === "Tab") dismiss();
+      else if ((event.key === "ArrowDown" || event.key === "ArrowUp") && !popup.hidden && suggestions.length) {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        highlighted = highlighted < 0 ? (direction > 0 ? 0 : suggestions.length - 1) :
+          (highlighted + direction + suggestions.length) % suggestions.length;
+        for (let index = 0; index < list.children.length; index += 1) list.children[index].setAttribute("aria-selected", String(index === highlighted));
+        const option = list.children[highlighted];
+        input.setAttribute("aria-activedescendant", option.id);
+        option.scrollIntoView({ block: "nearest" });
+      } else if (event.key === "Enter" && highlighted >= 0 && !popup.hidden) {
+        event.preventDefault();
+        select(highlighted);
+      }
+    });
+    loginSuggestions.push({ section, dismiss });
+  }
+
+  function dismissLoginSuggestions(section) {
+    for (const suggestions of loginSuggestions) if (!section || suggestions.section === section) suggestions.dismiss();
   }
 
   function rows(data, key) {
@@ -189,6 +317,7 @@
   function showSection() {
     const requested = location.hash.slice(1);
     const section = ["channels", "history", "broadcasts", "health"].includes(requested) ? requested : "channels";
+    for (const suggestions of loginSuggestions) if (suggestions.section !== section) suggestions.dismiss();
     for (const name of ["channels", "history", "broadcasts", "health"]) $("section-" + name).hidden = name !== section;
     for (const link of document.querySelectorAll("[data-section]")) {
       if (link.dataset.section === section) link.setAttribute("aria-current", "page");
@@ -847,6 +976,7 @@
 
   function startSearch(event) {
     if (event) event.preventDefault();
+    dismissLoginSuggestions("history");
     try {
       const account = login($("search-account").value, true);
       const channel = login($("search-channel").value, true);
@@ -934,6 +1064,7 @@
 
   function startBroadcastSearch(event) {
     if (event) event.preventDefault();
+    dismissLoginSuggestions("broadcasts");
     try {
       broadcastQuery = { channel: login($("broadcasts-channel").value, true), account: login($("broadcasts-account").value, true), limit: 50, ...timeRange("broadcasts") };
       $("broadcasts-channel").value = broadcastQuery.channel;
@@ -1009,12 +1140,16 @@
   $("search-form").addEventListener("submit", startSearch);
   $("broadcasts-form").addEventListener("submit", startBroadcastSearch);
   $("refresh-status").addEventListener("click", () => refreshStatus(true));
-  for (const id of ["search-account", "search-channel", "search-limit", "search-from", "search-to"]) $(id).addEventListener("input", () => {
+  function markHistoryFiltersStale() {
     eventsView.markStale(); relationshipsView.markStale(); sessionsView.markStale(); visitsView.markStale(); metadataHistoryView.markStale(); presenceView.markStale(); timelineView.markStale();
-  });
-  for (const id of ["broadcasts-account", "broadcasts-channel", "broadcasts-from", "broadcasts-to"]) $(id).addEventListener("input", () => {
+  }
+  function markBroadcastFiltersStale() {
     broadcastsView.markStale(); broadcastEventsView.markStale(); broadcastAccountsView.markStale(); broadcastVisitsView.markStale(); broadcastTimelineView.markStale();
-  });
+  }
+  for (const id of ["search-account", "search-channel", "search-limit", "search-from", "search-to"]) $(id).addEventListener("input", markHistoryFiltersStale);
+  for (const id of ["broadcasts-account", "broadcasts-channel", "broadcasts-from", "broadcasts-to"]) $(id).addEventListener("input", markBroadcastFiltersStale);
+  for (const [id, kind] of [["search-account", "account"], ["search-channel", "channel"]]) attachLoginSuggestions(id, kind, "history", markHistoryFiltersStale);
+  for (const [id, kind] of [["broadcasts-account", "account"], ["broadcasts-channel", "channel"]]) attachLoginSuggestions(id, kind, "broadcasts", markBroadcastFiltersStale);
   $("open-channel-broadcasts").addEventListener("click", () => {
     if (!searchQuery || !searchQuery.channel) return;
     $("broadcasts-channel").value = searchQuery.channel;
@@ -1024,7 +1159,7 @@
     navigate("broadcasts"); startBroadcastSearch();
   });
   window.addEventListener("hashchange", showSection);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshStatus(); else dismissLoginSuggestions(); });
   showSection();
   refreshStatus();
   setInterval(() => { if (!document.hidden) refreshStatus(); }, 15000);

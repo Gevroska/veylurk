@@ -39,11 +39,22 @@ class Element {
   contains(element) { return descendants(this).includes(element); }
   querySelector(selector) { assert.equal(selector, ".table-wrap"); return descendants(this).slice(1).find((element) => element.classList.contains("table-wrap")) || null; }
   querySelectorAll(selector) { assert.equal(selector, "[data-channel-action]"); return descendants(this).slice(1).filter((element) => element.dataset.channelAction); }
-  focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
+  focus() {
+    if (!this.ownerDocument || this.ownerDocument.activeElement === this) return;
+    const previous = this.ownerDocument.activeElement;
+    this.ownerDocument.activeElement = this;
+    if (previous) void previous.dispatch("blur");
+    void this.dispatch("focus");
+  }
+  blur() { if (this.ownerDocument?.activeElement === this) this.ownerDocument.activeElement = null; void this.dispatch("blur"); }
   setAttribute(key, value) { this.attributes[key] = String(value); if (key === "class") this.className = String(value); }
   removeAttribute(key) { delete this.attributes[key]; }
   addEventListener(name, callback) { this.listeners.set(name, [...(this.listeners.get(name) || []), callback]); }
-  async dispatch(name) { await Promise.all((this.listeners.get(name) || []).map((callback) => callback({ preventDefault() {} }))); }
+  async dispatch(name, details = {}) {
+    const event = { type: name, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...details };
+    await Promise.all((this.listeners.get(name) || []).map((callback) => callback(event)));
+    return event;
+  }
   scrollIntoView() {}
 }
 
@@ -53,13 +64,25 @@ function deferred() { let resolve; const promise = new Promise((done) => { resol
 function event(id, account = "sample_account") { return { id, session_id: 1, account, channel: "sample_channel", kind: "join", received_at: received, source: "twitch_irc" }; }
 
 function createApp(override, origin = "http://127.0.0.1:3131") {
-  const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"/g)].map((match) => [match[2], new Element(match[1])]));
+  const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)].map((match) => {
+    const element = new Element(match[1]); element.id = match[2];
+    for (const attribute of match[0].matchAll(/\s([a-z][a-z0-9-]*)(?:="([^"]*)")?/g)) {
+      element.setAttribute(attribute[1], attribute[2] ?? "");
+      if (attribute[1] === "hidden" || attribute[1] === "disabled") element[attribute[1]] = true;
+    }
+    return [match[2], element];
+  }));
   elements.get("search-limit").value = "50";
   const navigation = ["channels", "history", "broadcasts", "health"].map((section) => {
     const element = new Element("a"); element.dataset.section = section; return element;
   });
   const location = new URL(origin); location.hash = "#channels";
   const calls = [];
+  const documentListeners = new Map();
+  const windowListeners = new Map();
+  const timers = new Map();
+  let now = 0;
+  let nextTimer = 0;
   const document = {
     hidden: false,
     activeElement: null,
@@ -67,7 +90,7 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     createElement(tag) { const element = new Element(tag); element.ownerDocument = document; return element; },
     createElementNS(_namespace, tag) { return this.createElement(tag); },
     querySelectorAll(selector) { assert.equal(selector, "[data-section]"); return navigation; },
-    addEventListener() {},
+    addEventListener(name, callback) { documentListeners.set(name, [...(documentListeners.get(name) || []), callback]); },
   };
   for (const element of elements.values()) element.ownerDocument = document;
   const defaultResponse = (target) => {
@@ -75,6 +98,7 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     if (target.pathname === "/api/channels") return { channels: [{ login: "sample_channel", tracked: true, enabled: true, active_session_id: 1, last_observed_at: received }] };
     if (target.pathname === "/api/metadata/status") return { configured: false, state: "unavailable", channels: [] };
     if (target.pathname === "/api/settings") return { collection_mode: "all", unknown_policy: "collect" };
+    if (target.pathname === "/api/suggestions") return { kind: target.searchParams.get("kind"), suggestions: [] };
     if (target.pathname === "/api/timeline") return timeline();
     if (target.pathname === "/api/history") return { visits: [], has_more: false, next_offset: null };
     if (target.pathname === "/api/presence" || target.pathname.endsWith("/accounts")) return { accounts: [], has_more: false, next_offset: null };
@@ -86,8 +110,10 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
   };
   const context = vm.createContext({
     document, location, Node: Element, URL, URLSearchParams, Intl, Date, Set, Number, Error, TypeError, AbortController,
-    window: { addEventListener() {} },
-    setInterval() { return 1; }, setTimeout() { return 1; }, clearTimeout() {},
+    window: { addEventListener(name, callback) { windowListeners.set(name, [...(windowListeners.get(name) || []), callback]); } },
+    setInterval() { return 1; },
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, at: now + delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
     fetch: async (address, options) => {
       const target = new URL(address); calls.push({ target, options });
       const custom = override ? await override(target, options) : undefined;
@@ -98,7 +124,20 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     },
   });
   vm.runInContext(script, context, { filename: "app.js" });
-  return { elements, calls, document, get: (id) => elements.get(id) };
+  return {
+    elements, calls, document, get: (id) => elements.get(id),
+    navigate(section) { location.hash = "#" + section; for (const callback of windowListeners.get("hashchange") || []) callback(); },
+    visibility(hidden) { document.hidden = hidden; for (const callback of documentListeners.get("visibilitychange") || []) callback(); },
+    async advance(milliseconds) {
+      const until = now + milliseconds;
+      while (true) {
+        const next = [...timers].filter(([, timer]) => timer.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next) break;
+        now = next[1].at; timers.delete(next[0]); void next[1].callback(); await settle();
+      }
+      now = until; await settle();
+    },
+  };
 }
 
 test("untrusted account, channel, title, and error text stays literal", async () => {
@@ -734,4 +773,200 @@ test("disjoint broadcast timeline period reports unknown without manufacturing a
   await app.get("search-form").dispatch("submit"); await settle();
   assert.match(app.get("timeline-results").textContent, /No overlapping timeline period/);
   assert.equal(descendants(app.get("timeline-results")).some((item) => item.tagName === "SVG"), false);
+});
+
+const suggestionCalls = (app) => app.calls.filter((call) => call.target.pathname === "/api/suggestions");
+async function typeLogin(app, id, value) {
+  app.get(id).focus();
+  app.get(id).value = value;
+  await app.get(id).dispatch("input");
+}
+
+test("all four login comboboxes debounce normalized stored prefixes without fetching an account inventory", async () => {
+  const app = createApp((target) => target.pathname === "/api/suggestions" ? {
+    kind: target.searchParams.get("kind"), suggestions: [target.searchParams.get("prefix") + "_known"],
+  } : undefined);
+  await settle();
+  for (const [id, kind, section] of [["search-account", "account", "history"], ["search-channel", "channel", "history"], ["broadcasts-account", "account", "broadcasts"], ["broadcasts-channel", "channel", "broadcasts"]]) {
+    app.navigate(section);
+    const before = suggestionCalls(app).length;
+    await typeLogin(app, id, "  Sa  "); await app.advance(100);
+    await typeLogin(app, id, "  SaM  "); await app.advance(179);
+    assert.equal(suggestionCalls(app).length, before);
+    await app.advance(1);
+    const call = suggestionCalls(app).at(-1);
+    assert.equal(suggestionCalls(app).length, before + 1);
+    assert.equal(call.target.searchParams.get("kind"), kind);
+    assert.equal(call.target.searchParams.get("prefix"), "sam");
+    assert.equal(call.target.searchParams.get("limit"), "8");
+    assert.equal(call.options.mode, "same-origin");
+    assert.equal(call.options.cache, "no-store");
+    assert.equal(app.get(id).attributes.role, "combobox");
+    assert.equal(app.get(id).attributes["aria-autocomplete"], "list");
+    assert.equal(app.get(id).attributes["aria-controls"], id + "-listbox");
+    assert.equal(app.get(id).attributes["aria-expanded"], "true");
+    assert.equal(app.get(id + "-listbox").children[0].textContent, "sam_known");
+    assert.equal(app.document.activeElement, app.get(id));
+  }
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/accounts"), false);
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/search" || call.target.pathname === "/api/broadcasts"), false);
+});
+
+test("empty, invalid, too-long, unfocused and hidden prefixes never request suggestions", async () => {
+  const app = createApp(); await settle(); app.navigate("history");
+  for (const value of ["", " ", "#sam", "@sam", "https://example", "sam-name", "sam name", "é", "a".repeat(26)]) {
+    await typeLogin(app, "search-account", value); await app.advance(200);
+    assert.equal(app.get("search-account-suggestions").hidden, true);
+  }
+  app.get("search-account").blur(); app.get("search-account").value = "sample";
+  await app.get("search-account").dispatch("input"); await app.advance(200);
+  app.navigate("channels"); await typeLogin(app, "search-account", "sample"); await app.advance(200);
+  assert.equal(suggestionCalls(app).length, 0);
+});
+
+test("keyboard navigation retains input focus and Enter accepts only a highlighted login without searching", async () => {
+  const app = createApp((target) => target.pathname === "/api/suggestions" ? { kind: "account", suggestions: ["sample_a", "sample_b"] } : undefined);
+  await settle(); app.navigate("history");
+  app.get("search-channel").value = "other_channel";
+  await typeLogin(app, "search-account", "sample"); await app.advance(180);
+  const input = app.get("search-account");
+  assert.equal((await input.dispatch("keydown", { key: "Enter" })).defaultPrevented, false);
+  assert.equal(input.value, "sample");
+  assert.equal(input.attributes["aria-activedescendant"], undefined);
+  assert.equal((await input.dispatch("keydown", { key: "ArrowUp" })).defaultPrevented, true);
+  assert.equal(input.attributes["aria-activedescendant"], "search-account-suggestion-1");
+  assert.equal(app.get("search-account-listbox").children[1].attributes["aria-selected"], "true");
+  await input.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(input.attributes["aria-activedescendant"], "search-account-suggestion-0");
+  assert.equal(app.get("search-account-listbox").children[1].attributes["aria-selected"], "false");
+  assert.equal(app.document.activeElement, input);
+  assert.equal((await input.dispatch("keydown", { key: "Enter" })).defaultPrevented, true);
+  assert.equal(input.value, "sample_a");
+  assert.equal(app.get("search-channel").value, "other_channel");
+  assert.equal(app.get("search-account-suggestions").hidden, true);
+  assert.equal(input.attributes["aria-expanded"], "false");
+  assert.equal(input.attributes["aria-activedescendant"], undefined);
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/search"), false);
+  await app.advance(300); assert.equal(suggestionCalls(app).length, 1);
+  assert.equal((await input.dispatch("keydown", { key: "Enter" })).defaultPrevented, false);
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(app.calls.find((call) => call.target.pathname === "/api/search").target.searchParams.get("account"), "sample_a");
+});
+
+test("mouse and touch selection fill only their field and keep both forms idle until normal submission", async () => {
+  const app = createApp((target) => target.pathname === "/api/suggestions" ? { kind: target.searchParams.get("kind"), suggestions: ["stored_login"] } : undefined);
+  await settle();
+  for (const [id, other, section, pointerType] of [["search-channel", "search-account", "history", "mouse"], ["broadcasts-account", "broadcasts-channel", "broadcasts", "touch"]]) {
+    app.navigate(section); app.get(other).value = "manual_other";
+    await typeLogin(app, id, "stored"); await app.advance(180);
+    const option = app.get(id + "-listbox").children[0];
+    assert.equal(option.attributes.role, "option");
+    assert.equal((await option.dispatch("pointerdown", { pointerType })).defaultPrevented, true);
+    assert.equal(app.document.activeElement, app.get(id));
+    await option.dispatch("click", { pointerType });
+    assert.equal(app.get(id).value, "stored_login");
+    assert.equal(app.get(other).value, "manual_other");
+    assert.equal(app.get(id + "-suggestions").hidden, true);
+  }
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/search" || call.target.pathname === "/api/broadcasts"), false);
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  const request = app.calls.find((call) => call.target.pathname === "/api/broadcasts");
+  assert.equal(request.target.searchParams.get("account"), "stored_login");
+  assert.equal(request.target.searchParams.get("channel"), "manual_other");
+});
+
+test("a newer prefix aborts the prior suggestion request and rejects a late out-of-order reply", async () => {
+  const old = deferred();
+  const app = createApp((target) => target.pathname === "/api/suggestions" ? target.searchParams.get("prefix") === "sa" ? old.promise : { kind: "account", suggestions: ["sample_new"] } : undefined);
+  await settle(); app.navigate("history");
+  await typeLogin(app, "search-account", "sa"); await app.advance(180);
+  const original = suggestionCalls(app)[0];
+  assert.match(app.get("search-account-suggestion-status").textContent, /Looking for stored accounts/);
+  await typeLogin(app, "search-account", "sam");
+  assert.equal(original.options.signal.aborted, true);
+  assert.equal(app.get("search-account-suggestions").hidden, true);
+  await app.advance(180);
+  assert.equal(app.get("search-account-listbox").children[0].textContent, "sample_new");
+  old.resolve({ kind: "account", suggestions: ["sa_old"] }); await settle();
+  assert.equal(app.get("search-account-listbox").children[0].textContent, "sample_new");
+});
+
+test("Escape, Tab, blur, navigation, submission and a hidden page cancel pending suggestions without reopening", async () => {
+  for (const reason of ["escape", "tab", "blur", "navigate", "submit", "hidden"]) {
+    const pending = deferred();
+    const app = createApp((target) => target.pathname === "/api/suggestions" ? pending.promise : undefined);
+    await settle(); app.navigate("history");
+    await typeLogin(app, "search-account", "sample"); await app.advance(180);
+    const request = suggestionCalls(app)[0];
+    const input = app.get("search-account");
+    if (reason === "escape") assert.equal((await input.dispatch("keydown", { key: "Escape" })).defaultPrevented, true);
+    if (reason === "tab") assert.equal((await input.dispatch("keydown", { key: "Tab" })).defaultPrevented, false);
+    if (reason === "blur") app.get("search-channel").focus();
+    if (reason === "navigate") app.navigate("broadcasts");
+    if (reason === "submit") await app.get("search-form").dispatch("submit");
+    if (reason === "hidden") app.visibility(true);
+    assert.equal(request.options.signal.aborted, true, reason);
+    pending.resolve({ kind: "account", suggestions: ["sample_old"] }); await settle(); await app.advance(300);
+    assert.equal(app.get("search-account-suggestions").hidden, true, reason);
+    assert.equal(input.attributes["aria-expanded"], "false", reason);
+    assert.equal(app.get("search-account-listbox").children.length, 0, reason);
+    assert.equal(suggestionCalls(app).length, 1, reason);
+  }
+});
+
+test("Escape and Tab during the debounce cancel the scheduled lookup", async () => {
+  const app = createApp(); await settle(); app.navigate("broadcasts");
+  for (const key of ["Escape", "Tab"]) {
+    await typeLogin(app, "broadcasts-channel", "sample"); await app.advance(90);
+    await app.get("broadcasts-channel").dispatch("keydown", { key }); await app.advance(300);
+    assert.equal(app.get("broadcasts-channel-suggestions").hidden, true);
+  }
+  assert.equal(suggestionCalls(app).length, 0);
+});
+
+test("empty and unavailable suggestions explain manual entry and never prevent normal searches", async () => {
+  for (const response of [{ kind: "account", suggestions: [] }, { httpStatus: 503, error: { message: "Stored lookup unavailable" } }, new TypeError("offline")]) {
+    const app = createApp((target) => target.pathname === "/api/suggestions" ? response : undefined);
+    await settle(); app.navigate("history");
+    await typeLogin(app, "search-account", "manual_exact"); await app.advance(180);
+    assert.equal(app.get("search-account-suggestions").hidden, false);
+    assert.match(app.get("search-account-suggestion-status").textContent, /still enter an exact login/);
+    assert.equal(app.get("search-account-listbox").children.length, 0);
+    assert.equal((await app.get("search-account").dispatch("keydown", { key: "Enter" })).defaultPrevented, false);
+    await app.get("search-form").dispatch("submit"); await settle();
+    assert.equal(app.calls.find((call) => call.target.pathname === "/api/search").target.searchParams.get("account"), "manual_exact");
+    assert.equal(app.get("search-account-suggestions").hidden, true);
+  }
+});
+
+test("late errors after dismissal stay closed and malformed suggestion payloads remain harmless", async () => {
+  const pending = deferred();
+  const app = createApp((target) => target.pathname === "/api/suggestions" ? pending.promise : undefined);
+  await settle(); app.navigate("broadcasts");
+  await typeLogin(app, "broadcasts-channel", "sample"); await app.advance(180);
+  await app.get("broadcasts-channel").dispatch("keydown", { key: "Escape" });
+  pending.resolve({ httpStatus: 500 }); await settle();
+  assert.equal(app.get("broadcasts-channel-suggestions").hidden, true);
+  assert.equal(app.get("broadcasts-channel-suggestion-status").textContent, "");
+  for (const suggestions of [["<img src=x onerror=alert(1)>"], ["sample_b", "sample_a"], ["sample_a", "sample_a"], ["unrelated"], Array(9).fill("sample_a"), [42]]) {
+    const invalid = createApp((target) => target.pathname === "/api/suggestions" ? { kind: "account", suggestions } : undefined);
+    await settle(); invalid.navigate("history");
+    await typeLogin(invalid, "search-account", "sample"); await invalid.advance(180);
+    assert.match(invalid.get("search-account-suggestion-status").textContent, /Suggestions unavailable/);
+    assert.equal(invalid.get("search-account-listbox").children.length, 0);
+    assert.equal(descendants(invalid.get("search-account-listbox")).some((item) => item.tagName === "IMG"), false);
+  }
+});
+
+test("selecting a stored login marks existing results stale without a new search", async () => {
+  const app = createApp((target) => target.pathname === "/api/suggestions" ? { kind: "account", suggestions: ["sample_known"] } : undefined);
+  await settle(); app.navigate("history");
+  app.get("search-account").value = "sample";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const before = app.calls.filter((call) => call.target.pathname === "/api/search").length;
+  app.get("search-account").focus(); await app.advance(180);
+  await app.get("search-account-listbox").children[0].dispatch("click");
+  assert.equal(app.get("search-results").classList.contains("stale"), true);
+  assert.match(app.get("search-message").textContent, /Filters changed/);
+  assert.equal(app.calls.filter((call) => call.target.pathname === "/api/search").length, before);
 });
