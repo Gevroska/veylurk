@@ -7,8 +7,10 @@ Veylurk accepts up to 50 configured channels. This is a configuration bound, not
 The Windows workflow runs the ignored Rust `scale_workload` tests explicitly in addition to ordinary tests:
 
 ```text
-cargo test --locked scale_workload -- --ignored --nocapture
+cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
 ```
+
+The cases run serially to avoid competing database workloads distorting the measured I/O timings. Each case retains its 120-second elapsed-time guard and reports ingestion, durable commit/checkpoint, query and reopen phases. These guards are fixture limits rather than a production throughput promise.
 
 The workload uses synthetic channel counts of 10, 25 and 50 and timestamped observation histories. It exercises storage, history search, relationship queries, pagination and restart retention. Its test output reports the actual generated record counts and timings. It uses temporary databases without Twitch connections or credentials. CI success checks correctness under the fixture's chosen load; elapsed times from shared GitHub runners are diagnostic measurements, not a stable performance benchmark or service-level guarantee.
 

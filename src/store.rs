@@ -1,6 +1,6 @@
 //! Serialized SQLite access. Account logins are observations, not permanent account IDs.
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
@@ -311,16 +311,43 @@ impl Store {
         session_id: i64,
         observations: Vec<NewObservation>,
     ) -> Result<(), StoreError> {
-        if observations.len() > 10_000 {
+        self.append_sessions(vec![(session_id, observations)]).await
+    }
+
+    /// Commits a bounded flush across independent room sessions atomically. Session identity and
+    /// per-room receipt order are preserved without one FULL-sync commit for every room.
+    pub async fn append_sessions(
+        &self,
+        sessions: Vec<(i64, Vec<NewObservation>)>,
+    ) -> Result<(), StoreError> {
+        self.append_sessions_timed(sessions).await.map(|_| ())
+    }
+
+    // Shared with the opt-in workload so CI can distinguish statement work from durable commit
+    // and automatic WAL checkpoint costs. Timing overhead is constant per flush.
+    pub(crate) async fn append_sessions_timed(
+        &self,
+        sessions: Vec<(i64, Vec<NewObservation>)>,
+    ) -> Result<(Duration, Duration), StoreError> {
+        let count = sessions
+            .iter()
+            .try_fold(0usize, |count, (_, rows)| count.checked_add(rows.len()))
+            .ok_or(StoreError::Invalid)?;
+        if count > 10_000 {
             return Err(StoreError::Invalid);
         }
+        if sessions.is_empty() {
+            return Ok((Duration::ZERO, Duration::ZERO));
+        }
         self.call(move |conn| {
+            let started=std::time::Instant::now();
             let tx=conn.transaction()?;
-            let open: bool=tx.query_row("SELECT ended_at IS NULL FROM sessions WHERE id=?1",[session_id],|r|r.get(0))?;
-            if !open { return Err(StoreError::Invalid); }
-            let count=observations.len() as i64;
             { let mut stmt=tx.prepare_cached("INSERT INTO observations(session_id,channel,account,kind,received_at,received_at_utc) VALUES (?1,?2,?3,?4,?5,?6)")?;
               let mut relationship=tx.prepare_cached("INSERT INTO relationships(channel,account,first_observed_at,last_observed_at,observation_count) VALUES (?1,?2,?3,?3,1) ON CONFLICT(channel,account) DO UPDATE SET first_observed_at=MIN(first_observed_at,excluded.first_observed_at),last_observed_at=MAX(last_observed_at,excluded.last_observed_at),observation_count=observation_count+1")?;
+              let mut session_open=tx.prepare_cached("SELECT ended_at IS NULL FROM sessions WHERE id=?1")?;
+              for (session_id,observations) in sessions {
+              let open:Option<bool>=session_open.query_row([session_id],|r|r.get(0)).optional()?;
+              if open!=Some(true) { return Err(StoreError::Invalid); }
               for event in observations {
                   let stamp=crate::history::utc(&event.received_at)?;
                   let channel=normalize(&event.channel)?;
@@ -329,9 +356,10 @@ impl Store {
                   let id=tx.last_insert_rowid();
                   if let Some(ref account)=account {crate::history::derive(&tx,id,session_id,&channel,account,&event.kind,&stamp)?;}
                   if let Some(account)=account {relationship.execute(params![channel,account,stamp])?;}
-              } }
-            tx.execute("UPDATE collection_totals SET observation_count=observation_count+?1 WHERE id=1",[count])?;
-            tx.commit()?; Ok(())
+              } } }
+            tx.execute("UPDATE collection_totals SET observation_count=observation_count+?1 WHERE id=1",[count as i64])?;
+            let sql_time=started.elapsed();let committing=std::time::Instant::now();
+            tx.commit()?; Ok((sql_time,committing.elapsed()))
         }).await
     }
 
@@ -572,6 +600,103 @@ mod tests {
                 .observation_count,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn multiroom_flush_commits_once_preserves_order_and_rolls_back_every_room_on_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("multiroom.sqlite3"))
+            .await
+            .unwrap();
+        store
+            .track(vec!["first".into(), "second".into()], true)
+            .await
+            .unwrap();
+        let first = store.begin_session(vec!["first".into()]).await.unwrap();
+        let second = store.begin_session(vec!["second".into()]).await.unwrap();
+        let event = |channel: &str, kind: &str| NewObservation {
+            channel: channel.into(),
+            account: Some("alice".into()),
+            kind: kind.into(),
+            received_at: now(),
+        };
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counted = commits.clone();
+        store
+            .call(move |conn| {
+                conn.commit_hook(Some(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    false
+                }));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .append_sessions(vec![
+                (first, vec![event("first", "join"), event("first", "part")]),
+                (second, vec![event("second", "names")]),
+                (first, vec![event("first", "join")]),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        let rows = store.search(None, None, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!((rows[0].session_id, rows[0].kind.as_str()), (first, "join"));
+        assert_eq!(rows[1].session_id, second);
+        assert_eq!(rows[2].kind, "part");
+        assert_eq!(rows[3].kind, "join");
+        // A later invalid session or a room/session mismatch must roll back raw rows,
+        // relationship totals and derived visits already written for earlier rooms.
+        assert!(matches!(
+            store
+                .append_sessions(vec![
+                    (second, vec![event("second", "join")]),
+                    (999999, vec![event("first", "join")])
+                ])
+                .await,
+            Err(StoreError::Invalid)
+        ));
+        assert!(store
+            .append_sessions(vec![
+                (first, vec![event("first", "join")]),
+                (second, vec![event("first", "join")])
+            ])
+            .await
+            .is_err());
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(store.stats().await.unwrap().observation_count, 4);
+        let relationships = store.relationships(None, None, 0, 10).await.unwrap();
+        assert_eq!(
+            relationships
+                .iter()
+                .map(|row| row.observation_count)
+                .sum::<i64>(),
+            4
+        );
+        assert_eq!(
+            store
+                .visits(crate::history::VisitQuery {
+                    limit: 10,
+                    ..crate::history::VisitQuery::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(matches!(
+            store
+                .append_sessions(vec![
+                    (first, vec![event("first", "join"); 6000]),
+                    (second, vec![event("second", "join"); 6000])
+                ])
+                .await,
+            Err(StoreError::Invalid)
+        ));
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

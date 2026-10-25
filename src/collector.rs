@@ -66,20 +66,23 @@ async fn flush_pending(
     sessions: &BTreeMap<String, i64>,
     pending: &mut Vec<NewObservation>,
 ) -> Result<(), crate::store::StoreError> {
-    let mut grouped = BTreeMap::<String, Vec<NewObservation>>::new();
+    let mut grouped = BTreeMap::<i64, Vec<NewObservation>>::new();
+    let mut count = 0;
     for event in std::mem::take(pending) {
-        grouped
-            .entry(event.channel.clone())
-            .or_default()
-            .push(event);
-    }
-    for (channel, events) in grouped {
         let id = *sessions
-            .get(&channel)
+            .get(&event.channel)
             .ok_or(crate::store::StoreError::Invalid)?;
-        for batch in events.chunks(512) {
-            store.append(id, batch.to_vec()).await?;
+        grouped.entry(id).or_default().push(event);
+        count += 1;
+        if count == 512 {
+            store
+                .append_sessions(std::mem::take(&mut grouped).into_iter().collect())
+                .await?;
+            count = 0;
         }
+    }
+    if !grouped.is_empty() {
+        store.append_sessions(grouped.into_iter().collect()).await?;
     }
     Ok(())
 }

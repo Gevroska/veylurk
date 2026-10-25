@@ -167,6 +167,20 @@ main { max-width: 1280px; margin: auto; padding: 1.5rem 1.25rem 3rem; min-height
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); scrollbar-color: var(--input-border) var(--panel); }
 .table-wrap:focus-visible { outline-offset: 3px; }
 table { width: 100%; border-collapse: collapse; text-align: left; font-size: .88rem; }
+.table-wrap table { min-width: 960px; }
+.table-wrap td:first-child { min-width: 160px; }
+#channels-results table { min-width: 1200px; }
+#channels-results td:nth-child(1) { min-width: 180px; }
+#channels-results td:nth-child(2) { min-width: 220px; }
+#channels-results td:nth-child(3) { min-width: 320px; }
+#visits-results table, #broadcast-visits-results table, #broadcast-accounts-results table { min-width: 1240px; }
+#visits-results td:last-child, #broadcast-visits-results td:last-child { min-width: 300px; }
+#broadcast-accounts-results td:nth-child(2) { min-width: 320px; }
+#presence-results td:last-child { min-width: 300px; }
+#metadata-history-results td:nth-child(3) { min-width: 250px; }
+#metadata-history-results td:nth-child(4) { min-width: 200px; }
+#broadcasts-results table { min-width: 1100px; }
+#broadcasts-results td:first-child { min-width: 260px; }
 caption { text-align: left; padding: .8rem 1rem; color: var(--muted); font-size: .84rem; border-bottom: 1px solid var(--border); }
 th { background: var(--table-heading); font-size: .78rem; letter-spacing: .025em; color: var(--muted); font-weight: 650; white-space: nowrap; }
 td, th { padding: .8rem 1rem; border-bottom: 1px solid var(--border-soft); vertical-align: top; }

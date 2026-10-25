@@ -137,10 +137,8 @@ pub fn recompute(conn: &mut Connection) -> Result<(), StoreError> {
                 continue;
             }
             let stamp = utc(&raw).ok();
-            tx.execute(
-                "UPDATE observations SET received_at_utc=?1 WHERE id=?2",
-                params![stamp, id],
-            )?;
+            tx.prepare_cached("UPDATE observations SET received_at_utc=?1 WHERE id=?2")?
+                .execute(params![stamp, id])?;
             if let (Some(account), Some(stamp)) = (row.get::<_, Option<String>>(3)?, stamp) {
                 derive(&tx, id, session, &channel, &account, &kind, &stamp)?;
             }
@@ -185,33 +183,33 @@ pub(crate) fn derive(
     if !matches!(kind, "names" | "join" | "part") {
         return Ok(());
     }
-    let active:Option<(i64,String,String)>=conn.query_row("SELECT id,last_observed_at,start_basis FROM history_visits WHERE session_id=?1 AND channel=?2 AND account=?3 AND end_basis IS NULL ORDER BY id DESC LIMIT 1",params![session,channel,account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    let active:Option<(i64,String,String)>=conn.prepare_cached("SELECT id,last_observed_at,start_basis FROM history_visits WHERE session_id=?1 AND channel=?2 AND account=?3 AND end_basis IS NULL ORDER BY id DESC LIMIT 1")?.query_row(params![session,channel,account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     if kind == "part" {
         if let Some((visit, last, _)) = active {
             let backwards = stamp < last.as_str();
-            conn.execute("UPDATE history_visits SET end_observed_at=?1,closed_at=CASE WHEN ?3 THEN NULL ELSE ?1 END,end_observation_id=?2,end_basis=CASE WHEN ?3 THEN 'out_of_order' ELSE 'part' END,end_reason=CASE WHEN ?3 THEN 'part_receipt_clock_moved_backwards' ELSE 'part_received' END,out_of_order=MAX(out_of_order,?3) WHERE id=?4",params![stamp,id,backwards,visit])?;
+            conn.prepare_cached("UPDATE history_visits SET end_observed_at=?1,closed_at=CASE WHEN ?3 THEN NULL ELSE ?1 END,end_observation_id=?2,end_basis=CASE WHEN ?3 THEN 'out_of_order' ELSE 'part' END,end_reason=CASE WHEN ?3 THEN 'part_receipt_clock_moved_backwards' ELSE 'part_received' END,out_of_order=MAX(out_of_order,?3) WHERE id=?4")?.execute(params![stamp,id,backwards,visit])?;
         }
         return Ok(());
     }
     if let Some((visit, last, basis)) = active {
         if kind == "join" && basis == "uncertain_names" && stamp >= last.as_str() {
-            conn.execute("UPDATE history_visits SET end_basis='join_confirmation',end_reason='join_after_ambiguous_roster',closed_at=?1 WHERE id=?2",params![stamp,visit])?;
-            conn.execute("INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,positive_observation_count) VALUES(?1,?2,?3,?4,?5,?5,?1,?1,'join',1)",params![id,account,channel,session,stamp])?;
+            conn.prepare_cached("UPDATE history_visits SET end_basis='join_confirmation',end_reason='join_after_ambiguous_roster',closed_at=?1 WHERE id=?2")?.execute(params![stamp,visit])?;
+            conn.prepare_cached("INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,positive_observation_count) VALUES(?1,?2,?3,?4,?5,?5,?1,?1,'join',1)")?.execute(params![id,account,channel,session,stamp])?;
             return Ok(());
         }
         if stamp < last.as_str() {
-            conn.execute("UPDATE history_visits SET end_basis='out_of_order',end_reason='receipt_clock_moved_backwards',closed_at=last_observed_at,out_of_order=1 WHERE id=?1",[visit])?;
+            conn.prepare_cached("UPDATE history_visits SET end_basis='out_of_order',end_reason='receipt_clock_moved_backwards',closed_at=last_observed_at,out_of_order=1 WHERE id=?1")?.execute([visit])?;
             let basis = if kind == "names" {
                 "uncertain_names"
             } else {
                 kind
             };
-            conn.execute("INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,positive_observation_count,out_of_order) VALUES(?1,?2,?3,?4,?5,?5,?1,?1,?6,1,1)",params![id,account,channel,session,stamp,basis])?;
+            conn.prepare_cached("INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,positive_observation_count,out_of_order) VALUES(?1,?2,?3,?4,?5,?5,?1,?1,?6,1,1)")?.execute(params![id,account,channel,session,stamp,basis])?;
         } else {
-            conn.execute("UPDATE history_visits SET last_observed_at=?1,last_observation_id=?2,positive_observation_count=positive_observation_count+1,duplicate_or_repeated=1 WHERE id=?3",params![stamp,id,visit])?;
+            conn.prepare_cached("UPDATE history_visits SET last_observed_at=?1,last_observation_id=?2,positive_observation_count=positive_observation_count+1,duplicate_or_repeated=1 WHERE id=?3")?.execute(params![stamp,id,visit])?;
         }
     } else {
-        let prior:Option<(String,Option<String>)>=conn.query_row("SELECT end_basis,end_observed_at FROM history_visits WHERE session_id=?1 AND channel=?2 AND account=?3 ORDER BY id DESC LIMIT 1",params![session,channel,account],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let prior:Option<(String,Option<String>)>=conn.prepare_cached("SELECT end_basis,end_observed_at FROM history_visits WHERE session_id=?1 AND channel=?2 AND account=?3 ORDER BY id DESC LIMIT 1")?.query_row(params![session,channel,account],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let ambiguous = kind == "names"
             && prior
                 .as_ref()
@@ -221,7 +219,7 @@ pub(crate) fn derive(
             .and_then(|(_, at)| at.as_deref())
             .is_some_and(|at| stamp < at);
         let basis = if ambiguous { "uncertain_names" } else { kind };
-        conn.execute("INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,positive_observation_count,out_of_order) VALUES(?1,?2,?3,?4,?5,?5,?1,?1,?6,1,?7)",params![id,account,channel,session,stamp,basis,backwards])?;
+        conn.prepare_cached("INSERT INTO history_visits(id,account,channel,session_id,first_observed_at,last_observed_at,first_observation_id,last_observation_id,start_basis,positive_observation_count,out_of_order) VALUES(?1,?2,?3,?4,?5,?5,?1,?1,?6,1,?7)")?.execute(params![id,account,channel,session,stamp,basis,backwards])?;
     }
     Ok(())
 }
@@ -693,7 +691,19 @@ mod tests {
         let session = store.begin_session(names.clone()).await.unwrap();
         let started = std::time::Instant::now();
         let base = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap();
-        for channel in names {
+        let mut preparation = std::time::Duration::ZERO;
+        let mut sql = std::time::Duration::ZERO;
+        let mut commits = std::time::Duration::ZERO;
+        let mut slowest_append = std::time::Duration::ZERO;
+        let sqlite = store
+            .call(|conn| {
+                Ok(conn.query_row("SELECT sqlite_version()", [], |r| r.get::<_, String>(0))?)
+            })
+            .await
+            .unwrap();
+        eprintln!("Synthetic history workload start: channels={channels}, SQLite={sqlite}, receipts_per_channel=2200");
+        for (index, channel) in names.into_iter().enumerate() {
+            let preparing = std::time::Instant::now();
             let rows = (0..2200)
                 .map(|n| NewObservation {
                     channel: channel.clone(),
@@ -702,8 +712,22 @@ mod tests {
                     received_at: (base + chrono::Duration::hours(n)).to_rfc3339(),
                 })
                 .collect();
-            store.append(session, rows).await.unwrap();
+            preparation += preparing.elapsed();
+            let appending = std::time::Instant::now();
+            let (statement_time, commit_time) = store
+                .append_sessions_timed(vec![(session, rows)])
+                .await
+                .unwrap();
+            let append_time = appending.elapsed();
+            slowest_append = slowest_append.max(append_time);
+            sql += statement_time;
+            commits += commit_time;
+            if index == 0 || (index + 1) % 10 == 0 || index + 1 == channels {
+                eprintln!("Synthetic history ingestion: channels={}, elapsed={:?}, last_SQL={statement_time:?}, last_commit={commit_time:?}, last_append={append_time:?}",index+1,started.elapsed());
+            }
         }
+        eprintln!("Synthetic history phase ingestion: channels={channels}, preparation={preparation:?}, SQL={sql:?}, commit_and_checkpoint={commits:?}, slowest_append={slowest_append:?}, elapsed={:?}",started.elapsed());
+        let querying = std::time::Instant::now();
         let range = TimeRange::parse(
             Some("2024-01-10T00:00:00Z".into()),
             Some("2024-04-01T00:00:00Z".into()),
@@ -743,10 +767,20 @@ mod tests {
             store.stats().await.unwrap().observation_count,
             channels as i64 * 2200
         );
+        eprintln!(
+            "Synthetic history phase bounded_queries: channels={channels}, elapsed={:?}",
+            querying.elapsed()
+        );
+        let metadata_writing = std::time::Instant::now();
         let metadata = crate::metadata::initialize(store.clone()).await.unwrap();
         store.call(|conn| {
             conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<2999) INSERT INTO metadata_checks(channel,checked_at,state,viewer_count) SELECT 'channel0',strftime('%Y-%m-%dT%H:%M:%fZ','2024-01-01','+'||x||' hours'),'live',100+x FROM n;")?;Ok(())
         }).await.unwrap();
+        eprintln!(
+            "Synthetic history phase metadata_write: channels={channels}, elapsed={:?}",
+            metadata_writing.elapsed()
+        );
+        let metadata_querying = std::time::Instant::now();
         use tower::ServiceExt;
         let response=metadata.router().oneshot(axum::http::Request::builder().uri("/api/channels/channel0/metadata/history?limit=19&from=2024-01-10T00:00:00Z&to=2024-04-01T00:00:00Z").body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
@@ -759,12 +793,22 @@ mod tests {
         assert_eq!(history["observations"].as_array().unwrap().len(), 19);
         assert_eq!(history["has_more"], true);
         drop(metadata);
+        eprintln!(
+            "Synthetic history phase metadata_query: channels={channels}, elapsed={:?}",
+            metadata_querying.elapsed()
+        );
+        let closing = std::time::Instant::now();
         store
             .end_session(session, "fixture_shutdown".into())
             .await
             .unwrap();
         store.checkpoint().await.unwrap();
         drop(store);
+        eprintln!(
+            "Synthetic history phase close_checkpoint: channels={channels}, elapsed={:?}",
+            closing.elapsed()
+        );
+        let reopening = std::time::Instant::now();
         let reopened = loop {
             match Store::open(&path).await {
                 Ok(store) => break store,
@@ -789,6 +833,7 @@ mod tests {
                 .len(),
             20
         );
+        eprintln!("Synthetic history phase reopen_and_retention_queries: channels={channels}, elapsed={:?}",reopening.elapsed());
         eprintln!("Synthetic history workload: {channels} channels, {} retained receipts, {:?}; not live resource validation",channels*2200,started.elapsed());
         assert!(started.elapsed().as_secs() < 120);
     }

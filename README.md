@@ -20,7 +20,19 @@ The interface's **Theme** selector defaults to **Auto**, which follows your brow
 
 The HTTP listener binds only to `127.0.0.1`. Changes require requests from the local application's own origin. There is no remote-access mode, account system, or CSV export. The browser receives embedded local assets without third-party scripts or a CDN.
 
-One chat connection serves all enabled channels, with paced JOIN requests, keepalives, bounded queues, and reconnect backoff. A room that fails its initial membership deadline is marked unavailable while healthy rooms continue. It is retried on the next connection; pausing then resuming it requests a configuration reconnect. Configuration changes restart the connection and create a new recorded session. A storage failure stops collection and is shown in status; a retry cannot recover observations that were never saved. A second instance cannot open the same database while the first holds its lock.
+One chat connection serves channels selected by the saved collection policy, with paced JOIN requests, keepalives, bounded queues, and reconnect backoff. Unavailable rooms are retried individually with increasing waits while healthy rooms keep their evidence sessions. Channel changes add or remove rooms without restarting healthy rooms. Each room attempt has a separate recorded session. A storage failure requests graceful process shutdown and a failure exit so optional Task Scheduler supervision can apply its bounded retries; observations that were never saved cannot be recovered. A second instance cannot open the same database while the first holds its lock. Collection health also warns when the database volume has less than 512 MiB available; unavailable disk measurements remain unknown.
+
+## Search by account, channel and time
+
+In **Observation history**, enter an exact account login, channel login, or both. Optional **From** and **Until** fields use your browser's local time and are converted to UTC. From is inclusive and Until is exclusive. Separate visit evidence appears above the raw events, with first/last positive receipts and uncertain boundaries. An observation-only segment following a delayed roster response is labelled ambiguous and is excluded from supported visit counts.
+
+For a channel search, **Inspect chat evidence at a time** distinguishes a positive receipt at the chosen instant from an uncertain prior-connected candidate. Missing evidence is Unknown. Future instants are rejected. The stored metadata table and unconnected viewer-count chart show title/category changes and reported audience samples without interpolating through gaps.
+
+In **Broadcasts**, filter by channel, account and time, then choose **View summary / visits / events**. Summaries distinguish accounts positively observed inside the selected window from inferred-only accounts with an earlier supporting receipt. Unique account counts, supported visits and positive receipt counts are different measures. A visit's full positive evidence bounds can extend beyond the selected window; they are not measured attendance.
+
+The channel overview shows current live/offline/unknown reports separately from chat collection quality. **Chat collection policy** defaults to all enabled channels. **Live channels only** pauses observation only after a fresh successful offline report; unknown, failed or stale metadata keeps observation enabled. Without optional metadata credentials every live state stays unknown, so this policy cannot reliably restrict collection to live broadcasts. Policy and channel settings are retained in SQLite.
+
+The original Community-list sampler, calibrated statistical absence and complete viewer discovery remain unsupported by the current source. See the [requirements and remaining acceptance](docs/remaining-work.md) for the explicit gaps.
 
 ## What the history means
 
@@ -28,7 +40,7 @@ The database retains received NAMES, JOIN, PART, and NAMES-end observations, the
 
 Account search shows channels where that login was observed. Channel search shows the corresponding accounts and events. Relationship summaries give first and last received observations and message counts, not continuous presence or watch duration. A Twitch login is not a permanent account ID: renames cannot be reliably linked using IRC nicknames alone.
 
-Connection history records attempts, endings, and failures separately from account evidence. Time between sessions and periods without reliable delivery remain unknown. A process interruption is recorded on the next database open; the recovery time is not the exact instant the earlier process stopped.
+Connection history records room attempts, endings, and failures separately from account evidence. Versioned derived visits preserve the raw observations and can be recomputed. A PART closes an evidence interval without extending its last positive receipt; a later JOIN can support a separate return. Repeated or delayed NAMES after a recorded departure remain ambiguous. Time between sessions and periods without reliable delivery remain unknown. A process interruption is recorded on the next database open; the recovery time is not the exact instant the earlier process stopped.
 
 History has no automatic expiry. Pausing or removing a channel from tracking retains its searchable history. The database and its SQLite write-ahead log consume increasing disk space. Use `Stop-Veylurk.ps1` followed by `Backup-Veylurk.ps1 -Destination <new-directory>` for a verified offline backup. The backup refuses an active lock or nonempty WAL; copying only the main database while it is running can omit recent records. `Restore-Veylurk.ps1` verifies hashes and restores into a fresh data directory without overwriting existing history. Follow the [maintenance procedure](docs/windows-operation.md#offline-backup), including removing startup before maintenance.
 
@@ -54,7 +66,7 @@ The secret field is masked. **Remember** is unchecked by default: entered creden
 
 The worker uses the [client credentials grant](https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/#client-credentials-grant-flow), validates new tokens and active tokens hourly, and obtains a new app token when needed. App tokens do not have refresh tokens. It checks enabled channels in filtered batches at approximately 60-second intervals, independently from chat collection, and respects rate-limit waits. See [token validation](https://dev.twitch.tv/docs/authentication/validate-tokens/), [Get Streams](https://dev.twitch.tv/docs/api/reference/#get-streams), and [rate limits](https://dev.twitch.tv/docs/api/guide/#twitch-rate-limits).
 
-Broadcast records retain Twitch's stream ID, title changes, reported start, and successful check times. Account-to-broadcast results associate received chat evidence with the same channel between a reported broadcast start and the last confirmed live check. This is a time association, not proof the account watched that broadcast. Unknown periods are not assigned invented broadcasts, and collection gaps remain unknown.
+Broadcast records retain Twitch's stream ID, title/category/language changes, reported start, viewer-count checks and successful check times. Account-to-broadcast results include positive chat receipts between the reported start and last confirmed live check, or explicitly uncertain prior-connected candidates within the selected window and the same evidence session. Supporting receipt times remain visible, and no in-window receipt is fabricated for an inferred-only account. Unknown periods are not assigned invented broadcasts, and collection gaps remain unknown. None of these associations establishes video watching.
 
 ## Build and offline checks
 
@@ -65,13 +77,13 @@ cargo test --locked
 node --test web/app.test.cjs web/theme.test.cjs
 powershell.exe -NoProfile -File scripts/Test-VeylurkLauncher.ps1
 powershell.exe -NoProfile -File scripts/Test-VeylurkOperations.ps1
-cargo test --locked scale_workload -- --ignored --nocapture
+cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
 cargo build --release --locked --bin veylurk
 ```
 
 Node.js is used only for the interface's development tests. The Windows workflow runs these checks, builds release executables, and checks application startup, local APIs, embedded assets, and timed graceful shutdown using an empty temporary database without channels or metadata credentials. Packaged operations additionally check active-lock backup refusal, verified shutdown and offline backup/restore. Startup task fixtures mock Task Scheduler and never install actual tasks. The workflow also checks application and IRC-probe help, then uploads the application, scripts, documentation and bounded probe artifacts. HTTP and WebSocket fixtures use local test servers; they do not need Twitch credentials. Build success and offline tests are distinct from live operation and human acceptance.
 
-The Windows application completed two live, 120-second runs on two channels with clean exits. The first retained 691 observations; the restart loaded those same 691 records and reached 2,083. Account-to-channel and channel-to-account searches passed, and the real interface successfully paused and resumed collection. Peak working set was approximately 18.1 MB across those runs. This is bounded evidence for two channels in that environment, not a guarantee for long histories or dozens of channels.
+An earlier application revision completed two live, 120-second runs on two channels with clean exits. The first retained 691 observations; the restart loaded those same 691 records and reached 2,083. Account-to-channel and channel-to-account searches passed, and the real interface successfully paused and resumed collection. Peak working set was approximately 18.1 MB across those runs. This is bounded evidence for two channels in that environment, not a guarantee for long histories or dozens of channels.
 
 Synthetic 10/25/50-channel workload tests exercise historical queries and restart retention separately from live collection. A real extended live scale trial and login/reboot acceptance remain pending; see [capacity evidence and trial procedure](docs/performance.md).
 

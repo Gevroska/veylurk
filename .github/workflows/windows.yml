@@ -41,7 +41,7 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Exercise synthetic 10, 25 and 50 channel history workloads
-        run: cargo test --locked scale_workload -- --ignored --nocapture
+        run: cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
       - name: Build release application and probes
         run: cargo build --release --locked
       - name: Smoke-check application help without Twitch
