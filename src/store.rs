@@ -35,6 +35,10 @@ mod diagnostics_tests;
 #[path = "store_batch_close_tests.rs"]
 mod batch_close_tests;
 
+#[cfg(test)]
+#[path = "startup_schema_tests.rs"]
+mod startup_schema_tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("SQLite operation failed")]
@@ -177,6 +181,37 @@ fn close_session_in_transaction(
     Ok(())
 }
 
+fn initialize_schema(conn: &mut Connection) -> Result<(), StoreError> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > 1 {
+        return Err(StoreError::Initialize);
+    }
+    crate::history::checked_model_version(conn)?;
+    // Keep durable schema creation and the legacy relationship import in one commit.
+    // Connection PRAGMAs and history recomputation deliberately run outside this transaction.
+    let tx = conn.transaction()?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS channels(login TEXT PRIMARY KEY,tracked INTEGER NOT NULL,enabled INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at TEXT NOT NULL,ended_at TEXT,end_reason TEXT,end_uncertain INTEGER NOT NULL DEFAULT 0,closed_recorded_at TEXT);
+                    CREATE TABLE IF NOT EXISTS session_channels(session_id INTEGER NOT NULL REFERENCES sessions(id),channel TEXT NOT NULL REFERENCES channels(login),collection_state TEXT NOT NULL DEFAULT 'joining',collection_error TEXT,PRIMARY KEY(session_id,channel));
+                    CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id INTEGER NOT NULL,channel TEXT NOT NULL,account TEXT,kind TEXT NOT NULL CHECK(kind IN ('names','join','part','names_end')),received_at TEXT NOT NULL,FOREIGN KEY(session_id,channel) REFERENCES session_channels(session_id,channel));
+                    CREATE INDEX IF NOT EXISTS observations_channel_id ON observations(channel,id);
+                    CREATE INDEX IF NOT EXISTS observations_account_id ON observations(account,id);
+                    CREATE INDEX IF NOT EXISTS observations_account_channel_id ON observations(account,channel,id);
+                    CREATE INDEX IF NOT EXISTS observations_channel_time ON observations(channel,received_at,id);
+                    CREATE INDEX IF NOT EXISTS observations_session ON observations(session_id,channel);
+                    CREATE INDEX IF NOT EXISTS observations_relationship ON observations(channel,account,received_at);
+                    CREATE INDEX IF NOT EXISTS session_channels_channel ON session_channels(channel,session_id);
+                    CREATE TABLE IF NOT EXISTS collection_totals(id INTEGER PRIMARY KEY CHECK(id=1),observation_count INTEGER NOT NULL,session_count INTEGER NOT NULL);
+                    INSERT OR IGNORE INTO collection_totals SELECT 1,(SELECT COUNT(*) FROM observations),(SELECT COUNT(*) FROM sessions);
+                    CREATE TABLE IF NOT EXISTS relationships(channel TEXT NOT NULL,account TEXT NOT NULL,first_observed_at TEXT NOT NULL,last_observed_at TEXT NOT NULL,observation_count INTEGER NOT NULL,PRIMARY KEY(channel,account));
+                    CREATE INDEX IF NOT EXISTS relationships_account ON relationships(account,channel);")?;
+    if version == 0 {
+        tx.execute_batch("INSERT OR IGNORE INTO relationships SELECT channel,account,MIN(received_at),MAX(received_at),COUNT(*) FROM observations WHERE account IS NOT NULL GROUP BY channel,account; PRAGMA user_version=1;")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let diagnostics = Diagnostics::new(path.as_ref());
@@ -205,27 +240,8 @@ impl Store {
                 conn.busy_timeout(Duration::from_secs(5))?;
                 conn.pragma_update(None,"wal_autocheckpoint",WAL_CHECKPOINT_PAGES)?;
                 conn.pragma_update(None,"journal_size_limit",WAL_RETAINED_LIMIT_BYTES)?;
-                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-                    CREATE TABLE IF NOT EXISTS channels(login TEXT PRIMARY KEY,tracked INTEGER NOT NULL,enabled INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
-                    CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at TEXT NOT NULL,ended_at TEXT,end_reason TEXT,end_uncertain INTEGER NOT NULL DEFAULT 0,closed_recorded_at TEXT);
-                    CREATE TABLE IF NOT EXISTS session_channels(session_id INTEGER NOT NULL REFERENCES sessions(id),channel TEXT NOT NULL REFERENCES channels(login),collection_state TEXT NOT NULL DEFAULT 'joining',collection_error TEXT,PRIMARY KEY(session_id,channel));
-                    CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id INTEGER NOT NULL,channel TEXT NOT NULL,account TEXT,kind TEXT NOT NULL CHECK(kind IN ('names','join','part','names_end')),received_at TEXT NOT NULL,FOREIGN KEY(session_id,channel) REFERENCES session_channels(session_id,channel));
-                    CREATE INDEX IF NOT EXISTS observations_channel_id ON observations(channel,id);
-                    CREATE INDEX IF NOT EXISTS observations_account_id ON observations(account,id);
-                    CREATE INDEX IF NOT EXISTS observations_account_channel_id ON observations(account,channel,id);
-                    CREATE INDEX IF NOT EXISTS observations_channel_time ON observations(channel,received_at,id);
-                    CREATE INDEX IF NOT EXISTS observations_session ON observations(session_id,channel);
-                    CREATE INDEX IF NOT EXISTS observations_relationship ON observations(channel,account,received_at);
-                    CREATE INDEX IF NOT EXISTS session_channels_channel ON session_channels(channel,session_id);
-                    CREATE TABLE IF NOT EXISTS collection_totals(id INTEGER PRIMARY KEY CHECK(id=1),observation_count INTEGER NOT NULL,session_count INTEGER NOT NULL);
-                    INSERT OR IGNORE INTO collection_totals SELECT 1,(SELECT COUNT(*) FROM observations),(SELECT COUNT(*) FROM sessions);
-                    CREATE TABLE IF NOT EXISTS relationships(channel TEXT NOT NULL,account TEXT NOT NULL,first_observed_at TEXT NOT NULL,last_observed_at TEXT NOT NULL,observation_count INTEGER NOT NULL,PRIMARY KEY(channel,account));
-                    CREATE INDEX IF NOT EXISTS relationships_account ON relationships(account,channel);")?;
-                let version:i64=conn.pragma_query_value(None,"user_version",|row|row.get(0))?;
-                if version>1 {return Err(StoreError::Initialize);}
-                if version==0 {
-                    conn.execute_batch("BEGIN; INSERT OR IGNORE INTO relationships SELECT channel,account,MIN(received_at),MAX(received_at),COUNT(*) FROM observations WHERE account IS NOT NULL GROUP BY channel,account; PRAGMA user_version=1; COMMIT;")?;
-                }
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+                initialize_schema(&mut conn)?;
                 crate::history::initialize(&mut conn)?;
                 // A process restart closes any session that could not record its own end.
                 conn.execute("UPDATE sessions SET ended_at=COALESCE((SELECT MAX(received_at_utc) FROM observations WHERE session_id=sessions.id),started_at),end_reason='process_interrupted',end_uncertain=1,closed_recorded_at=?1 WHERE ended_at IS NULL", [now()])?;

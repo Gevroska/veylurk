@@ -23,6 +23,8 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const BASE: &str = "2024-01-01T00:00:00.000Z";
 const HOT: &str = "hotaccount";
 const CYCLE: usize = 12;
+const MIXED_READ_LIMIT: usize = 100;
+const MAX_MIXED_READ_SAMPLES: usize = 8192;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkConfig {
@@ -31,6 +33,8 @@ pub struct BenchmarkConfig {
     pub batch_size: usize,
     pub query_repetitions: usize,
     pub max_seconds: u64,
+    pub mixed_reads: bool,
+    pub without_timeline_index: bool,
 }
 
 impl BenchmarkConfig {
@@ -63,9 +67,73 @@ pub struct BenchmarkReport {
     pub timings: Value,
     pub append_windows: Vec<Value>,
     pub queries: Vec<Value>,
+    pub mixed_reads: Value,
+    pub timeline_index_variant: Value,
     pub files: Value,
     pub process: Value,
     pub correctness: Value,
+    pub failures: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct PhaseError {
+    phase: String,
+    error: Box<dyn Error>,
+}
+
+impl std::fmt::Display for PhaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.phase, self.error)
+    }
+}
+
+impl Error for PhaseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+fn in_phase<T, E: Into<Box<dyn Error>>>(
+    phase: impl Into<String>,
+    result: std::result::Result<T, E>,
+) -> Result<T> {
+    result.map_err(|error| {
+        Box::new(PhaseError {
+            phase: phase.into(),
+            error: error.into(),
+        }) as Box<dyn Error>
+    })
+}
+
+fn failure_details(fallback_phase: &str, error: &(dyn Error + 'static)) -> Value {
+    let phase = error
+        .downcast_ref::<PhaseError>()
+        .map(|e| e.phase.as_str())
+        .unwrap_or(fallback_phase);
+    let mut chain = Vec::new();
+    let mut sqlite_extended_code = None;
+    let mut source = Some(error);
+    while let Some(error) = source {
+        chain.push(error.to_string());
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            error.downcast_ref::<rusqlite::Error>()
+        {
+            sqlite_extended_code = Some(code.extended_code);
+        }
+        source = error.source();
+    }
+    json!({"phase":phase,"error_chain":chain,"sqlite_extended_code":sqlite_extended_code})
+}
+
+fn final_wal_bytes(result: std::io::Result<u64>, failures: &mut Vec<Value>) -> Option<u64> {
+    match result {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(error) => {
+            failures.push(failure_details("final_wal_metadata", &error));
+            None
+        }
+    }
 }
 
 fn budget(started: Instant, seconds: u64) -> Result<()> {
@@ -142,7 +210,7 @@ fn distribution(samples: &[Duration]) -> Value {
     json!({"count":values.len(),"sum_ms":values.iter().sum::<f64>(),"p50_ms":percentile(0.50),"p95_ms":percentile(0.95),"p99_ms":percentile(0.99),"max_ms":values.last().copied().unwrap_or(0.0),"percentile_method":"nearest_rank"})
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct FilePeaks {
     database: u64,
     wal: u64,
@@ -161,6 +229,67 @@ impl FilePeaks {
     }
 }
 
+#[derive(Default)]
+struct MixedReadSamples {
+    wall: Vec<Duration>,
+    rows: Vec<Option<usize>>,
+    errors: usize,
+    row_limit_violations: usize,
+}
+
+async fn mixed_read_workload(
+    store: Store,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> MixedReadSamples {
+    let mut samples = MixedReadSamples::default();
+    while samples.wall.len() < MAX_MIXED_READ_SAMPLES && !*stop.borrow() {
+        let reading = Instant::now();
+        // Never cancel an admitted read: finish this one request before considering stop.
+        // This measures the public Store API, including queueing and result delivery.
+        let result = store
+            .visits(VisitQuery {
+                account: Some(HOT.into()),
+                limit: MIXED_READ_LIMIT,
+                ..VisitQuery::default()
+            })
+            .await;
+        samples.wall.push(reading.elapsed());
+        samples.rows.push(result.as_ref().ok().map(Vec::len));
+        match result {
+            Ok(rows) => samples.row_limit_violations += usize::from(rows.len() > MIXED_READ_LIMIT),
+            Err(_) => samples.errors += 1,
+        }
+        if *stop.borrow() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+        }
+    }
+    samples
+}
+
+fn mixed_read_report(enabled: bool, samples: MixedReadSamples) -> Value {
+    json!({
+        "enabled":enabled,
+        "query":"Store.visits(account=hotaccount, limit=100)",
+        "maximum_outstanding_requests":1,
+        "delay_after_each_completed_request_ms":100,
+        "sample_cap":MAX_MIXED_READ_SAMPLES,
+        "sample_cap_reached":samples.wall.len() == MAX_MIXED_READ_SAMPLES,
+        "latency_scope":"public Store request wall time, including queue wait, query execution and result delivery; separate queue and execution timings unavailable",
+        "request_wall_including_queue_and_execution":distribution(&samples.wall),
+        "request_wall_ms":samples.wall.iter().copied().map(millis).collect::<Vec<_>>(),
+        "rows_per_request":samples.rows,
+        "errors":samples.errors,
+        "row_limit_violations":samples.row_limit_violations,
+        "row_limit":MIXED_READ_LIMIT,
+        "scope":"new requests only while ingesting; any last admitted read finishes before session closure; per-flush filesystem sampling is disabled to avoid observer-dependent producer idle windows; no payload serialization or logical fingerprint validation in this measurement"
+    })
+}
+
 async fn settings(store: &Store) -> std::result::Result<Value, StoreError> {
     store.call_read(Operation::Query, |conn| {
         Ok(json!({
@@ -170,7 +299,8 @@ async fn settings(store: &Store) -> std::result::Result<Value, StoreError> {
             "foreign_keys": conn.pragma_query_value(None,"foreign_keys",|r|r.get::<_,i64>(0))?,
             "page_size": conn.pragma_query_value(None,"page_size",|r|r.get::<_,i64>(0))?,
             "wal_autocheckpoint": conn.pragma_query_value(None,"wal_autocheckpoint",|r|r.get::<_,i64>(0))?,
-            "journal_size_limit": conn.pragma_query_value(None,"journal_size_limit",|r|r.get::<_,i64>(0))?
+            "journal_size_limit": conn.pragma_query_value(None,"journal_size_limit",|r|r.get::<_,i64>(0))?,
+            "timeline_index_present": conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='history_visits_end_receipt_scope')",[],|r|r.get::<_,bool>(0))?
         }))
     }).await
 }
@@ -186,10 +316,17 @@ struct PendingQuery {
     payload: std::result::Result<Box<dyn FnOnce() -> Result<Value>>, StoreError>,
 }
 
+fn unvalidated_queries(samples: &[PendingQuery]) -> Vec<Value> {
+    samples.iter().map(|sample| {
+        json!({"name":sample.name,"wall_ms":millis(sample.elapsed),"rows":sample.rows,"has_more":sample.has_more,"before":sample.before,"repetition":sample.repetition,"success":false,"validation_completed":false,"measurement_error":sample.payload.as_ref().err().map(|error| failure_details(sample.name,error))})
+    }).collect()
+}
+
 fn query_sample<T: Serialize + 'static>(
     name: &'static str,
     elapsed: Duration,
     result: std::result::Result<Vec<T>, StoreError>,
+    repetition: usize,
 ) -> PendingQuery {
     let rows = result.as_ref().ok().map(Vec::len);
     let payload = result.map(|rows| {
@@ -201,7 +338,7 @@ fn query_sample<T: Serialize + 'static>(
         rows,
         has_more: None,
         before: None,
-        repetition: 0,
+        repetition,
         payload,
     }
 }
@@ -212,6 +349,7 @@ async fn timeline_sample(
     channel: Option<String>,
     before: Option<i64>,
     end: &str,
+    repetition: usize,
 ) -> PendingQuery {
     let started = Instant::now();
     let result = store
@@ -237,7 +375,7 @@ async fn timeline_sample(
         rows,
         has_more,
         before,
-        repetition: 0,
+        repetition,
         payload,
     }
 }
@@ -247,10 +385,10 @@ async fn query_workload(
     config: &BenchmarkConfig,
     end: &str,
     started: Instant,
-) -> Result<Vec<PendingQuery>> {
-    let mut samples = Vec::new();
+    samples: &mut Vec<PendingQuery>,
+) -> Result<()> {
     // Cursors select representative retained positions; no unbounded timeline walk is timed.
-    let cursors = store.call_read(Operation::Query, |conn| {
+    let cursors = in_phase("after_load_queries.cursor_selection", store.call_read(Operation::Query, |conn| {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM history_visits WHERE account=?1",[HOT],|r|r.get(0))?;
         let mut result = Vec::new();
         for offset in [count / 2, (count - 101).max(0)] {
@@ -258,7 +396,7 @@ async fn query_workload(
             result.push(id);
         }
         Ok(result)
-    }).await?;
+    }).await)?;
     for repetition in 0..config.query_repetitions {
         budget(started, config.max_seconds)?;
         let at = Instant::now();
@@ -274,7 +412,12 @@ async fn query_workload(
             .ok()
             .and_then(|rows| rows.last())
             .map(|v| v.id);
-        samples.push(query_sample("visits_hot_global_first", at.elapsed(), first));
+        samples.push(query_sample(
+            "visits_hot_global_first",
+            at.elapsed(),
+            first,
+            repetition,
+        ));
         budget(started, config.max_seconds)?;
         let at = Instant::now();
         let result = store
@@ -285,7 +428,12 @@ async fn query_workload(
                 ..VisitQuery::default()
             })
             .await;
-        samples.push(query_sample("visits_hot_global_next", at.elapsed(), result));
+        samples.push(query_sample(
+            "visits_hot_global_next",
+            at.elapsed(),
+            result,
+            repetition,
+        ));
         samples.last_mut().unwrap().before = next;
         budget(started, config.max_seconds)?;
         let at = Instant::now();
@@ -297,11 +445,21 @@ async fn query_workload(
                 ..VisitQuery::default()
             })
             .await;
-        samples.push(query_sample("visits_hot_one_room", at.elapsed(), result));
+        samples.push(query_sample(
+            "visits_hot_one_room",
+            at.elapsed(),
+            result,
+            repetition,
+        ));
         budget(started, config.max_seconds)?;
         let at = Instant::now();
         let result = store.search(Some(HOT.into()), None, None, 100).await;
-        samples.push(query_sample("raw_hot_global", at.elapsed(), result));
+        samples.push(query_sample(
+            "raw_hot_global",
+            at.elapsed(),
+            result,
+            repetition,
+        ));
         budget(started, config.max_seconds)?;
         let at = Instant::now();
         let result = store
@@ -316,7 +474,12 @@ async fn query_workload(
                 },
             )
             .await;
-        samples.push(query_sample("raw_one_room_range", at.elapsed(), result));
+        samples.push(query_sample(
+            "raw_one_room_range",
+            at.elapsed(),
+            result,
+            repetition,
+        ));
         budget(started, config.max_seconds)?;
         let at = Instant::now();
         let result = store.relationships(Some(HOT.into()), None, 0, 100).await;
@@ -324,6 +487,7 @@ async fn query_workload(
             "relationships_hot_global",
             at.elapsed(),
             result,
+            repetition,
         ));
         budget(started, config.max_seconds)?;
         let at = Instant::now();
@@ -332,6 +496,7 @@ async fn query_workload(
             "session_history_one_room",
             at.elapsed(),
             result,
+            repetition,
         ));
         budget(started, config.max_seconds)?;
         let at = Instant::now();
@@ -342,7 +507,12 @@ async fn query_workload(
                 ..VisitQuery::default()
             })
             .await;
-        samples.push(query_sample("visits_empty_lookup", at.elapsed(), result));
+        samples.push(query_sample(
+            "visits_empty_lookup",
+            at.elapsed(),
+            result,
+            repetition,
+        ));
         for (name, channel, cursor) in [
             ("timeline_hot_global_first", None, None),
             ("timeline_hot_global_middle", None, Some(cursors[0])),
@@ -354,13 +524,10 @@ async fn query_workload(
             ),
         ] {
             budget(started, config.max_seconds)?;
-            samples.push(timeline_sample(store, name, channel, cursor, end).await);
-        }
-        for sample in samples.iter_mut().rev().take(12) {
-            sample.repetition = repetition;
+            samples.push(timeline_sample(store, name, channel, cursor, end, repetition).await);
         }
     }
-    Ok(samples)
+    Ok(())
 }
 
 struct Identities {
@@ -496,6 +663,7 @@ fn validate_queries(
         match sample.payload {
             Err(error) => {
                 result["error"] = json!(error.to_string());
+                result["error_details"] = failure_details(sample.name, &error);
             }
             Ok(payload) => {
                 let mut payload = payload()?;
@@ -633,68 +801,122 @@ async fn verify(
     started: Instant,
     ids: Arc<Identities>,
 ) -> Result<Value> {
-    budget(started, config.max_seconds)?;
+    in_phase(
+        "verification.observed_counts.budget",
+        budget(started, config.max_seconds),
+    )?;
     let expected = expected(config);
-    let observed = store
-        .call_read(Operation::Query, |conn| {
-            let mut result = serde_json::Map::new();
-            for table in [
-                "channels",
-                "sessions",
-                "session_channels",
-                "observations",
-                "relationships",
-                "history_visits",
-            ] {
-                let count: i64 =
-                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-                result.insert(table.into(), json!(count));
-            }
-            for (name, sql) in [
-                (
-                    "hot_visits",
-                    "SELECT COUNT(*) FROM history_visits WHERE account='hotaccount'",
-                ),
-                (
-                    "positive_receipts",
-                    "SELECT COUNT(*) FROM observations WHERE kind IN ('join','names')",
-                ),
-                (
-                    "part_receipts",
-                    "SELECT COUNT(*) FROM observations WHERE kind='part'",
-                ),
-                (
-                    "ambiguous_visits",
-                    "SELECT COUNT(*) FROM history_visits WHERE start_basis='uncertain_names'",
-                ),
-                (
-                    "out_of_order_visits",
-                    "SELECT COUNT(*) FROM history_visits WHERE out_of_order=1",
-                ),
-                (
-                    "repeated_visits",
-                    "SELECT COUNT(*) FROM history_visits WHERE duplicate_or_repeated=1",
-                ),
-            ] {
-                result.insert(
-                    name.into(),
-                    json!(conn.query_row(sql, [], |r| r.get::<_, i64>(0))?),
-                );
-            }
-            Ok(Value::Object(result))
-        })
-        .await?;
-    budget(started, config.max_seconds)?;
-    let validation = store.call_read(Operation::Query, |conn| {
-        let integrity: String = conn.query_row("PRAGMA integrity_check",[],|r|r.get(0))?;
-        let foreign_key_failures: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check",[],|r|r.get(0))?;
-        let totals: (i64,i64) = conn.query_row("SELECT observation_count,session_count FROM collection_totals WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        let positive_sum: i64 = conn.query_row("SELECT SUM(positive_observation_count) FROM history_visits",[],|r|r.get(0))?;
-        let relationship_sum: i64 = conn.query_row("SELECT SUM(observation_count) FROM relationships",[],|r|r.get(0))?;
-        let open_sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL",[],|r|r.get(0))?;
-        let open_visits: i64 = conn.query_row("SELECT COUNT(*) FROM history_visits WHERE end_basis IS NULL",[],|r|r.get(0))?;
-        Ok(json!({"integrity_check":integrity,"foreign_key_failures":foreign_key_failures,"aggregate_observations":totals.0,"aggregate_sessions":totals.1,"derived_positive_sum":positive_sum,"relationship_observation_sum":relationship_sum,"open_sessions":open_sessions,"open_visits":open_visits}))
-    }).await?;
+    let observed = in_phase(
+        "verification.observed_counts",
+        store
+            .call_read(Operation::Query, |conn| {
+                let mut result = serde_json::Map::new();
+                for table in [
+                    "channels",
+                    "sessions",
+                    "session_channels",
+                    "observations",
+                    "relationships",
+                    "history_visits",
+                ] {
+                    let count: i64 =
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+                    result.insert(table.into(), json!(count));
+                }
+                for (name, sql) in [
+                    (
+                        "hot_visits",
+                        "SELECT COUNT(*) FROM history_visits WHERE account='hotaccount'",
+                    ),
+                    (
+                        "positive_receipts",
+                        "SELECT COUNT(*) FROM observations WHERE kind IN ('join','names')",
+                    ),
+                    (
+                        "part_receipts",
+                        "SELECT COUNT(*) FROM observations WHERE kind='part'",
+                    ),
+                    (
+                        "ambiguous_visits",
+                        "SELECT COUNT(*) FROM history_visits WHERE start_basis='uncertain_names'",
+                    ),
+                    (
+                        "out_of_order_visits",
+                        "SELECT COUNT(*) FROM history_visits WHERE out_of_order=1",
+                    ),
+                    (
+                        "repeated_visits",
+                        "SELECT COUNT(*) FROM history_visits WHERE duplicate_or_repeated=1",
+                    ),
+                ] {
+                    result.insert(
+                        name.into(),
+                        json!(conn.query_row(sql, [], |r| r.get::<_, i64>(0))?),
+                    );
+                }
+                Ok(Value::Object(result))
+            })
+            .await,
+    )?;
+    in_phase(
+        "verification.validation.budget",
+        budget(started, config.max_seconds),
+    )?;
+    let mut validation = serde_json::Map::new();
+    // Verification is separate from timed production queries. Keep each check a read
+    // with the unchanged five-second execution budget, and retain its exact phase.
+    for (name, sql) in [
+        ("integrity_check", "PRAGMA integrity_check"),
+        (
+            "foreign_key_failures",
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+        ),
+        (
+            "aggregate_observations",
+            "SELECT observation_count FROM collection_totals WHERE id=1",
+        ),
+        (
+            "aggregate_sessions",
+            "SELECT session_count FROM collection_totals WHERE id=1",
+        ),
+        (
+            "derived_positive_sum",
+            "SELECT SUM(positive_observation_count) FROM history_visits",
+        ),
+        (
+            "relationship_observation_sum",
+            "SELECT SUM(observation_count) FROM relationships",
+        ),
+        (
+            "open_sessions",
+            "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL",
+        ),
+        (
+            "open_visits",
+            "SELECT COUNT(*) FROM history_visits WHERE end_basis IS NULL",
+        ),
+    ] {
+        in_phase(
+            format!("verification.validation.{name}.budget"),
+            budget(started, config.max_seconds),
+        )?;
+        let value = in_phase(
+            format!("verification.validation.{name}"),
+            store
+                .call_read(Operation::Query, move |conn| {
+                    if name == "integrity_check" {
+                        Ok(json!(
+                            conn.query_row(sql, [], |row| row.get::<_, String>(0))?
+                        ))
+                    } else {
+                        Ok(json!(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?))
+                    }
+                })
+                .await,
+        )?;
+        validation.insert(name.into(), value);
+    }
+    let validation = Value::Object(validation);
     let mut fingerprints = BTreeMap::new();
     // Separate bounded read jobs retain the production five-second query deadline.
     for (label, sql) in [
@@ -706,12 +928,12 @@ async fn verify(
         ("history_boundaries","SELECT channel,reason,recorded_at,session_id,after_observation_id FROM history_boundaries ORDER BY channel,id"),
         ("models_and_totals","SELECT 'totals',observation_count,session_count FROM collection_totals UNION ALL SELECT 'history_model',version,NULL FROM history_model"),
     ] {
-        budget(started, config.max_seconds)?;
+        in_phase(format!("verification.fingerprint.{label}.budget"), budget(started, config.max_seconds))?;
         let ids=ids.clone();
-        let fingerprint = store.call_read(Operation::Query,move |conn| {
+        let fingerprint = in_phase(format!("verification.fingerprint.{label}"), store.call_read(Operation::Query,move |conn| {
             let mut hash = Sha256::new(); hash_rows(conn,&mut hash,label,sql,&ids)?;
             Ok(format!("{:x}",hash.finalize()))
-        }).await?;
+        }).await)?;
         fingerprints.insert(label,fingerprint);
     }
     let encoded = serde_json::to_vec(&fingerprints)?;
@@ -808,6 +1030,23 @@ pub async fn run(output: &Path, config: BenchmarkConfig) -> Result<BenchmarkRepo
     let store = Store::open(&path).await?;
     let open_ms = millis(opening.elapsed());
     budget(started, config.max_seconds)?;
+    let timeline_index_setup_ms = if config.without_timeline_index {
+        let setting_up = Instant::now();
+        // This opt-in variant can reach only the fresh isolated Store created above.
+        in_phase(
+            "timeline_index_variant_setup",
+            store
+                .call_write(Operation::Initialize, |conn| {
+                    conn.execute_batch("DROP INDEX history_visits_end_receipt_scope")?;
+                    Ok(())
+                })
+                .await,
+        )?;
+        millis(setting_up.elapsed())
+    } else {
+        0.0
+    };
+    budget(started, config.max_seconds)?;
     let initial_settings = settings(&store).await?;
     let base = DateTime::parse_from_rfc3339(BASE)?.with_timezone(&Utc);
     let end = stamp(&base, config.events_per_channel + 1);
@@ -835,36 +1074,97 @@ pub async fn run(output: &Path, config: BenchmarkConfig) -> Result<BenchmarkRepo
     let mut sql = Duration::ZERO;
     let mut commits = Duration::ZERO;
     let mut preparing = Duration::ZERO;
+    let mut filesystem_sampling = Duration::ZERO;
+    let mut filesystem_sampling_count = 0usize;
     let ingest_process_before = process_snapshot();
     let ingest_started = Instant::now();
-    for offset in (0..total).step_by(config.batch_size) {
-        budget(started, config.max_seconds)?;
-        let preparation = Instant::now();
-        let mut groups = BTreeMap::<i64, Vec<NewObservation>>::new();
-        for position in offset..(offset + config.batch_size).min(total) {
-            let room = position % config.channels;
-            groups.entry(sessions[room]).or_default().push(event(
-                &names[room],
-                position / config.channels,
-                &base,
-            ));
-        }
-        preparing += preparation.elapsed();
-        let appending = Instant::now();
-        let (sql_time, commit_time) = store
-            .append_sessions_timed(groups.into_iter().collect())
-            .await?;
-        append.push(appending.elapsed());
-        sql += sql_time;
-        commits += commit_time;
-        peaks.sample(&path);
-        let ingested = (offset + config.batch_size).min(total);
-        if append.len() == 1 || append.len() % 50 == 0 || ingested == total {
-            eprintln!("Offline synthetic benchmark: {ingested}/{total} receipts; {}/{} flushes; elapsed {:.2}s",append.len(),flushes,started.elapsed().as_secs_f64());
-        }
+    let (reader_stop, reader_shutdown) = tokio::sync::watch::channel(false);
+    let reader_task = config
+        .mixed_reads
+        .then(|| tokio::spawn(mixed_read_workload(store.clone(), reader_shutdown)));
+    if reader_task.is_some() {
+        // Admit the optional reader once even for the smallest, fastest fixtures.
+        tokio::task::yield_now().await;
     }
-    let ingest_wall_ms = millis(ingest_started.elapsed());
+    let ingest_result: Result<()> = async {
+        for offset in (0..total).step_by(config.batch_size) {
+            budget(started, config.max_seconds)?;
+            let preparation = Instant::now();
+            let mut groups = BTreeMap::<i64, Vec<NewObservation>>::new();
+            for position in offset..(offset + config.batch_size).min(total) {
+                let room = position % config.channels;
+                groups.entry(sessions[room]).or_default().push(event(
+                    &names[room],
+                    position / config.channels,
+                    &base,
+                ));
+            }
+            preparing += preparation.elapsed();
+            let appending = Instant::now();
+            let (sql_time, commit_time) = store
+                .append_sessions_timed(groups.into_iter().collect())
+                .await?;
+            append.push(appending.elapsed());
+            sql += sql_time;
+            commits += commit_time;
+            if !config.mixed_reads {
+                let sampling = Instant::now();
+                let sample_path = path.clone();
+                // Exactly one observer job is awaited at a time. Mixed workloads omit
+                // this pause so batch sizes cannot alter reader contention via sampling.
+                peaks = tokio::task::spawn_blocking(move || {
+                    let mut sampled = peaks;
+                    sampled.sample(&sample_path);
+                    sampled
+                })
+                .await?;
+                filesystem_sampling += sampling.elapsed();
+                filesystem_sampling_count += 1;
+            }
+            let ingested = (offset + config.batch_size).min(total);
+            if !config.mixed_reads
+                && (append.len() == 1 || append.len() % 50 == 0 || ingested == total)
+            {
+                eprintln!("Offline synthetic benchmark: {ingested}/{total} receipts; {}/{} flushes; elapsed {:.2}s",append.len(),flushes,started.elapsed().as_secs_f64());
+            }
+        }
+        Ok(())
+    }
+    .await;
+    reader_stop.send_replace(true);
+    let ingest_wall = ingest_started.elapsed();
     let ingest_process_after = process_snapshot();
+    // Keep the last admitted request's completion out of ingest and session-close timing.
+    // Also join on ingestion errors, so this optional task never outlives this benchmark run.
+    let (mixed_samples, mixed_reader_finish_wall, reader_finish_process) = match reader_task {
+        Some(task) => {
+            let reader_finishing = Instant::now();
+            let samples = task.await?;
+            (samples, reader_finishing.elapsed(), process_snapshot())
+        }
+        None => (
+            MixedReadSamples::default(),
+            Duration::ZERO,
+            ingest_process_after.clone(),
+        ),
+    };
+    ingest_result?;
+    let append_wall_sum: Duration = append.iter().copied().sum();
+    let ingest_excluding_observer = ingest_wall.saturating_sub(filesystem_sampling);
+    let remaining_ingest_overhead = ingest_excluding_observer
+        .saturating_sub(preparing)
+        .saturating_sub(append_wall_sum);
+    let mixed_reads_ok = mixed_samples.errors == 0
+        && mixed_samples.row_limit_violations == 0
+        && (!config.mixed_reads || !mixed_samples.wall.is_empty());
+    let mixed_reads = mixed_read_report(config.mixed_reads, mixed_samples);
+    let sampling_policy = if config.mixed_reads {
+        "phase_boundaries_only"
+    } else {
+        "after_each_flush_and_phase_boundaries"
+    };
+    // The reader has finished and ingest timing has ended before this phase-boundary sample.
+    peaks.sample(&path);
     budget(started, config.max_seconds)?;
     let closing = Instant::now();
     budget(started, config.max_seconds)?;
@@ -884,34 +1184,82 @@ pub async fn run(output: &Path, config: BenchmarkConfig) -> Result<BenchmarkRepo
     let session_close_ms = millis(closing.elapsed());
     let query_process_before = process_snapshot();
     let querying = Instant::now();
-    let pending_queries = query_workload(&store, &config, &end, started).await?;
+    let mut pending_queries = Vec::new();
+    let query_result = query_workload(&store, &config, &end, started, &mut pending_queries).await;
     let query_wall_ms = millis(querying.elapsed());
     let query_process_after = process_snapshot();
-    budget(started, config.max_seconds)?;
+    let mut failures = Vec::new();
+    if let Err(error) = query_result {
+        failures.push(failure_details("after_load_queries", error.as_ref()));
+    }
+    // Preserve all completed measurements even if identity, query-result or full-table
+    // verification subsequently fails. Serialization remains outside the timed queries.
+    let mut queries = unvalidated_queries(&pending_queries);
     let verifying = Instant::now();
-    let ids = identities(&store, &config).await?;
-    budget(started, config.max_seconds)?;
-    let validating_queries = Instant::now();
-    let queries = validate_queries(pending_queries, &config, &ids)?;
-    let query_validation_wall_ms = millis(validating_queries.elapsed());
-    let correctness = verify(&store, &config, started, ids).await?;
+    let mut query_validation_wall_ms = 0.0;
+    let verification_result: Result<Value> = async {
+        in_phase(
+            "verification.identities.budget",
+            budget(started, config.max_seconds),
+        )?;
+        let ids = in_phase("verification.identities", identities(&store, &config).await)?;
+        in_phase(
+            "query_result_validation.budget",
+            budget(started, config.max_seconds),
+        )?;
+        let validating_queries = Instant::now();
+        let validation_result = validate_queries(pending_queries, &config, &ids);
+        query_validation_wall_ms = millis(validating_queries.elapsed());
+        queries = in_phase("query_result_validation", validation_result)?;
+        verify(&store, &config, started, ids).await
+    }
+    .await;
+    let correctness = match verification_result {
+        Ok(correctness) => correctness,
+        Err(error) => {
+            let failure = failure_details("verification", error.as_ref());
+            failures.push(failure.clone());
+            json!({"passed":false,"verification_completed":false,"failure":failure,"expected":expected(&config)})
+        }
+    };
     let verify_wall_ms = millis(verifying.elapsed());
-    budget(started, config.max_seconds)?;
-    let final_settings = settings(&store).await?;
-    budget(started, config.max_seconds)?;
-    peaks.sample(&path);
-    let checkpointing = Instant::now();
-    store.checkpoint().await?;
-    let explicit_checkpoint_ms = millis(checkpointing.elapsed());
-    let final_db = fs::metadata(&path)?.len();
-    let final_wal = fs::metadata(format!("{}-wal", path.display()))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let finalization: Result<(Value, f64)> = async {
+        in_phase("final_settings.budget", budget(started, config.max_seconds))?;
+        let final_settings = in_phase("final_settings", settings(&store).await)?;
+        in_phase(
+            "final_checkpoint.budget",
+            budget(started, config.max_seconds),
+        )?;
+        peaks.sample(&path);
+        let checkpointing = Instant::now();
+        in_phase("final_checkpoint", store.checkpoint().await)?;
+        Ok((final_settings, millis(checkpointing.elapsed())))
+    }
+    .await;
+    let (final_settings, explicit_checkpoint_ms) = match finalization {
+        Ok((settings, elapsed)) => (settings, Some(elapsed)),
+        Err(error) => {
+            failures.push(failure_details("finalization", error.as_ref()));
+            (Value::Null, None)
+        }
+    };
+    let final_db = match fs::metadata(&path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) => {
+            failures.push(failure_details("final_database_metadata", &error));
+            None
+        }
+    };
+    let final_wal = final_wal_bytes(
+        fs::metadata(format!("{}-wal", path.display())).map(|m| m.len()),
+        &mut failures,
+    );
     let final_process = process_snapshot();
     let settings_ok = initial_settings == final_settings
         && final_settings["journal_mode"] == "wal"
         && final_settings["synchronous"] == 2
-        && final_settings["foreign_keys"] == 1;
+        && final_settings["foreign_keys"] == 1
+        && final_settings["timeline_index_present"] == !config.without_timeline_index;
     let mut windows = Vec::new();
     for quarter in 0..4 {
         let from = quarter * append.len() / 4;
@@ -920,20 +1268,32 @@ pub async fn run(output: &Path, config: BenchmarkConfig) -> Result<BenchmarkRepo
     }
     let success = correctness["passed"] == true
         && settings_ok
-        && final_wal == 0
+        && final_wal == Some(0)
+        && mixed_reads_ok
+        && failures.is_empty()
         && queries.iter().all(|q| q["success"] == true);
+    let timeline_index_variant = json!({
+        "without_timeline_index":config.without_timeline_index,
+        "index_name":"history_visits_end_receipt_scope",
+        "setup_wall_ms":timeline_index_setup_ms,
+        "index_present_before_ingest":initial_settings["timeline_index_present"],
+        "comparison_scope":"index-only variant within this executable: opt-in drop happens after fresh Store initialization and before fixture setup; startup and batched session-close optimizations stay enabled in both variants; setup wall is excluded from ingest, append and query measurements; production query budgets and application APIs stay unchanged"
+    });
     Ok(BenchmarkReport {
-        schema_version: 1,
+        schema_version: 2,
         session_close_strategy: "one_atomic_durable_transaction",
         success,
         config,
         provenance: json!({"workload":"offline_synthetic_irc_receipts_v1","network_used":false,"twitch_credentials_used":false,"existing_database_used":false,"live_twitch_throughput_claim":false,"timestamp_base":BASE,"fixture_cycle":"JOIN hot; NAMES hot repeat; JOIN distinct cold; PART hot; ambiguous NAMES hot; JOIN hot confirmation; PART hot; PART cold; JOIN hot return; backwards NAMES hot; JOIN hot confirmation; PART hot","scope":"Store ingestion and query measurements; excludes transport, HTTP, browser, and collection reliability","time_budget":"checked between operations; in-flight durable filesystem operations may finish after the budget"}),
-        timings: json!({"units":"milliseconds","clock":"monotonic wall clock; CPU reported separately","open_wall_ms":open_ms,"session_create_wall_ms":session_create_ms,"ingest_wall_ms":ingest_wall_ms,"preparation_wall_sum_ms":millis(preparing),"append_wall":distribution(&append),"append_sql_wall_sum_ms":millis(sql),"commit_including_automatic_checkpoint_wall_sum_ms":millis(commits),"automatic_checkpoint_separate_timing_available":false,"session_close_wall_ms":session_close_ms,"query_wall_ms":query_wall_ms,"query_result_validation_wall_ms":query_validation_wall_ms,"correctness_wall_ms":verify_wall_ms,"explicit_final_checkpoint_wall_ms":explicit_checkpoint_ms,"total_wall_ms":millis(started.elapsed())}),
+        timings: json!({"units":"milliseconds","clock":"monotonic wall clock; CPU reported separately","open_wall_ms":open_ms,"session_create_wall_ms":session_create_ms,"ingest_wall_ms":millis(ingest_wall),"preparation_wall_sum_ms":millis(preparing),"append_wall":distribution(&append),"append_sql_wall_sum_ms":millis(sql),"commit_including_automatic_checkpoint_wall_sum_ms":millis(commits),"automatic_checkpoint_separate_timing_available":false,"filesystem_sampling_wall_sum_ms":millis(filesystem_sampling),"filesystem_sampling_count_during_ingest":filesystem_sampling_count,"filesystem_sampling_policy":sampling_policy,"filesystem_sampling_scope":"write-only: one awaited spawn_blocking job per flush, including submission, blocking-pool queue, metadata calls and completion delivery; mixed reads: no sampling during ingestion, avoiding observer-dependent producer idle windows","ingest_excluding_filesystem_observer_wall_ms":millis(ingest_excluding_observer),"remaining_ingest_overhead_wall_ms":millis(remaining_ingest_overhead),"ingest_attribution_note":"diagnostic wall accounting only, not production ingestion time or throughput: subtracts timed ingest filesystem observer intervals, receipt preparation and append API waits; mixed runs have zero ingest filesystem observer intervals; remainder includes loop control, progress logging, measurement overhead and scheduling outside append waits; this does not establish a filesystem cause or predict observer-free production performance","mixed_reader_finish_after_ingest_wall_ms":millis(mixed_reader_finish_wall),"session_close_wall_ms":session_close_ms,"query_wall_ms":query_wall_ms,"query_result_validation_wall_ms":query_validation_wall_ms,"correctness_wall_ms":verify_wall_ms,"explicit_final_checkpoint_wall_ms":explicit_checkpoint_ms,"total_wall_ms":millis(started.elapsed())}),
         append_windows: windows,
         queries,
-        files: json!({"peak_database_bytes_sampled_after_each_flush":peaks.database,"peak_wal_bytes_sampled_after_each_flush":peaks.wal,"peak_combined_bytes_sampled_after_each_flush":peaks.combined,"final_database_bytes":final_db,"final_wal_bytes":final_wal,"settings_before":initial_settings,"settings_after":final_settings,"settings_unchanged_and_full_durability":settings_ok}),
-        process: json!({"source":"Windows GetProcessTimes / GetProcessMemoryInfo; null when unavailable","peak_scope":"process lifetime; snapshots identify measurement versus verification phases","private_commit_note":"private committed bytes, not private working set","before":initial_process,"after_ingest":ingest_process_after,"after_queries_before_verification":query_process_after,"after_verification":final_process,"cpu_ingest":cpu_delta(&ingest_process_before,&ingest_process_after),"cpu_queries_excluding_result_validation":cpu_delta(&query_process_before,&query_process_after),"cpu_total":cpu_delta(&initial_process,&final_process)}),
+        mixed_reads,
+        timeline_index_variant,
+        files: json!({"sampled_peak_database_bytes":peaks.database,"sampled_peak_wal_bytes":peaks.wal,"sampled_peak_combined_bytes":peaks.combined,"sampling_policy":sampling_policy,"sampled_peak_scope":"maximum observed at the reported sample points; not a continuous database/WAL peak; mixed runs sample only before ingest, after the final reader finishes, after session closure and before the final checkpoint","final_database_bytes":final_db,"final_wal_bytes":final_wal,"settings_before":initial_settings,"settings_after":final_settings,"settings_unchanged_and_full_durability":settings_ok}),
+        process: json!({"source":"Windows GetProcessTimes / GetProcessMemoryInfo; null when unavailable","peak_scope":"process lifetime; snapshots identify measurement versus verification phases","private_commit_note":"private committed bytes, not private working set","before":initial_process,"after_ingest":ingest_process_after,"after_mixed_reader_finish":reader_finish_process,"after_queries_before_verification":query_process_after,"after_verification":final_process,"cpu_ingest":cpu_delta(&ingest_process_before,&ingest_process_after),"cpu_ingest_scope":"process CPU during ingestion, including filesystem peak sampling, progress logging and any concurrent mixed reader; excludes later reader completion, after-load query validation and logical fingerprint validation","cpu_mixed_reader_finish":cpu_delta(&ingest_process_after,&reader_finish_process),"cpu_queries_excluding_result_validation":cpu_delta(&query_process_before,&query_process_after),"cpu_total":cpu_delta(&initial_process,&final_process)}),
         correctness,
+        failures,
     })
 }
 
@@ -948,13 +1308,79 @@ mod tests {
             batch_size: 128,
             query_repetitions: 2,
             max_seconds: 60,
+            mixed_reads: false,
+            without_timeline_index: false,
         }
+    }
+
+    #[test]
+    fn final_wal_metadata_distinguishes_absence_from_failure() {
+        let mut failures = Vec::new();
+        assert_eq!(final_wal_bytes(Ok(64), &mut failures), Some(64));
+        assert_eq!(
+            final_wal_bytes(Err(std::io::ErrorKind::NotFound.into()), &mut failures),
+            Some(0)
+        );
+        assert!(failures.is_empty());
+        assert_eq!(
+            final_wal_bytes(
+                Err(std::io::ErrorKind::PermissionDenied.into()),
+                &mut failures
+            ),
+            None
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["phase"], "final_wal_metadata");
+        assert!(!failures[0]["error_chain"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_verification_context_retains_prior_query_measurements_and_sqlite_error() {
+        let interrupted = || {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                None,
+            ))
+        };
+        let samples = vec![
+            query_sample(
+                "visits_hot_global_first",
+                Duration::from_millis(2),
+                Ok(vec![1i64]),
+                0,
+            ),
+            query_sample::<i64>(
+                "timeline_hot_global_first",
+                Duration::from_millis(5100),
+                Err(interrupted()),
+                1,
+            ),
+        ];
+        let retained = unvalidated_queries(&samples);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0]["wall_ms"], 2.0);
+        assert_eq!(retained[0]["rows"], 1);
+        assert_eq!(retained[0]["repetition"], 0);
+        assert_eq!(retained[0]["validation_completed"], false);
+        assert_eq!(retained[1]["wall_ms"], 5100.0);
+        assert_eq!(retained[1]["repetition"], 1);
+        assert_eq!(retained[1]["measurement_error"]["sqlite_extended_code"], 9);
+        let error = in_phase::<(), _>(
+            "verification.fingerprint.history_visits",
+            Err(interrupted()),
+        )
+        .unwrap_err();
+        let failure = failure_details("verification", error.as_ref());
+        assert_eq!(failure["phase"], "verification.fingerprint.history_visits");
+        assert_eq!(failure["sqlite_extended_code"], 9);
+        assert!(failure["error_chain"].as_array().unwrap().len() >= 3);
     }
 
     #[test]
     fn workload_guards_and_known_default_totals() {
         let mut c = config();
         assert!(c.validate().is_ok());
+        assert!(!c.without_timeline_index);
         c.channels = 51;
         assert!(c.validate().is_err());
         c = config();
@@ -992,5 +1418,114 @@ mod tests {
             second.correctness["logical_fingerprint_sha256"]
         );
         assert!(run(&parent.path().join("first"), config()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mixed_reads_and_index_variants_preserve_logical_evidence_and_query_results() {
+        let parent = tempfile::tempdir().unwrap();
+        let ordinary = run(&parent.path().join("ordinary"), config())
+            .await
+            .unwrap();
+        let mixed = run(
+            &parent.path().join("mixed"),
+            BenchmarkConfig {
+                mixed_reads: true,
+                ..config()
+            },
+        )
+        .await
+        .unwrap();
+        let without_index = run(
+            &parent.path().join("without-index"),
+            BenchmarkConfig {
+                without_timeline_index: true,
+                ..config()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ordinary.success, "{ordinary:#?}");
+        assert!(mixed.success, "{mixed:#?}");
+        assert!(without_index.success, "{without_index:#?}");
+        assert_eq!(
+            ordinary.timeline_index_variant["without_timeline_index"],
+            false
+        );
+        assert_eq!(ordinary.timeline_index_variant["setup_wall_ms"], 0.0);
+        assert_eq!(
+            ordinary.files["settings_before"]["timeline_index_present"],
+            true
+        );
+        assert_eq!(
+            without_index.files["settings_before"]["timeline_index_present"],
+            false
+        );
+        assert_eq!(
+            without_index.files["settings_after"]["timeline_index_present"],
+            false
+        );
+        assert_eq!(ordinary.mixed_reads["enabled"], false);
+        assert_eq!(
+            ordinary.mixed_reads["request_wall_including_queue_and_execution"]["count"],
+            0
+        );
+        assert_eq!(
+            ordinary.timings["mixed_reader_finish_after_ingest_wall_ms"],
+            0.0
+        );
+        let count = mixed.mixed_reads["request_wall_including_queue_and_execution"]["count"]
+            .as_u64()
+            .unwrap();
+        assert!((1..=MAX_MIXED_READ_SAMPLES as u64).contains(&count));
+        assert_eq!(mixed.mixed_reads["errors"], 0);
+        assert_eq!(mixed.mixed_reads["row_limit_violations"], 0);
+        assert!(mixed.mixed_reads["rows_per_request"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rows| {
+                rows.as_u64()
+                    .is_some_and(|rows| rows <= MIXED_READ_LIMIT as u64)
+            }));
+        assert_eq!(
+            ordinary.correctness["logical_fingerprint_sha256"],
+            mixed.correctness["logical_fingerprint_sha256"]
+        );
+        assert_eq!(
+            ordinary.correctness["table_fingerprints_sha256"],
+            mixed.correctness["table_fingerprints_sha256"]
+        );
+        let query_digests = |report: &BenchmarkReport| {
+            report
+                .queries
+                .iter()
+                .map(|query| (query["name"].clone(), query["result_digest_sha256"].clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(query_digests(&ordinary), query_digests(&mixed));
+        assert_eq!(query_digests(&ordinary), query_digests(&without_index));
+        assert_eq!(
+            ordinary.correctness["logical_fingerprint_sha256"],
+            without_index.correctness["logical_fingerprint_sha256"]
+        );
+        assert_eq!(
+            ordinary.correctness["table_fingerprints_sha256"],
+            without_index.correctness["table_fingerprints_sha256"]
+        );
+        assert_eq!(
+            ordinary.timings["filesystem_sampling_count_during_ingest"],
+            ordinary.timings["append_wall"]["count"]
+        );
+        assert_eq!(mixed.timings["filesystem_sampling_count_during_ingest"], 0);
+        assert_eq!(mixed.timings["filesystem_sampling_wall_sum_ms"], 0.0);
+        assert_eq!(mixed.files["sampling_policy"], "phase_boundaries_only");
+        assert_eq!(
+            mixed.timings["filesystem_sampling_policy"],
+            "phase_boundaries_only"
+        );
+        assert_eq!(
+            ordinary.files["sampling_policy"],
+            "after_each_flush_and_phase_boundaries"
+        );
     }
 }

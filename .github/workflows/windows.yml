@@ -49,12 +49,18 @@ jobs:
         run: cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
       - name: Build release application and probes
         run: cargo build --release --locked
+      - name: Build isolated performance harness for diagnosis
+        id: performance_build
+        if: always() && !cancelled()
+        run: cargo build --release --locked --bin veylurk-perf-bench
       - name: Smoke-check application help without Twitch
         shell: pwsh
         run: |
           .\target\release\veylurk.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'Application help check failed' }
       - name: Verify offline performance harness with a small isolated workload
+        id: performance_smoke
+        if: always() && !cancelled() && steps.performance_build.outcome == 'success'
         shell: pwsh
         run: |
           $benchDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-bench-smoke-' + [guid]::NewGuid().ToString('N'))
@@ -182,6 +188,7 @@ jobs:
           path: target/release/veylurk-irc-probe.exe
           if-no-files-found: error
       - name: Upload offline Windows performance harness
+        if: always() && !cancelled() && steps.performance_smoke.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: veylurk-perf-bench-windows-x64

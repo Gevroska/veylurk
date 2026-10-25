@@ -23,6 +23,12 @@ struct Args {
     query_repetitions: u32,
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=600))]
     max_seconds: u32,
+    /// Issue one bounded hot-account visits read at a time while ingesting.
+    #[arg(long)]
+    mixed_reads: bool,
+    /// Drop only the timeline receipt-scope index in this fresh synthetic database.
+    #[arg(long)]
+    without_timeline_index: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -34,6 +40,8 @@ async fn main() -> ExitCode {
         batch_size: args.batch_size as usize,
         query_repetitions: args.query_repetitions as usize,
         max_seconds: args.max_seconds as u64,
+        mixed_reads: args.mixed_reads,
+        without_timeline_index: args.without_timeline_index,
     };
     let result = async {
         let report = run(&args.output_dir, config).await?;
@@ -77,6 +85,26 @@ mod tests {
         }
         assert!(
             Args::try_parse_from(["bench", "--output-dir", "new", "--batch-size", "2048"]).is_ok()
+        );
+        assert!(
+            !Args::try_parse_from(["bench", "--output-dir", "new"])
+                .unwrap()
+                .mixed_reads
+        );
+        assert!(
+            Args::try_parse_from(["bench", "--output-dir", "new", "--mixed-reads"])
+                .unwrap()
+                .mixed_reads
+        );
+        assert!(
+            !Args::try_parse_from(["bench", "--output-dir", "new"])
+                .unwrap()
+                .without_timeline_index
+        );
+        assert!(
+            Args::try_parse_from(["bench", "--output-dir", "new", "--without-timeline-index"])
+                .unwrap()
+                .without_timeline_index
         );
     }
 }

@@ -83,7 +83,28 @@ fn visit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Visit> {
 }
 const VISIT_COLUMNS: &str = "v.id,v.account,v.channel,v.session_id,v.first_observed_at,v.last_observed_at,v.end_observed_at,v.start_basis,COALESCE(v.end_basis,'open'),v.end_reason,v.positive_observation_count,v.duplicate_or_repeated,v.out_of_order,MAX(0,CAST((julianday(v.last_observed_at)-julianday(v.first_observed_at))*86400+0.0001 AS INTEGER))";
 
+pub(crate) fn checked_model_version(conn: &Connection) -> Result<Option<i64>, StoreError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='history_model')",
+        [],
+        |row| row.get(0),
+    )?;
+    let version = if exists {
+        conn.query_row("SELECT version FROM history_model WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+    } else {
+        None
+    };
+    if version.is_some_and(|version| version > MODEL_VERSION) {
+        return Err(StoreError::Initialize);
+    }
+    Ok(version)
+}
+
 pub(crate) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
+    let version = checked_model_version(conn)?;
     // The source timestamp remains untouched. A normalized projection permits indexed UTC filters.
     let has_utc = {
         let mut stmt = conn.prepare("PRAGMA table_info(observations)")?;
@@ -92,10 +113,11 @@ pub(crate) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         columns.iter().any(|name| name == "received_at_utc")
     };
+    let tx = conn.transaction()?;
     if !has_utc {
-        conn.execute_batch("ALTER TABLE observations ADD COLUMN received_at_utc TEXT;")?;
+        tx.execute_batch("ALTER TABLE observations ADD COLUMN received_at_utc TEXT;")?;
     }
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS observations_utc ON observations(received_at_utc,id);
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS observations_utc ON observations(received_at_utc,id);
         CREATE INDEX IF NOT EXISTS observations_account_utc ON observations(account,received_at_utc,id);
         CREATE INDEX IF NOT EXISTS observations_channel_utc ON observations(channel,received_at_utc,id);
         CREATE TABLE IF NOT EXISTS history_model(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
@@ -106,16 +128,11 @@ pub(crate) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
         CREATE INDEX IF NOT EXISTS history_visits_channel ON history_visits(channel,id);
         CREATE INDEX IF NOT EXISTS history_visits_time ON history_visits(first_observed_at,last_observed_at,id);
         CREATE INDEX IF NOT EXISTS history_visits_scope ON history_visits(session_id,channel,account,id);
+        CREATE INDEX IF NOT EXISTS history_visits_end_receipt_scope ON history_visits(end_observation_id,session_id,channel,account) WHERE end_observation_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS history_visits_gaps ON history_visits(session_id,closed_at) WHERE end_basis='coverage_gap';
         CREATE INDEX IF NOT EXISTS history_visits_open ON history_visits(session_id,channel,account) WHERE end_basis IS NULL;")?;
-    let version: Option<i64> = conn
-        .query_row("SELECT version FROM history_model WHERE id=1", [], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    if version.is_some_and(|version| version > MODEL_VERSION) {
-        return Err(StoreError::Initialize);
-    }
+    tx.commit()?;
+    // Recompute owns its transaction; do not nest it inside schema creation.
     if version != Some(MODEL_VERSION) {
         recompute(conn)?;
     }
