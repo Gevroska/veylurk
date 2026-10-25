@@ -89,7 +89,8 @@ Assert-Rejected { Register-VeylurkStartup $package 9123 } 'An unrelated startup 
 
 # Fake process and listener, plus a mock loopback API. No HTTP connection is made.
 $script:runtime = [pscustomobject]@{ instance_id = 'fixture-instance'; pid = 1234; port = 9123; executable = ('\\?\' + (Join-Path $package 'veylurk.exe')); database = ('\\?\' + $database) }
-$script:app = [pscustomobject]@{ Id = 1234; Path = (Join-Path $package 'veylurk.exe'); Exited = $false; Disposed = $false }
+$script:app = [pscustomobject]@{ Id = 1234; Path = (Join-Path $package 'veylurk.exe'); Exited = $false; Disposed = $false; HandleRead = $false; ExitCode = 0 }
+$script:app | Add-Member ScriptProperty Handle { $this.HandleRead = $true; return [IntPtr]1234 }
 $script:app | Add-Member ScriptMethod WaitForExit { param($Milliseconds) $this.Exited = $true; return $true }
 $script:app | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
 $script:listenerPid = 1234
@@ -100,6 +101,7 @@ function Invoke-RestMethod {
     param($Uri, $TimeoutSec, $Method, $Headers, $ContentType, $Body)
     if ($Method -eq 'Post') {
         $script:postCount++
+        Assert-Fixture $script:app.HandleRead 'Shutdown posted before retaining the process handle.'
         Assert-Fixture ($Uri -eq 'http://127.0.0.1:9123/api/shutdown' -and $Headers.Origin -eq 'http://127.0.0.1:9123' -and $ContentType -eq 'application/json') 'Shutdown request lost origin or JSON guards.'
         Assert-Fixture (($Body | ConvertFrom-Json).instance_id -ceq $script:runtime.instance_id) 'Shutdown did not bind the selected instance.'
         return [pscustomobject]@{ state = 'stopping'; instance_id = $script:runtime.instance_id }
@@ -108,12 +110,24 @@ function Invoke-RestMethod {
 }
 Stop-VeylurkGracefully $package 9123 1
 Assert-Fixture ($script:postCount -eq 1 -and $script:app.Exited -and $script:app.Disposed) 'Shutdown did not wait for the selected app.'
+$script:app.Exited = $false
+$script:app.Disposed = $false
+$script:app.HandleRead = $false
+$script:app.ExitCode = 1
+$shutdownFailure = $null
+try { Stop-VeylurkGracefully $package 9123 1 } catch { $shutdownFailure = $_.Exception.Message }
+Assert-Fixture ($null -ne $shutdownFailure -and $shutdownFailure.Contains('History and WAL were retained')) 'Shutdown claimed success after a failed checkpoint exit.'
+Assert-Fixture ($script:postCount -eq 2 -and $script:app.Exited -and $script:app.Disposed) 'Failed shutdown did not wait and release the retained process.'
+$script:app.ExitCode = $null
+Assert-Rejected { Stop-VeylurkGracefully $package 9123 1 } 'Shutdown accepted an unavailable process exit code.'
+Assert-Fixture ($script:postCount -eq 3) 'Unavailable exit-code fixture did not reach shutdown.'
+$script:app.ExitCode = 0
 $script:listenerPid = 5678
 Assert-Rejected { Stop-VeylurkGracefully $package 9123 1 } 'Shutdown accepted a different listener process.'
-Assert-Fixture ($script:postCount -eq 1) 'Shutdown posted before listener verification.'
+Assert-Fixture ($script:postCount -eq 3) 'Shutdown posted before listener verification.'
 $script:listenerPid = 1234
 $script:runtime.database = Join-Path $root 'other.sqlite3'
 Assert-Rejected { Stop-VeylurkGracefully $package 9123 1 } 'Shutdown accepted a different database.'
-Assert-Fixture ($script:postCount -eq 1) 'Shutdown posted before database verification.'
+Assert-Fixture ($script:postCount -eq 3) 'Shutdown posted before database verification.'
 # Temporary invented fixture files are retained; no real history or startup tasks are touched.
 Write-Output 'Operations fixtures passed: offline locks/WAL, encrypted backup/restore, hash/path rejection, log rotation, mocked startup and verified graceful shutdown.'

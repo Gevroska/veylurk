@@ -26,7 +26,7 @@ Stop the selected package gracefully:
 powershell.exe -NoProfile -File .\Stop-Veylurk.ps1
 ```
 
-Use the same `-Port` if changed. The stop script checks the runtime's database and executable paths, process ID, loopback listener ownership and instance identity. It sends a same-origin JSON shutdown request bound to that instance and waits up to 60 seconds (`-TimeoutSeconds` changes the wait). It never terminates arbitrary processes. If shutdown is still pending, wait and investigate; do not force termination to obtain a backup. The application must finish closing the collector and SQLite worker before an offline backup can succeed.
+Use the same `-Port` if changed. The stop script checks the runtime's database and executable paths, process ID, loopback listener ownership and instance identity. It retains the selected process handle, sends a same-origin JSON shutdown request bound to that instance, waits up to 60 seconds (`-TimeoutSeconds` changes the wait), and requires a successful exit code. It never terminates arbitrary processes. If shutdown is still pending, wait and investigate; do not force termination to obtain a backup. A nonzero exit can indicate that SQLite could not finish its checkpoint, for example because another database reader held it open. The process has ended, but this is not a confirmed clean shutdown: inspect the retained database and WAL, close external readers, then reopen and gracefully stop that same history before backing it up. Do not delete its WAL. The application must finish closing the collector and SQLite worker before an offline backup can succeed.
 
 ## Optional startup at login
 

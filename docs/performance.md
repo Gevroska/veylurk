@@ -10,7 +10,9 @@ The Windows workflow runs the ignored Rust `scale_workload` tests explicitly in 
 cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
 ```
 
-The cases run serially to avoid competing database workloads distorting the measured I/O timings. Each case retains its 120-second elapsed-time guard and reports ingestion, durable commit/checkpoint, query and reopen phases. These guards are fixture limits rather than a production throughput promise.
+The cases run serially to avoid competing database workloads distorting the measured I/O timings. Each case retains its 120-second elapsed-time guard and reports ingestion, durable commit/checkpoint, query and reopen phases. Mixed-room transactions contain at most 512 events, matching the collector. The controlled fixture also requires maximum append stalls below five seconds, WAL use within its 128 MiB budget, and a checked final truncating checkpoint. These guards are fixture limits rather than a production throughput promise.
+
+Storage retains `synchronous=FULL` and one serialized connection. Automatic checkpoints target 8192 WAL frames, approximately 32 MiB with the default 4096-byte pages; recycled file allocation targets 64 MiB. These are checkpoint and reuse targets, not a hard active-WAL cap. A transaction can overshoot the target, and an external database reader can delay checkpoint completion. The SQLite instruction progress handler cannot interrupt a blocked filesystem flush. Slow storage can still produce collection gaps; keep those gaps explicit and retain the WAL if a checkpoint fails.
 
 The workload uses synthetic channel counts of 10, 25 and 50 and timestamped observation histories. It exercises storage, history search, relationship queries, pagination and restart retention. Its test output reports the actual generated record counts and timings. It uses temporary databases without Twitch connections or credentials. CI success checks correctness under the fixture's chosen load; elapsed times from shared GitHub runners are diagnostic measurements, not a stable performance benchmark or service-level guarantee.
 

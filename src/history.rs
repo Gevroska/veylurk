@@ -688,45 +688,79 @@ mod tests {
             .map(|n| format!("channel{n}"))
             .collect::<Vec<_>>();
         store.track(names.clone(), true).await.unwrap();
-        let session = store.begin_session(names.clone()).await.unwrap();
+        let mut sessions = Vec::with_capacity(channels);
+        for name in &names {
+            sessions.push(store.begin_session(vec![name.clone()]).await.unwrap());
+        }
         let started = std::time::Instant::now();
         let base = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap();
         let mut preparation = std::time::Duration::ZERO;
         let mut sql = std::time::Duration::ZERO;
         let mut commits = std::time::Duration::ZERO;
         let mut slowest_append = std::time::Duration::ZERO;
-        let sqlite = store
+        let mut peak_wal_bytes = 0u64;
+        let (sqlite, page_size, checkpoint_pages, wal_retained_limit) = store
             .call(|conn| {
-                Ok(conn.query_row("SELECT sqlite_version()", [], |r| r.get::<_, String>(0))?)
+                Ok((
+                    conn.query_row("SELECT sqlite_version()", [], |r| r.get::<_, String>(0))?,
+                    conn.pragma_query_value(None, "page_size", |r| r.get::<_, i64>(0))?,
+                    conn.pragma_query_value(None, "wal_autocheckpoint", |r| r.get::<_, i64>(0))?,
+                    conn.pragma_query_value(None, "journal_size_limit", |r| r.get::<_, i64>(0))?,
+                ))
             })
             .await
             .unwrap();
-        eprintln!("Synthetic history workload start: channels={channels}, SQLite={sqlite}, receipts_per_channel=2200");
-        for (index, channel) in names.into_iter().enumerate() {
+        let total = channels * 2200;
+        let flush_count = total.div_ceil(512);
+        eprintln!("Synthetic history workload start: channels={channels}, SQLite={sqlite}, receipts_per_channel=2200, global_batch_limit=512, flush_count={flush_count}, page_size={page_size}, checkpoint_pages={checkpoint_pages}, retained_WAL_limit={wal_retained_limit}");
+        for index in 0..flush_count {
             let preparing = std::time::Instant::now();
-            let rows = (0..2200)
-                .map(|n| NewObservation {
-                    channel: channel.clone(),
-                    account: Some(format!("account{}", n / 2)),
-                    kind: if n % 2 == 0 { "join" } else { "part" }.into(),
-                    received_at: (base + chrono::Duration::hours(n)).to_rfc3339(),
-                })
-                .collect();
+            let mut groups = std::collections::BTreeMap::<i64, Vec<NewObservation>>::new();
+            // Interleave rooms as the shared IRC transport can, retaining each room's
+            // receipt order and the collector's actual 512-event global flush bound.
+            for position in index * 512..((index + 1) * 512).min(total) {
+                let room = position % channels;
+                let n = (position / channels) as i64;
+                groups
+                    .entry(sessions[room])
+                    .or_default()
+                    .push(NewObservation {
+                        channel: names[room].clone(),
+                        account: Some(format!("account{}", n / 2)),
+                        kind: if n % 2 == 0 { "join" } else { "part" }.into(),
+                        received_at: (base + chrono::Duration::hours(n)).to_rfc3339(),
+                    });
+            }
             preparation += preparing.elapsed();
             let appending = std::time::Instant::now();
             let (statement_time, commit_time) = store
-                .append_sessions_timed(vec![(session, rows)])
+                .append_sessions_timed(groups.into_iter().collect())
                 .await
                 .unwrap();
             let append_time = appending.elapsed();
             slowest_append = slowest_append.max(append_time);
             sql += statement_time;
             commits += commit_time;
-            if index == 0 || (index + 1) % 10 == 0 || index + 1 == channels {
-                eprintln!("Synthetic history ingestion: channels={}, elapsed={:?}, last_SQL={statement_time:?}, last_commit={commit_time:?}, last_append={append_time:?}",index+1,started.elapsed());
+            peak_wal_bytes = peak_wal_bytes.max(
+                std::fs::metadata(format!("{}-wal", path.display()))
+                    .map(|file| file.len())
+                    .unwrap_or(0),
+            );
+            if index == 0 || (index + 1) % 50 == 0 || index + 1 == flush_count {
+                eprintln!("Synthetic history ingestion: channels={channels}, flush={}/{flush_count}, elapsed={:?}, last_SQL={statement_time:?}, last_commit={commit_time:?}, last_append={append_time:?}",index+1,started.elapsed());
             }
         }
-        eprintln!("Synthetic history phase ingestion: channels={channels}, preparation={preparation:?}, SQL={sql:?}, commit_and_checkpoint={commits:?}, slowest_append={slowest_append:?}, elapsed={:?}",started.elapsed());
+        eprintln!("Synthetic history phase ingestion: channels={channels}, flush_count={flush_count}, preparation={preparation:?}, SQL={sql:?}, commit_and_checkpoint={commits:?}, slowest_append={slowest_append:?}, peak_WAL_bytes={peak_wal_bytes}, elapsed={:?}",started.elapsed());
+        assert!(
+            slowest_append < std::time::Duration::from_secs(5),
+            "a representative 512-event global flush stalled collection for {slowest_append:?}"
+        );
+        // No external reader pins the WAL in this controlled workload. Allow transaction
+        // overshoot above the 32 MiB checkpoint target while detecting runaway growth.
+        assert!(
+            peak_wal_bytes <= 128 * 1024 * 1024,
+            "controlled workload exceeded its 128 MiB WAL budget: {peak_wal_bytes}"
+        );
         let querying = std::time::Instant::now();
         let range = TimeRange::parse(
             Some("2024-01-10T00:00:00Z".into()),
@@ -798,11 +832,20 @@ mod tests {
             metadata_querying.elapsed()
         );
         let closing = std::time::Instant::now();
-        store
-            .end_session(session, "fixture_shutdown".into())
-            .await
-            .unwrap();
+        for session in sessions {
+            store
+                .end_session(session, "fixture_shutdown".into())
+                .await
+                .unwrap();
+        }
         store.checkpoint().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .map(|file| file.len())
+                .unwrap_or(0),
+            0,
+            "explicit checkpoint must truncate WAL before shutdown/backup"
+        );
         drop(store);
         eprintln!(
             "Synthetic history phase close_checkpoint: channels={channels}, elapsed={:?}",

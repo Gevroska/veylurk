@@ -115,6 +115,9 @@ function Stop-VeylurkGracefully {
     $runtime = Get-VeylurkRuntime $Port
     $app = Assert-VeylurkRuntime $PackageDirectory $Port $runtime
     try {
+        # Open and retain the process handle before requesting exit. Otherwise a
+        # short-lived process can disappear before .NET can obtain its exit code.
+        $null = $app.Handle
         # Check again immediately before the mutation; never stop a replacement instance.
         $again = Get-VeylurkRuntime $Port
         if ($again.instance_id -cne $runtime.instance_id) { throw 'The application instance changed. No shutdown was requested.' }
@@ -122,6 +125,10 @@ function Stop-VeylurkGracefully {
         $result = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$Port/api/shutdown" -Headers @{ Origin = "http://127.0.0.1:$Port" } -ContentType 'application/json' -Body $body -TimeoutSec 5
         if ($result.instance_id -cne $runtime.instance_id -or $result.state -cne 'stopping') { throw 'The application did not acknowledge this shutdown.' }
         if (-not $app.WaitForExit($TimeoutSeconds * 1000)) { throw 'Graceful shutdown is still pending. No process was killed; wait and retry.' }
+        $exitCode = $app.ExitCode
+        if ($null -eq $exitCode -or $exitCode -ne 0) {
+            throw 'Veylurk exited without confirming a clean shutdown. History and WAL were retained; inspect them before attempting an offline backup.'
+        }
     } finally { $app.Dispose() }
 }
 

@@ -9,6 +9,16 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+// Checkpoint less often than SQLite's default 1000 frames: the 50-room retained-history
+// workload measured durable database-file flushes dominating commit time on Windows.
+// At the normal 4096-byte page size this targets about 32 MiB of active WAL. FULL sync
+// still durably commits each flush. The recycled-file limit applies on WAL reset; a
+// large transaction or an external reader can temporarily exceed it.
+// https://www.sqlite.org/pragma.html#pragma_wal_autocheckpoint
+// https://www.sqlite.org/pragma.html#pragma_journal_size_limit
+const WAL_CHECKPOINT_PAGES: i64 = 8192;
+const WAL_RETAINED_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -27,6 +37,8 @@ pub enum StoreError {
     NotFound,
     #[error("database initialization failed")]
     Initialize,
+    #[error("WAL checkpoint is blocked by another database reader or writer")]
+    CheckpointBusy,
 }
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -126,6 +138,8 @@ impl Store {
                 lock.try_lock().map_err(|_|StoreError::Initialize)?;
                 let mut conn = Connection::open(&worker_path)?;
                 conn.busy_timeout(Duration::from_secs(5))?;
+                conn.pragma_update(None,"wal_autocheckpoint",WAL_CHECKPOINT_PAGES)?;
+                conn.pragma_update(None,"journal_size_limit",WAL_RETAINED_LIMIT_BYTES)?;
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
                     CREATE TABLE IF NOT EXISTS channels(login TEXT PRIMARY KEY,tracked INTEGER NOT NULL,enabled INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
                     CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at TEXT NOT NULL,ended_at TEXT,end_reason TEXT,end_uncertain INTEGER NOT NULL DEFAULT 0,closed_recorded_at TEXT);
@@ -497,7 +511,13 @@ impl Store {
 
     pub async fn checkpoint(&self) -> Result<(), StoreError> {
         self.call(|conn| {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            let state: (i64, i64, i64) =
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if state != (0, 0, 0) {
+                return Err(StoreError::CheckpointBusy);
+            }
             Ok(())
         })
         .await
@@ -600,6 +620,121 @@ mod tests {
                 .observation_count,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn wal_checkpoint_policy_keeps_full_durability_and_explicit_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-policy.sqlite3");
+        let store = Store::open(&path).await.unwrap();
+        let policy = store
+            .call(|conn| {
+                Ok((
+                    conn.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))?,
+                    conn.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))?,
+                    conn.pragma_query_value(None, "wal_autocheckpoint", |r| r.get::<_, i64>(0))?,
+                    conn.pragma_query_value(None, "journal_size_limit", |r| r.get::<_, i64>(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(policy, ("wal".into(), 2, 8192, 64 * 1024 * 1024));
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store.begin_session(vec!["example".into()]).await.unwrap();
+        store
+            .append(
+                session,
+                vec![NewObservation {
+                    channel: "example".into(),
+                    account: Some("alice".into()),
+                    kind: "join".into(),
+                    received_at: now(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .unwrap()
+                .len()
+                > 0
+        );
+        store.checkpoint().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .map(|file| file.len())
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            store
+                .search(Some("alice".into()), None, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.stats().await.unwrap().observation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reports_a_pinned_external_reader_and_retains_committed_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinned-reader.sqlite3");
+        let store = Store::open(&path).await.unwrap();
+        store.track(vec!["example".into()], true).await.unwrap();
+        let session = store.begin_session(vec!["example".into()]).await.unwrap();
+        store
+            .call(|conn| {
+                conn.busy_timeout(Duration::from_millis(20))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT * FROM channels;")
+            .unwrap();
+        store
+            .append(
+                session,
+                vec![NewObservation {
+                    channel: "example".into(),
+                    account: Some("alice".into()),
+                    kind: "join".into(),
+                    received_at: now(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.checkpoint().await,
+            Err(StoreError::CheckpointBusy)
+        ));
+        assert!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .unwrap()
+                .len()
+                > 0
+        );
+        reader.execute_batch("COMMIT;").unwrap();
+        drop(reader);
+        store.checkpoint().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .map(|file| file.len())
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            store
+                .search(Some("alice".into()), None, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.stats().await.unwrap().observation_count, 1);
     }
 
     #[tokio::test]
