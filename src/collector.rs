@@ -97,6 +97,20 @@ async fn flush_pending(
     Ok(())
 }
 
+fn queue_observations(
+    flush: &mut tokio::time::Interval,
+    pending: &mut Vec<NewObservation>,
+    events: Vec<NewObservation>,
+) -> bool {
+    // Anchor the age limit to the first pending receipt. Idle time or a slow prior
+    // commit must not leave a ready tick that immediately commits a tiny batch.
+    if pending.is_empty() && !events.is_empty() {
+        flush.reset();
+    }
+    pending.extend(events);
+    pending.len() >= 512
+}
+
 async fn publish_rooms(
     status: &SharedStatus,
     rooms: &BTreeMap<String, RoomStatus>,
@@ -251,8 +265,7 @@ async fn run_endpoint(
                                     if let Some(room)=rooms.get_mut(&event.channel) {room.last_positive_at=Some(event.received_at.clone());}
                                 }
                             }
-                            pending.extend(events);
-                            if pending.len()>=512 {flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await} else {Ok(())}
+                            if queue_observations(&mut flush,&mut pending,events) {flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await} else {Ok(())}
                         },
                     }
                 },
@@ -556,3 +569,7 @@ mod tests {
 #[cfg(test)]
 #[path = "collector_buffer_tests.rs"]
 mod buffer_tests;
+
+#[cfg(test)]
+#[path = "collector_flush_tests.rs"]
+mod flush_tests;
