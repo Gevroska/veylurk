@@ -73,6 +73,87 @@ pub struct Store {
     query_expiry: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
     #[cfg(test)]
     append_interrupt: Arc<AtomicBool>,
+    #[cfg(test)]
+    work_for_test: Arc<std::sync::Mutex<StorageWorkForTest>>,
+}
+
+// Fixed-size, per-Store completion-window aggregates for isolated workload diagnostics.
+// The mutex only protects counter arithmetic/copies; it never spans database or filesystem
+// work. Snapshots do not enqueue actor jobs. Store clones share the same window.
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Serialize)]
+pub(crate) struct StorageWorkForTest {
+    append: AppendWorkForTest,
+    stats: StatsWorkForTest,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Serialize)]
+struct AppendWorkForTest {
+    successful_commits: u64,
+    committed_rows: u64,
+    full_512_batches: u64,
+    full_512_rows: u64,
+    undersized_batches: u64,
+    undersized_rows: u64,
+    larger_than_512_batches: u64,
+    larger_than_512_rows: u64,
+    sql_total_ms: f64,
+    sql_max_ms: f64,
+    commit_total_ms: f64,
+    commit_max_ms: f64,
+}
+
+#[cfg(test)]
+impl AppendWorkForTest {
+    fn committed(&mut self, rows: usize, sql: Duration, commit: Duration) {
+        let rows = rows as u64;
+        self.successful_commits = self.successful_commits.saturating_add(1);
+        self.committed_rows = self.committed_rows.saturating_add(rows);
+        let (batches, committed_rows) = match rows.cmp(&512) {
+            std::cmp::Ordering::Less => (&mut self.undersized_batches, &mut self.undersized_rows),
+            std::cmp::Ordering::Equal => (&mut self.full_512_batches, &mut self.full_512_rows),
+            std::cmp::Ordering::Greater => (
+                &mut self.larger_than_512_batches,
+                &mut self.larger_than_512_rows,
+            ),
+        };
+        *batches = batches.saturating_add(1);
+        *committed_rows = committed_rows.saturating_add(rows);
+        let sql_ms = sql.as_secs_f64() * 1000.0;
+        let commit_ms = commit.as_secs_f64() * 1000.0;
+        self.sql_total_ms += sql_ms;
+        self.sql_max_ms = self.sql_max_ms.max(sql_ms);
+        self.commit_total_ms += commit_ms;
+        self.commit_max_ms = self.commit_max_ms.max(commit_ms);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Serialize)]
+struct StatsWorkForTest {
+    completed_executions: u64,
+    execution_total_ms: f64,
+    execution_max_ms: f64,
+}
+
+// Drop records both successful and failed stats executions, including serialized metadata
+// calls, but excludes actor queue wait and caller scheduling after the actor replies.
+#[cfg(test)]
+struct StatsExecutionForTest {
+    work: Arc<std::sync::Mutex<StorageWorkForTest>>,
+    began: std::time::Instant,
+}
+
+#[cfg(test)]
+impl Drop for StatsExecutionForTest {
+    fn drop(&mut self) {
+        let elapsed_ms = self.began.elapsed().as_secs_f64() * 1000.0;
+        let mut work = self.work.lock().unwrap();
+        work.stats.completed_executions = work.stats.completed_executions.saturating_add(1);
+        work.stats.execution_total_ms += elapsed_ms;
+        work.stats.execution_max_ms = work.stats.execution_max_ms.max(elapsed_ms);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -292,6 +373,8 @@ impl Store {
             query_expiry: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             append_interrupt: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            work_for_test: Arc::new(std::sync::Mutex::new(StorageWorkForTest::default())),
         })
     }
 
@@ -301,6 +384,16 @@ impl Store {
 
     pub fn diagnostics(&self) -> crate::diagnostics::Snapshot {
         self.diagnostics.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_work_for_test(&self) {
+        *self.work_for_test.lock().unwrap() = StorageWorkForTest::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn work_snapshot_for_test(&self) -> StorageWorkForTest {
+        *self.work_for_test.lock().unwrap()
     }
 
     pub(crate) fn record_failure(&self, operation: Operation, error: &StoreError) {
@@ -665,6 +758,8 @@ impl Store {
         let fake_expiry = self.append_expiry.lock().unwrap().clone();
         #[cfg(test)]
         let inject_interrupt = self.append_interrupt.swap(false, Ordering::Relaxed);
+        #[cfg(test)]
+        let work_for_test = self.work_for_test.clone();
         self.call_write(Operation::Append, move |conn| {
             let started=std::time::Instant::now();
             let tx=conn.transaction()?;
@@ -702,7 +797,11 @@ impl Store {
                 }
             }
             let sql_time=started.elapsed();let committing=std::time::Instant::now();
-            tx.commit()?; Ok((sql_time,committing.elapsed()))
+            tx.commit()?;
+            let commit_time=committing.elapsed();
+            #[cfg(test)]
+            work_for_test.lock().unwrap().append.committed(count, sql_time, commit_time);
+            Ok((sql_time,commit_time))
         }).await
     }
 
@@ -815,7 +914,14 @@ impl Store {
 
     pub async fn stats(&self) -> Result<StorageStats, StoreError> {
         let path = self.path.clone();
+        #[cfg(test)]
+        let work_for_test = self.work_for_test.clone();
         self.call_read(Operation::Query, move |conn| {
+            #[cfg(test)]
+            let _execution_for_test = StatsExecutionForTest {
+                work: work_for_test,
+                began: std::time::Instant::now(),
+            };
             let (observation_count, session_count) = conn.query_row(
                 "SELECT observation_count,session_count FROM collection_totals WHERE id=1",
                 [],

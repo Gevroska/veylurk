@@ -160,6 +160,7 @@ struct RecoveryTarget<'a> {
     observations: usize,
     stage: RecoveryStage,
     original_budget: Option<&'a Arc<Semaphore>>,
+    work_at_release: Option<crate::store::StorageWorkForTest>,
 }
 
 #[derive(serde::Serialize)]
@@ -210,7 +211,7 @@ fn recovery_health(
     })
 }
 
-fn recovery_failure_context(
+fn recovery_context(
     store: &Store,
     health: &SharedStatus,
     target: RecoveryTarget<'_>,
@@ -225,7 +226,7 @@ fn recovery_failure_context(
         .ok()
         .map(|state| recovery_health(&state, target.original_budget));
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": target.stage,
         "recovery_elapsed_ms": elapsed_ms,
         "expected_observations": target.observations,
@@ -239,6 +240,12 @@ fn recovery_failure_context(
         "original_available_receive_permits": target.original_budget.map(|budget| budget.available_permits()),
         "collector": current,
         "diagnostics": store.diagnostics(),
+        "store_work": {
+            "completion_window": if target.work_at_release.is_some() { "since_round_start" } else { "since_store_open" },
+            "at_release": target.work_at_release,
+            "now": store.work_snapshot_for_test(),
+            "timing_scope": "Full actor execution durations of operations completing in the window; actor queue wait excluded. Append SQL includes any SQLite busy wait; commit includes FULL sync and automatic checkpoint. Stats includes filesystem metadata. The fixture's actor hold is not append SQL time.",
+        },
     }).to_string()
 }
 
@@ -248,11 +255,13 @@ async fn recovered(
     observations: usize,
     stage: RecoveryStage,
     original_budget: Option<&Arc<Semaphore>>,
+    work_at_release: Option<crate::store::StorageWorkForTest>,
 ) -> Arc<tokio::sync::Semaphore> {
     let target = RecoveryTarget {
         observations,
         stage,
         original_budget,
+        work_at_release,
     };
     let began = Instant::now();
     let mut progress = RecoveryProgress::default();
@@ -265,7 +274,7 @@ async fn recovered(
             let stats = stats_result.unwrap_or_else(|_| {
                 panic!(
                     "recovery storage statistics failed: {}",
-                    recovery_failure_context(store, health, target, began, &progress)
+                    recovery_context(store, health, target, began, &progress)
                 );
             });
             let elapsed_ms = began.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -307,12 +316,19 @@ async fn recovered(
         }
     })
     .await;
-    result.unwrap_or_else(|_| {
+    let budget = result.unwrap_or_else(|_| {
         panic!(
             "all receipts became durable and all receive permits recovered: {}",
-            recovery_failure_context(store, health, target, began, &progress)
+            recovery_context(store, health, target, began, &progress)
         );
-    })
+    });
+    if work_at_release.is_some() {
+        eprintln!(
+            "buffered-stall recovery complete: {}",
+            recovery_context(store, health, target, began, &progress)
+        );
+    }
+    budget
 }
 
 #[test]
@@ -475,10 +491,13 @@ async fn fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls(
             }
             peer.send(Message::text(response)).await.unwrap();
         }
-        let budget = recovered(&store, &health, ROOMS, RecoveryStage::InitialRooms, None).await;
+        let budget = recovered(&store, &health, ROOMS, RecoveryStage::InitialRooms, None, None).await;
         assert_durable_integrity(&store, 0, false).await;
 
         for round in 0..2 {
+            // Start a fresh completion window only after the previous recovery and
+            // integrity query completed. No actor job or extra polling is introduced.
+            store.reset_work_for_test();
             let held = Arc::new(AtomicBool::new(false));
             let actor_held = held.clone();
             let (entered_tx, entered_rx) = oneshot::channel();
@@ -569,6 +588,7 @@ async fn fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls(
             assert!(held.load(Ordering::SeqCst), "all burst receipts and PONGs precede SQLite release");
             assert_eq!(budget.available_permits(), RECEIVE_UNITS - RECEIPTS_PER_ROUND,
                 "every stalled receipt remains charged until commit");
+            let work_at_release = store.work_snapshot_for_test();
             release_tx.send(()).unwrap();
             let actual_hold = hold.await.unwrap().unwrap();
             assert!(actual_hold >= Duration::from_secs(13));
@@ -577,7 +597,7 @@ async fn fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls(
 
             let expected_joins = (round + 1) * RECEIPTS_PER_ROUND;
             let stage = if round == 0 { RecoveryStage::AfterFirstStall } else { RecoveryStage::AfterSecondStall };
-            let recovered_budget = recovered(&store, &health, ROOMS + expected_joins, stage, Some(&budget)).await;
+            let recovered_budget = recovered(&store, &health, ROOMS + expected_joins, stage, Some(&budget), Some(work_at_release)).await;
             assert!(Arc::ptr_eq(&budget, &recovered_budget), "the transport did not reconnect");
             assert_durable_integrity(&store, expected_joins, false).await;
         }
