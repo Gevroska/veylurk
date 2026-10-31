@@ -13,6 +13,7 @@ pub const EVENT_CAP: usize = 192 * 1024;
 pub const BODY_ENVELOPE_CAP: usize = RESPONSE_CAP * 6 + 1024;
 pub const MAX_EVENTS: usize = 2048;
 pub const MAX_CANDIDATES: usize = 4;
+pub const MAX_NAVIGATION_IDS: usize = 64;
 
 /// A navigation intent invalidates the previous ID before asynchronous observer
 /// shutdown. Only an issued current intent can acquire a NavigationStarting ID.
@@ -21,6 +22,7 @@ pub struct NavigationGate {
     intent: u64,
     issued: bool,
     started_id: Option<u64>,
+    seen_ids: HashSet<u64>,
 }
 
 impl NavigationGate {
@@ -41,6 +43,17 @@ impl NavigationGate {
         if !self.issued {
             return false;
         }
+        // Redirects retain their navigation ID. Once this intent acquires its
+        // ID, neither a superseded redirect nor another navigation may replace
+        // it. Retain IDs across intents so a delayed old Starting cannot win
+        // the race before the new intent's first Starting event either.
+        if let Some(current) = self.started_id {
+            return current == id;
+        }
+        if self.seen_ids.contains(&id) || self.seen_ids.len() >= MAX_NAVIGATION_IDS {
+            return false;
+        }
+        self.seen_ids.insert(id);
         self.started_id = Some(id);
         true
     }
@@ -741,10 +754,31 @@ mod tests {
         assert!(!gate.started(100));
         assert!(!gate.issue(a));
         assert!(gate.issue(b));
+        assert!(!gate.started(100));
         assert!(!gate.completed(100));
         assert!(gate.started(200));
+        assert!(!gate.started(100));
+        assert!(!gate.started(300));
+        assert!(gate.started(200)); // A redirect of the current navigation.
         assert!(!gate.completed(100));
         assert!(gate.completed(200));
+    }
+
+    #[test]
+    fn navigation_identity_retention_is_bounded_and_never_evicts_old_ids() {
+        let mut gate = NavigationGate::default();
+        for id in 0..MAX_NAVIGATION_IDS as u64 {
+            let intent = gate.begin();
+            assert!(gate.issue(intent));
+            assert!(gate.started(id));
+            assert!(gate.completed(id));
+        }
+        let intent = gate.begin();
+        assert!(gate.issue(intent));
+        assert!(!gate.started(0));
+        assert!(!gate.started(MAX_NAVIGATION_IDS as u64));
+        assert!(!gate.has_started());
+        assert_eq!(gate.seen_ids.len(), MAX_NAVIGATION_IDS);
     }
 
     #[test]
