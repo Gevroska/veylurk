@@ -7,13 +7,88 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const START_GAP_MS: u64 = 30_000;
-pub const NAVIGATION_UI_MS: u64 = 15_000;
+pub const NAVIGATION_UI_MS: u64 = 25_000;
+pub const PAUSED_READY_STABLE_MS: u64 = 2_000;
 pub const RESPONSE_MS: u64 = 25_000;
 pub const EVENT_CAP: usize = 192 * 1024;
 pub const BODY_ENVELOPE_CAP: usize = RESPONSE_CAP * 6 + 1024;
 pub const MAX_EVENTS: usize = 2048;
 pub const MAX_CANDIDATES: usize = 4;
 pub const MAX_NAVIGATION_IDS: usize = 64;
+
+/// Structural observations only; no account labels, chat text, or media URLs.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PlayerObservation {
+    pub signed_in: bool,
+    pub chat_ready: bool,
+    pub community_ready: bool,
+    pub video_present: bool,
+    pub video_ready: bool,
+    pub video_paused: Option<bool>,
+    pub play_control: bool,
+    pub pause_clicked: bool,
+}
+
+/// One ordinary pause action per navigation. Stable readiness must precede
+/// observer arming. A later loss of verified pause is terminal, never retried.
+#[derive(Default)]
+pub struct PlayerGate {
+    pause_clicked: bool,
+    pause_verified: bool,
+    stable_since: Option<u64>,
+    ready: bool,
+}
+
+impl PlayerGate {
+    pub fn may_click_pause(&self) -> bool {
+        !self.pause_clicked && !self.pause_verified
+    }
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+    pub fn pause_verified(&self) -> bool {
+        self.pause_verified
+    }
+    pub fn observe(
+        &mut self,
+        now: u64,
+        observation: &PlayerObservation,
+        require_readiness: bool,
+    ) -> Result<bool, &'static str> {
+        if observation.pause_clicked {
+            if !self.may_click_pause() {
+                return Err("unexpected_repeated_pause_action");
+            }
+            self.pause_clicked = true;
+        }
+        let paused = observation.video_present
+            && observation.video_ready
+            && observation.video_paused == Some(true)
+            && observation.play_control;
+        if !paused {
+            if self.pause_verified {
+                return Err("verified_player_pause_lost");
+            }
+            self.stable_since = None;
+            return Ok(false);
+        }
+        self.pause_verified = true;
+        if self.ready && !observation.signed_in {
+            return Err("signed_in_ui_lost");
+        }
+        if !require_readiness {
+            return Ok(self.ready && observation.signed_in);
+        }
+        if !observation.signed_in || !observation.chat_ready || !observation.community_ready {
+            self.stable_since = None;
+            self.ready = false;
+            return Ok(false);
+        }
+        let since = self.stable_since.get_or_insert(now);
+        self.ready = now.saturating_sub(*since) >= PAUSED_READY_STABLE_MS;
+        Ok(self.ready)
+    }
+}
 
 /// A navigation intent invalidates the previous ID before asynchronous observer
 /// shutdown. Only an issued current intent can acquire a NavigationStarting ID.
@@ -131,7 +206,7 @@ pub fn arguments(args: &[String]) -> Result<Option<Config>, &'static str> {
         }
         index += 2;
     }
-    Config::new(channels, circuits.unwrap_or(2), max_seconds.unwrap_or(420)).map(Some)
+    Config::new(channels, circuits.unwrap_or(2), max_seconds.unwrap_or(240)).map(Some)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -711,6 +786,12 @@ pub struct AttemptEvidence {
     pub ended_ms: Option<u64>,
     pub status: &'static str,
     pub video_element_present: Option<bool>,
+    pub video_paused: Option<bool>,
+    pub player_pause_verified: bool,
+    pub pause_verified_before_trigger: bool,
+    pub player_pause_last_checked_ms: Option<u64>,
+    pub normal_pause_clicks: usize,
+    pub signed_in_ui_verified: bool,
     pub http_status: Option<u16>,
     pub provenance: Option<Provenance>,
     pub reported_chat_count: Option<u64>,
@@ -747,7 +828,7 @@ pub struct RunEvidence {
 impl RunEvidence {
     pub fn new(config: &Config) -> Self {
         Self {
-            mode: "finite_autonomous_popout",
+            mode: "finite_autonomous_full_channel_paused",
             circuits: config.circuits,
             max_seconds: config.max_seconds,
             status: "starting",
@@ -768,6 +849,12 @@ impl RunEvidence {
             ended_ms: None,
             status: "navigating",
             video_element_present: None,
+            video_paused: None,
+            player_pause_verified: false,
+            pause_verified_before_trigger: false,
+            player_pause_last_checked_ms: None,
+            normal_pause_clicks: 0,
+            signed_in_ui_verified: false,
             http_status: None,
             provenance: None,
             reported_chat_count: None,
@@ -821,6 +908,123 @@ impl RunEvidence {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn paused_channel() -> PlayerObservation {
+        PlayerObservation {
+            signed_in: true,
+            chat_ready: true,
+            community_ready: true,
+            video_present: true,
+            video_ready: true,
+            video_paused: Some(true),
+            play_control: true,
+            pause_clicked: false,
+        }
+    }
+
+    #[test]
+    fn player_readiness_requires_confirmed_pause_and_stable_signed_in_chat() {
+        let mut gate = PlayerGate::default();
+        assert!(!gate
+            .observe(0, &PlayerObservation::default(), true)
+            .unwrap());
+        let mut playing = paused_channel();
+        playing.video_paused = Some(false);
+        playing.play_control = false;
+        playing.pause_clicked = true;
+        assert!(!gate.observe(100, &playing, true).unwrap());
+        assert!(!gate.may_click_pause());
+        assert!(!gate.pause_verified());
+        let mut loading = paused_channel();
+        loading.signed_in = false;
+        assert!(!gate.observe(200, &loading, true).unwrap());
+        assert!(gate.pause_verified());
+        assert!(!gate.ready());
+        let ready = paused_channel();
+        assert!(!gate.observe(500, &ready, true).unwrap());
+        loading.signed_in = true;
+        loading.chat_ready = false;
+        assert!(!gate.observe(2_000, &loading, true).unwrap());
+        assert!(!gate.observe(2_100, &ready, true).unwrap());
+        assert!(!gate.observe(4_099, &ready, true).unwrap());
+        assert!(gate.observe(4_100, &ready, true).unwrap());
+        assert!(gate.ready());
+        assert!(!gate.may_click_pause());
+    }
+
+    #[test]
+    fn pause_guard_survives_open_community_and_idle_but_not_resumed_playback() {
+        let mut gate = PlayerGate::default();
+        let ready = paused_channel();
+        assert!(!gate.observe(0, &ready, true).unwrap());
+        assert!(gate.observe(PAUSED_READY_STABLE_MS, &ready, true).unwrap());
+        let mut opened = ready.clone();
+        opened.community_ready = false;
+        opened.chat_ready = false;
+        assert!(gate.observe(3_000, &opened, false).unwrap());
+        assert!(gate.observe(30_000, &opened, false).unwrap());
+        opened.video_paused = Some(false);
+        assert_eq!(
+            gate.observe(30_001, &opened, false),
+            Err("verified_player_pause_lost")
+        );
+        let next_navigation = PlayerGate::default();
+        assert!(!next_navigation.ready());
+        assert!(!next_navigation.pause_verified());
+        assert!(next_navigation.may_click_pause());
+    }
+
+    #[test]
+    fn pause_guard_rejects_missing_video_auth_loss_and_repeated_pause_actions() {
+        for missing in ["video", "control", "signed_in"] {
+            let mut gate = PlayerGate::default();
+            let mut observed = paused_channel();
+            gate.observe(0, &observed, true).unwrap();
+            assert!(gate
+                .observe(PAUSED_READY_STABLE_MS, &observed, true)
+                .unwrap());
+            match missing {
+                "video" => observed.video_present = false,
+                "control" => observed.play_control = false,
+                _ => observed.signed_in = false,
+            }
+            let expected = if missing == "signed_in" {
+                "signed_in_ui_lost"
+            } else {
+                "verified_player_pause_lost"
+            };
+            assert_eq!(gate.observe(3_000, &observed, false), Err(expected));
+        }
+        let mut gate = PlayerGate::default();
+        let mut observed = paused_channel();
+        observed.pause_clicked = true;
+        gate.observe(0, &observed, true).unwrap();
+        assert_eq!(
+            gate.observe(1, &observed, true),
+            Err("unexpected_repeated_pause_action")
+        );
+    }
+
+    #[test]
+    fn autonomous_defaults_are_full_channel_evidence_and_finite_240_seconds() {
+        let config = arguments(&[
+            "--autonomous".into(),
+            "--channel".into(),
+            "first".into(),
+            "--channel".into(),
+            "second".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.circuits, 2);
+        assert_eq!(config.max_seconds, 240);
+        let mut evidence = RunEvidence::new(&config);
+        evidence.start(Schedule::new(config).start_due(0).unwrap());
+        assert_eq!(evidence.mode, "finite_autonomous_full_channel_paused");
+        assert!(!evidence.attempts[0].player_pause_verified);
+        assert!(!evidence.attempts[0].pause_verified_before_trigger);
+        assert_eq!(evidence.attempts[0].normal_pause_clicks, 0);
+    }
 
     #[test]
     fn new_navigation_intent_rejects_old_completion_before_and_after_issue() {
@@ -938,7 +1142,7 @@ mod tests {
         assert_eq!(denied.attempts[0].status, "integrity_denied");
     }
     fn req(id: &str, wall: f64) -> RequestEvent {
-        event(&json!({"requestId":id,"frameId":"top","documentURL":"https://www.twitch.tv/popout/test/chat","timestamp":20.0,"wallTime":wall,"request":{"url":"https://gql.twitch.tv/gql","method":"POST","postData":"{\"operationName\":\"CommunityTab\",\"variables\":{\"login\":\"test\"}}","headers":{"Authorization":"secret"}}}).to_string()).unwrap()
+        event(&json!({"requestId":id,"frameId":"top","documentURL":"https://www.twitch.tv/test","timestamp":20.0,"wallTime":wall,"request":{"url":"https://gql.twitch.tv/gql","method":"POST","postData":"{\"operationName\":\"CommunityTab\",\"variables\":{\"login\":\"test\"}}","headers":{"Authorization":"secret"}}}).to_string()).unwrap()
     }
     fn resp(id: &str, disk: Option<bool>) -> ResponseEvent {
         ResponseEvent {

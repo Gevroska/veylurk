@@ -36,25 +36,52 @@ const TOOLBAR_HEIGHT: i32 = 92;
 // immediately before the ordinary click fences delayed pre-arm requests.
 const COMMUNITY_UI: &str = r#"(() => {
   const expected = __POPOUT__ ? '/popout/__CHANNEL__/chat' : '/__CHANNEL__';
-  const video_present = !!document.querySelector('video');
-  const result = code => ({code, video_present, trigger_unix_ms:null});
+  const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
+  const buttons = [...document.querySelectorAll('button,[role="tab"]')].filter(visible);
+  const label = e => (e.getAttribute('aria-label') || '').trim();
+  const target = buttons.find(e => e.getAttribute('data-test-selector') === 'chat-viewer-list')
+    || buttons.find(e => e.getAttribute('data-a-target') === 'chat-viewers')
+    || buttons.find(e => label(e) === 'Community')
+    || buttons.find(e => (e.textContent || '').trim() === 'Community');
+  const player = buttons.find(e => e.getAttribute('data-a-target') === 'player-play-pause-button')
+    || buttons.find(e => /^(Pause|Play) \(space\/k\)$/.test(label(e)));
+  const signed_in = buttons.some(e => label(e) === 'User Avatar' || e.querySelector('img[alt="User Avatar"]'))
+    && !buttons.some(e => e.getAttribute('data-a-target') === 'login-button');
+  const chat_ready = !!document.querySelector('[data-a-target="chat-input"],.chat-scrollable-area__message-container');
+  let pause_clicked = false;
+  const snapshot = () => {
+    const videos = [...document.querySelectorAll('video')];
+    return {signed_in, chat_ready, community_ready:!!target && !target.disabled,
+      video_present:videos.length > 0,
+      video_ready:videos.length > 0 && videos.length <= 8 && videos.every(v => v.readyState >= 2 && !v.ended),
+      video_paused:videos.length > 0 ? videos.every(v => v.paused) : null,
+      play_control:!!player && !player.disabled && /^Play(?: \(space\/k\))?$/.test(label(player)), pause_clicked};
+  };
+  const result = code => ({code, ...snapshot(), trigger_unix_ms:null});
   if (location.origin !== 'https://www.twitch.tv' || location.pathname.toLowerCase() !== expected)
     return result('wrong_page');
   if (/access denied|verify you are human|unusual traffic/i.test(document.title)
       || document.querySelector('iframe[src*="captcha" i],iframe[src*="challenge" i],form[action*="challenge" i]'))
     return result('challenge_denied');
-  if (__POPOUT__ && video_present) return result('video_present');
-  const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
-  const buttons = [...document.querySelectorAll('button,[role="tab"]')].filter(visible);
-  const target = buttons.find(e => e.getAttribute('data-test-selector') === 'chat-viewer-list')
-    || buttons.find(e => e.getAttribute('data-a-target') === 'chat-viewers')
-    || buttons.find(e => (e.getAttribute('aria-label') || '').trim() === 'Community')
-    || buttons.find(e => (e.textContent || '').trim() === 'Community');
+  if (__AUTOMATIC__) {
+    const before = snapshot();
+    if (__ALLOW_PAUSE__ && before.video_present && before.video_paused === false
+        && player && !player.disabled && /^Pause(?: \(space\/k\))?$/.test(label(player))) {
+      player.click();
+      pause_clicked = true;
+      return result('observed');
+    }
+    if (!__CLICK__) return result('observed');
+    if (!before.signed_in || !before.chat_ready || !before.community_ready
+        || !before.video_ready || before.video_paused !== true || !before.play_control)
+      return result('pause_or_readiness_lost');
+  }
   if (!target || target.disabled) return result('waiting_ui');
   if (!__CLICK__) return result('ready');
   const trigger_unix_ms = performance.timeOrigin + performance.now();
+  const observed = snapshot();
   target.click();
-  return {code:'native_community_clicked',video_present,trigger_unix_ms};
+  return {code:'native_community_clicked',...observed,trigger_unix_ms};
 })()"#;
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -96,11 +123,15 @@ struct State {
     frame_id: Option<String>,
     schedule: Option<Schedule>,
     auto_stage: Option<AutoStage>,
+    player_gate: sampling::PlayerGate,
+    pending_sample: Option<(community_webview2_proof::ParsedSample, BodyRequest)>,
 }
 
 #[derive(Clone, Copy)]
 enum AutoStage {
     Navigating(Instant),
+    Preparing(Instant),
+    Enabling(Instant),
     Ready(Instant),
     Sampling,
 }
@@ -108,7 +139,8 @@ enum AutoStage {
 #[derive(Deserialize)]
 struct UiResult {
     code: String,
-    video_present: bool,
+    #[serde(flatten)]
+    player: sampling::PlayerObservation,
     trigger_unix_ms: Option<f64>,
 }
 
@@ -234,6 +266,7 @@ impl App {
         state.script_pending = false;
         state.network_pending = false;
         state.tracker = None;
+        state.pending_sample = None;
     }
 
     fn record_action(&self, target: &'static str) {
@@ -513,7 +546,7 @@ impl App {
                     app.begin_sample();
                 } else {
                     let stage = app.state.borrow().auto_stage;
-                    if let Some(AutoStage::Navigating(deadline)) = stage {
+                    if let Some(AutoStage::Enabling(deadline)) = stage {
                         app.state.borrow_mut().auto_stage = Some(AutoStage::Ready(deadline));
                     }
                 }
@@ -577,6 +610,13 @@ impl App {
     }
 
     fn begin_sample(self: &Rc<Self>) {
+        if self.automatic() && !self.state.borrow().player_gate.ready() {
+            self.fail(
+                "player_pause_not_verified",
+                "The normal player pause must be verified before sampling.",
+            );
+            return;
+        }
         let generation;
         let now = self.elapsed_ms();
         {
@@ -611,7 +651,7 @@ impl App {
     }
 
     fn ui_step(self: &Rc<Self>, click: bool) {
-        let (channel, generation, automatic) = {
+        let (channel, generation, automatic, allow_pause, require_readiness, checks_pending_sample) = {
             let state = self.state.borrow();
             if state.script_pending || state.closing_at.is_some() {
                 return;
@@ -620,6 +660,14 @@ impl App {
                 state.selected_channel.clone().unwrap_or_default(),
                 state.generation,
                 state.schedule.is_some(),
+                matches!(state.auto_stage, Some(AutoStage::Preparing(_)))
+                    && state.player_gate.may_click_pause(),
+                click
+                    || matches!(
+                        state.auto_stage,
+                        Some(AutoStage::Preparing(_) | AutoStage::Ready(_))
+                    ),
+                state.pending_sample.is_some(),
             )
         };
         let Ok(uri) = self.current_uri() else {
@@ -629,7 +677,7 @@ impl App {
             );
             return;
         };
-        if !is_channel_page(&uri, &channel) || automatic && !is_popout_page(&uri, &channel) {
+        if !is_channel_page(&uri, &channel) || automatic && is_popout_page(&uri, &channel) {
             self.sample_failure(Failure::AuthenticationDenied);
             return;
         }
@@ -637,6 +685,11 @@ impl App {
         let script = COMMUNITY_UI
             .replace("__CHANNEL__", &channel)
             .replace("__POPOUT__", if popout { "true" } else { "false" })
+            .replace("__AUTOMATIC__", if automatic { "true" } else { "false" })
+            .replace(
+                "__ALLOW_PAUSE__",
+                if allow_pause { "true" } else { "false" },
+            )
             .replace("__CLICK__", if click { "true" } else { "false" });
         self.state.borrow_mut().script_pending = true;
         let weak = Rc::downgrade(self);
@@ -650,6 +703,34 @@ impl App {
                 return Ok(());
             }
             app.state.borrow_mut().script_pending = false;
+            if automatic {
+                let state = app.state.borrow();
+                let expired = state
+                    .schedule
+                    .as_ref()
+                    .is_some_and(|schedule| schedule.expired(app.elapsed_ms()));
+                let deadline = match state.auto_stage {
+                    Some(
+                        AutoStage::Navigating(deadline)
+                        | AutoStage::Preparing(deadline)
+                        | AutoStage::Enabling(deadline)
+                        | AutoStage::Ready(deadline),
+                    ) => Some(deadline),
+                    _ => None,
+                };
+                drop(state);
+                if expired || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    app.end_auto_attempt(
+                        if expired {
+                            "run_deadline"
+                        } else {
+                            "navigation_ui_deadline"
+                        },
+                        true,
+                    );
+                    return Ok(());
+                }
+            }
             if result.is_err() || json.len() > 1024 {
                 app.fail(
                     "community_ui_action_failed",
@@ -666,32 +747,82 @@ impl App {
             };
             if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
                 if let Some(attempt) = run.attempts.last_mut() {
-                    attempt.video_element_present = Some(ui.video_present);
+                    attempt.video_element_present = Some(ui.player.video_present);
+                    attempt.video_paused = ui.player.video_paused;
+                    attempt.player_pause_last_checked_ms = Some(app.elapsed_ms());
+                    attempt.normal_pause_clicks += usize::from(ui.player.pause_clicked);
+                    attempt.signed_in_ui_verified |= ui.player.signed_in;
                 }
             }
+            let player_ready = if automatic
+                && !matches!(ui.code.as_str(), "wrong_page" | "challenge_denied")
+            {
+                let outcome = app.state.borrow_mut().player_gate.observe(
+                    app.elapsed_ms(),
+                    &ui.player,
+                    require_readiness,
+                );
+                match outcome {
+                    Ok(ready) => {
+                        if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
+                            if let Some(attempt) = run.attempts.last_mut() {
+                                attempt.player_pause_verified |=
+                                    app.state.borrow().player_gate.pause_verified();
+                            }
+                        }
+                        ready
+                    }
+                    Err(code) => {
+                        app.fail(code, "The verified normal player pause or signed-in state was lost. The proof is stopped.");
+                        return Ok(());
+                    }
+                }
+            } else {
+                false
+            };
             match ui.code.as_str() {
                 "challenge_denied" => app.sample_failure(Failure::ChallengeDenied),
                 "wrong_page" => app.sample_failure(Failure::AuthenticationDenied),
-                "video_present" => app.fail(
-                    "popout_contains_video",
-                    "The chat-only prerequisite failed; no source sample is accepted.",
+                "pause_or_readiness_lost" => app.fail(
+                    "pause_or_readiness_lost",
+                    "The paused channel prerequisites changed before the Community click.",
                 ),
+                "observed" if automatic && !click => {
+                    let stage = app.state.borrow().auto_stage;
+                    if player_ready {
+                        match stage {
+                            Some(AutoStage::Preparing(deadline)) => {
+                                app.state.borrow_mut().auto_stage =
+                                    Some(AutoStage::Enabling(deadline));
+                                app.enable_network(false);
+                            }
+                            Some(AutoStage::Ready(_)) if require_readiness => app.begin_sample(),
+                            Some(AutoStage::Sampling) if checks_pending_sample => {
+                                app.finish_pending_sample()
+                            }
+                            _ => (),
+                        }
+                    }
+                }
                 "waiting_ui" if !click => (),
                 "waiting_ui" => app.fail(
                     "community_control_unavailable",
                     "The ordinary Community control is unavailable. No repeated click.",
                 ),
-                "ready" if !click => {
-                    let stage = app.state.borrow().auto_stage;
-                    if let Some(AutoStage::Ready(deadline)) = stage {
-                        if Instant::now() >= deadline {
-                            app.end_auto_attempt("navigation_ui_deadline", false);
-                        } else {
-                            app.begin_sample();
+                "ready" if !click && !automatic => (),
+                "native_community_clicked" if click => {
+                    if automatic && !player_ready {
+                        app.fail(
+                            "player_pause_not_verified",
+                            "Player pause was not verified at the Community trigger.",
+                        );
+                        return Ok(());
+                    }
+                    if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
+                        if let Some(attempt) = run.attempts.last_mut() {
+                            attempt.pause_verified_before_trigger = player_ready;
                         }
                     }
-                }
-                "native_community_clicked" if click => {
                     let outcome = app
                         .state
                         .borrow_mut()
@@ -714,6 +845,10 @@ impl App {
                 ),
             }
             app.save();
+            if automatic && !checks_pending_sample && app.state.borrow().pending_sample.is_some() {
+                // A body received during an older UI call needs a new pause check.
+                app.ui_step(false);
+            }
             Ok(())
         }));
         if let Some(core) = self.core() {
@@ -904,6 +1039,10 @@ impl App {
                 let parsed = parse_response(&bytes, &verified.selection, verified.status);
                 drop(bytes);
                 match parsed {
+                    Ok(parsed) if app.automatic() => {
+                        app.state.borrow_mut().pending_sample = Some((parsed, verified));
+                        app.ui_step(false);
+                    }
                     Ok(parsed) => app.accept_sample(parsed, &verified),
                     Err(failure) => app.sample_failure(failure),
                 }
@@ -925,6 +1064,32 @@ impl App {
                     "The matching native response body is unavailable.",
                 );
             }
+        }
+    }
+
+    fn finish_pending_sample(&self) {
+        let generation = self.state.borrow().generation;
+        if !self.is_active(generation) || !self.state.borrow().player_gate.ready() {
+            return;
+        }
+        let pending = self.state.borrow_mut().pending_sample.take();
+        let Some((parsed, body)) = pending else {
+            return;
+        };
+        let verified = self
+            .state
+            .borrow()
+            .tracker
+            .as_ref()
+            .ok_or("missing_request_tracker")
+            .and_then(|tracker| tracker.complete_body(generation, &body.id));
+        match verified {
+            Ok(body) => self.accept_sample(parsed, &body),
+            Err("http_denied") => self.sample_failure(Failure::HttpDenied),
+            Err(code) => self.fail(
+                code,
+                "Native source identity changed during the final pause check.",
+            ),
         }
     }
 
@@ -1034,6 +1199,7 @@ impl App {
             {
                 let mut state = self.state.borrow_mut();
                 state.selected_channel = Some(attempt.channel.clone());
+                state.player_gate = sampling::PlayerGate::default();
                 state.auto_stage = Some(AutoStage::Navigating(
                     Instant::now() + Duration::from_millis(sampling::NAVIGATION_UI_MS),
                 ));
@@ -1042,30 +1208,31 @@ impl App {
                 run.start(attempt.clone());
                 run.status = "running";
             }
-            self.record_action("twitch_chat_popout");
-            self.navigate(format!(
-                "https://www.twitch.tv/popout/{}/chat",
-                attempt.channel
-            ));
+            self.record_action("twitch_full_channel_paused");
+            self.navigate(format!("https://www.twitch.tv/{}", attempt.channel));
             return;
         }
         let stage = self.state.borrow().auto_stage;
         match stage {
-            Some(AutoStage::Navigating(deadline) | AutoStage::Ready(deadline))
-                if Instant::now() >= deadline =>
-            {
-                self.end_auto_attempt("navigation_ui_deadline", false)
+            Some(
+                AutoStage::Navigating(deadline)
+                | AutoStage::Preparing(deadline)
+                | AutoStage::Enabling(deadline)
+                | AutoStage::Ready(deadline),
+            ) if Instant::now() >= deadline => {
+                // A page that never proves pause must not play through the gap.
+                self.end_auto_attempt("navigation_ui_deadline", true)
             }
-            Some(AutoStage::Navigating(_)) => {
-                let (ready, pending) = {
-                    let s = self.state.borrow();
-                    (s.navigation_ready, s.network_pending)
-                };
-                if ready && !pending {
-                    self.enable_network(false);
+            Some(AutoStage::Navigating(deadline)) => {
+                if self.state.borrow().navigation_ready {
+                    self.state.borrow_mut().auto_stage = Some(AutoStage::Preparing(deadline));
+                    self.ui_step(false);
                 }
             }
-            Some(AutoStage::Ready(_)) => self.ui_step(false),
+            Some(AutoStage::Preparing(_) | AutoStage::Enabling(_) | AutoStage::Ready(_)) => {
+                self.ui_step(false)
+            }
+            None if self.state.borrow().player_gate.ready() => self.ui_step(false),
             _ => (),
         }
     }
@@ -1400,7 +1567,7 @@ unsafe fn attach(
                     if success.as_bool() {
                         app.status("Native page loaded. Login and Community access still require their own evidence.");
                     } else if app.automatic() {
-                        app.end_auto_attempt("navigation_failed", false);
+                        app.end_auto_attempt("navigation_failed", true);
                     } else {
                         app.status(&format!("Browser navigation failed (WebView2 error {}). No login or Community sample is verified.", error.0));
                     }
@@ -1515,8 +1682,12 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Some(app) = app {
-                app.resize();
+            // Keep ordinary page layout when minimized. Native occlusion and
+            // background throttling remain unchanged; restoration resizes again.
+            if wparam.0 != SIZE_MINIMIZED as usize {
+                if let Some(app) = app {
+                    app.resize();
+                }
             }
             LRESULT(0)
         }

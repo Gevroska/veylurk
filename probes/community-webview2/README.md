@@ -4,7 +4,7 @@ This isolated Rust Windows proof uses the existing WebView2 runtime and its
 executable-local `data/browser-profile`. It does not change the production
 Veylurk service, SQLite history, credentials, or IRC evidence. Manual Community
 access and profile persistence were demonstrated with an earlier revision;
-this revision still needs Windows checks and live autonomous-popout acceptance.
+this revision still needs Windows checks and live autonomous paused-channel acceptance.
 
 There is no installer, runtime download, private HTTP client, token/cookie API,
 request replay, imported profile, browser identity modification, security flag,
@@ -33,6 +33,8 @@ frame mismatch, caching, and repeated samples. They do not establish live access
 Timing fixtures cover a network finish preceding the response-event timestamp,
 unknown transferred bytes, numeric-only failure diagnostics, and unchanged body
 limits and freshness claims in those cases.
+Typed player-state tests cover pause confirmation, stable signed-in chat
+readiness, readiness loss, playback resuming, idle checks, and navigation reset.
 The Windows workflow packages only the executable, documentation, manifests,
 and any required loader; it never packages a browser profile or live evidence.
 
@@ -54,12 +56,12 @@ Normal closure preserves the profile. Reopen this same folder to test session
 persistence; neither successful navigation nor a saved profile proves login or
 source access. Successful later navigation clears the prior native error status.
 
-## Finite autonomous chat-only mode
+## Finite autonomous paused-channel mode
 
 Use the same executable folder and existing app-owned profile:
 
 ```powershell
-.\veylurk-community-webview2-proof.exe --autonomous --channel first_channel --channel second_channel --circuits 2 --max-seconds 300
+.\veylurk-community-webview2-proof.exe --autonomous --channel first_channel --channel second_channel --circuits 2 --max-seconds 240
 ```
 
 Replace the two placeholders with actual permitted channel logins. This command
@@ -67,21 +69,41 @@ is an example, not a launch performed by the build. A new Internet-capable
 executable still needs the owner's launch approval.
 
 The mode accepts exactly two or three distinct channels, one to three circuits
-(default two), and a 60–600 second total limit (default 420). One controller
-visits `https://www.twitch.tv/popout/CHANNEL/chat` in channel order, with all
-attempt starts at least 30 seconds apart. It never navigates to the full video
-player. The attempt has one 15-second navigation/UI budget, then a 25-second
+(default two), and a 60–600 second total limit (default 240). One controller
+visits the normal `https://www.twitch.tv/CHANNEL` page in channel order, with all
+attempt starts at least 30 seconds apart. It waits for the normal player and
+uses its ordinary Pause control at most once per navigation when needed.
+The attempt has one 25-second navigation/UI budget, then a 25-second
 native-response budget. Total runtime includes startup and waits; closing gets
 at most five additional seconds for browser-process exit confirmation.
 
-The existing profile is required. No automatic login is attempted. A video
-DOM element invalidates the chat-only prerequisite. The host records only its
-presence flag. Native buttons cannot redirect the autonomous run; close the
-window to stop it. Minimized-window operation remains a separate live check.
+The existing profile is required. No automatic login is attempted. The source
+page must show the signed-in User Avatar, chat structure, Community control,
+and a loaded video whose paused state is corroborated by the normal Play
+control. These prerequisites must remain ready for at least two seconds before
+observation is enabled. Structural selectors are conservative candidates; the
+runtime must validate them. No account identity, chat content, or media URL is
+returned or retained by this UI check.
+
+Pause is checked again immediately before the ordinary Community click and
+after the response body arrives, before sample acceptance. The same checks
+continue during response waits and between attempts. A lost verified pause
+stops the run. The next navigation gets a new pause/readiness gate. There is no
+mute substitute, media URL request, direct player API call, ad skip, DOM removal,
+or background/occlusion flag. A paused video does not prove absent video network
+traffic or low resource usage. Native buttons cannot redirect the autonomous
+run; close the window to stop it. Minimized operation needs separate live proof.
+Minimization preserves the last normal controller bounds so the page keeps its
+ordinary layout. Native background throttling and occlusion behavior are unchanged.
+
+This route is explicit: autonomous mode never tries the chat popout and never
+falls back or retries after a denial. A normal full-channel control succeeded
+after a separate denied popout run; that does not establish the denial's cause.
 
 There is one ordinary Community click per attempt. No failed attempt is retried:
-a channel that reaches a navigation/UI/response deadline is skipped in later
-circuits. Other channels may continue. HTTP 401/403/429, integrity,
+a channel that reaches a response deadline is skipped in later circuits while
+its paused page remains guarded. Navigation/UI failure stops the run because
+pause cannot be assured during a scheduling gap. HTTP 401/403/429, integrity,
 authentication, rate-limit, or challenge denial stops the whole run. Unexpected
 protocol data, identity failures, or exceeded safety bounds also stop the run.
 No CAPTCHA, challenge, account-recovery flow, or detection workaround is tried.
@@ -132,6 +154,10 @@ per-channel overlap/union and duplicate-set flags, cache provenance, and browser
 cleanup state. Account sets exist only in memory. Raw bodies, errors, page DOM,
 headers, credentials, cookies, and individual account logins are never written.
 Evidence-write failure stops the autonomous proof.
+Each attempt also records video presence/paused state, whether pause was ever
+verified and verified before the trigger, normal Pause click count, the last
+pause-check time, and whether signed-in UI was observed. These are point-in-time
+observations; they do not establish continuous absence of playback or traffic.
 Matched-source timing failures retain at most one numeric diagnostic containing
 the raw finite timestamps, differences, encoded length, and a specific reason
 code. Nonfinite numbers become null. No request IDs, URLs, headers, or accounts
@@ -144,8 +170,8 @@ response are distinct. `server_freshness` remains `unknown`, and
 cannot establish server freshness, independence, randomness, full coverage,
 viewing time, or calibrated absence. No samples become IRC NAMES/JOIN events.
 
-Live acceptance requires positive native samples from the actual popout route
-without a video element; multiple channel circuits and profile restart;
+Live acceptance requires positive native samples from normal full-channel pages
+with verified paused playback; multiple channel circuits and profile restart;
 correct channel isolation and useful repeated-sample evidence; and measurements
 of the whole browser/app process tree. Check minimized operation separately.
 Build success and fixtures do not establish these conditions. Cache-only or
