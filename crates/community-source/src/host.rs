@@ -89,6 +89,9 @@ pub struct SourceFailure {
     pub pauses_community: bool,
 }
 
+// Storage is fixed: four queued statuses plus one completion and one terminal
+// slot. Keeping the payload inline avoids an extra allocation per receipt.
+#[allow(clippy::large_enum_variant)]
 pub enum HostEvent {
     Ready,
     LoginShown,

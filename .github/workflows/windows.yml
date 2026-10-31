@@ -40,6 +40,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
+        id: lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked -- --skip collector::buffer_tests::fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls
@@ -51,7 +52,7 @@ jobs:
         run: cargo build --release --locked
       - name: Build isolated performance harness for diagnosis
         id: performance_build
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.lint.outcome == 'success'
         run: cargo build --release --locked --bin veylurk-perf-bench
       - name: Smoke-check application help without Twitch
         shell: pwsh

@@ -210,7 +210,7 @@ async fn update_settings(
     if !(30..=86_400).contains(&input.target_interval_seconds) {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_query"));
     }
-    service.command(Command::Settings(input)).await?;
+    let _ = service.command(Command::Settings(input)).await?;
     Ok(Json(json!(input)))
 }
 async fn login(

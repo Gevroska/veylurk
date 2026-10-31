@@ -349,7 +349,7 @@ impl App {
         EXIT_ENV.with(|slot| {
             slot.borrow_mut()
                 .take()
-                .map_or(true, |(_, environment5, token)| unsafe {
+                .is_none_or(|(_, environment5, token)| unsafe {
                     environment5.remove_BrowserProcessExited(token).is_ok()
                 })
         })
@@ -2428,9 +2428,11 @@ unsafe fn make_window(
         Some(instance),
         None,
     )?;
-    let mut evidence = Evidence::default();
-    evidence.schema_version = 2;
-    evidence.autonomous = config.as_ref().map(RunEvidence::new);
+    let evidence = Evidence {
+        schema_version: 2,
+        autonomous: config.as_ref().map(RunEvidence::new),
+        ..Evidence::default()
+    };
     let service = service_options.map(|(options, bridge)| Service {
         last_cancel: RefCell::new(bridge.control.cancel_version.load(Ordering::Acquire)),
         bridge,
