@@ -50,7 +50,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Repeated Community-list samples | Finite autonomous full-channel rotation, sampling after minimization, normal cleanup and sign-in persistence verified. Shared-host/storage/UI integration is implemented; isolated application acceptance passed at `43831ae`. |
 | Observe silent accounts | Partial source support: NAMES/JOIN/PART can expose nonposting chat-connected accounts; delivery and completeness are unknown. |
 | Discover 100% of video viewers | Unsupported by the available evidence and access rights. |
-| Population-adaptive request cadence | Implemented as an optional response-count scheduling heuristic, with Fixed mode, separate retry fences and per-channel target/actual status. New v2 migration and Windows/live acceptance are pending. Population validity, independence, coverage and absence probabilities remain unvalidated separately. |
+| Population-adaptive request cadence | Implemented as an optional response-count scheduling heuristic, with Fixed mode, separate retry fences and per-channel target/actual status. Atomic v1-to-v2 migration and a four-minute isolated live run passed at `6e5a49f`. Population validity, independence, coverage and absence probabilities remain unvalidated separately. |
 | Detect live state and retain titles/details | Implemented using optional Helix credentials; retains stream identity, start, titles/category/language, viewer-count checks and observed offline checks. Failures and stale checks remain Unknown. |
 | Collect during live broadcasts | Implemented selectable All enabled channels / Live channels only policy, persisted in SQLite. Live-only pauses only after a fresh successful offline check. Unknown or stale metadata keeps observation enabled. |
 | First/last positive observations | Implemented per account/channel evidence visit and broadcast summaries; PART never extends the last positive receipt. |
@@ -108,7 +108,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 - Check both search directions, historical migration, separate visits, range filters, themes and collection policy on the real package.
 - Login startup/recovery needs an explicitly selected opt-in task on the intended Windows account. It is implemented but is not installed without that choice.
 - The short performance increment passed Windows CI at `88a72ba0`; its owner-approved local rollout preserved history and credentials. Long reliability trials remain owner-managed. See [performance evidence](performance.md). Short trials and CI do not establish long-run reliability. The current interface increment adds historical title inspection and timeline zoom; validate it separately from the earlier releases.
-- Reconsider Community sampling only if a reproducible, permitted autonomous source is demonstrated. Validate freshness, caching, selection bias, population identity and correlation before introducing statistical estimates or adapting sample cadence.
+- The autonomous Community source gate and isolated application integration passed. Fixed/Adaptive scheduling is implemented as a response-count heuristic. Validate freshness, caching, selection bias, population identity and correlation before introducing statistical estimates; the scheduling formula does not establish those properties.
 
 ## Current development evidence
 
@@ -118,7 +118,7 @@ Two initial starts of that revision stopped with generic storage errors; later f
 
 Local validation uses isolated fixtures. Rust execution is delegated to hosted Windows MSVC CI because the available local GNU toolchain lacks its native C build dependencies. Final CI/run/artifact identifiers and live validation belong to the candidate verification record; do not reuse the earlier two-channel acceptance as evidence for this revision.
 
-UI visual checks use a clearly marked fictional localhost fixture, without a collector or database. They establish interface rendering and interaction only. The already approved application may keep collecting during development; each newly built executable still requires its own firewall launch approval before live validation. Short trials of the earlier revision are not acceptance of the new binary.
+Earlier UI visual fixtures were fictional and established rendering/interaction only. Community integration was subsequently checked in the real isolated application with two live channels, a retained sign-in and a separate test database. Existing firewall authorization is reused for the same approved executable filename and location; notify the owner before a genuinely new Internet-connected executable path. Short trials of an earlier revision are not blanket acceptance of later application changes.
 
 ## Further constraints
 
@@ -126,10 +126,18 @@ Windows, English source/UI/documentation, local credentials, indefinite retentio
 
 ## Adaptive cadence acceptance
 
-The current candidate adds count-based Adaptive/Fixed scheduling and a real atomic
+The application adds count-based Adaptive/Fixed scheduling and a real atomic
 Community v1-to-v2 settings migration. Existing installations keep Fixed mode and
 their saved preferences, pause and history; fresh installs remain disabled with
-Adaptive/300 defaults. Independent source review is closed, and 79 UI tests pass.
-Exact Windows compilation, migration and isolated live acceptance remain pending.
-The last accepted binary remains revision `43831ae` until those gates pass.
+Adaptive/300 defaults. Independent source review is closed. Revision `6e5a49f`
+passed Windows workflow [41253405010](https://github.com/Gevroska/veylurk/actions/runs/41253405010),
+including 201 ordinary library tests, the isolated recovery fixture, binary tests,
+three scale cases, 79 application UI tests, five theme tests and packaged operations.
+A 240-second isolated run saved six samples and 628 member receipts over two live
+channels, reused both website sign-in and metadata credentials, then exited normally
+with no pending samples or profile processes. All pre-upgrade immutable IRC and
+Community records compared identically, including 20,509 observations and 10,397
+member receipts. Fixed settings migrated intact; legacy PATCH requests preserved
+the current mode; explicit Adaptive targets matched the saved response counts.
+The production installation was unchanged. Long reliability trials remain owner-managed.
 See [the cadence contract](community-cadence.md).

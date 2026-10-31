@@ -234,6 +234,11 @@ td.actions { min-width: 260px; }
 .community-controls { margin-top: 1rem; }
 .community-controls .collection-settings { margin-bottom: 1rem; }
 .community-controls input { max-width: 20rem; }
+.community-controls .section-heading > div { min-width: 0; }
+.community-controls .section-heading > .badge { flex-shrink: 0; white-space: nowrap; }
+#community-settings-form { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+#community-settings-form select, #community-settings-form input { width: 100%; max-width: none; }
+#community-save { grid-column: 1 / -1; justify-self: start; }
 .community-cadence-table { margin-top: 1rem; }
 .community-cadence-table table { min-width: 1140px; font-size: .82rem; }
 .community-cadence-table td, .community-cadence-table th { padding: .6rem .75rem; }
@@ -313,6 +318,7 @@ footer { max-width: 1240px; padding: 1rem 0; margin: 0 auto; border-top: 1px sol
   .add-form button { margin-top: .8rem; width: 100%; }
   .search-form { grid-template-columns: 1fr; }
   .collection-settings, .presence-form { grid-template-columns: 1fr; }
+  #community-settings-form { grid-template-columns: minmax(0, 1fr); }
   .search-form .page-size { max-width: none; }
   .health-grid { grid-template-columns: 1fr; }
   .detail-list { grid-template-columns: 1fr; gap: .25rem; }

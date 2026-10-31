@@ -64,3 +64,16 @@ full settings. Source/member cursors and graph semantics are unchanged.
 
 This feature changes when samples are requested. It does not turn missing sample
 membership into departure, viewing time, 100% discovery or calibrated 99% confidence.
+
+## Validation
+
+Revision `6e5a49f` passed Windows compilation, strict checks, migration/rollback
+regressions and packaged operations. A four-minute isolated application run on
+two live channels saved six samples and 628 member receipts, reused website
+sign-in and metadata credentials, and exited normally with browser cleanup.
+Existing Fixed settings and immutable IRC/Community records survived migration.
+Old two-field PATCH requests preserved both Fixed and subsequently selected
+Adaptive mode. Calculated targets matched real response counts: 100 Viewer rows
+with reported totals of 494 and 285 produced 61- and 106-second targets; a later
+reported total of 486 changed the first target to 62 seconds. Actual intervals
+were reported separately. These checks do not calibrate coverage or confidence.
