@@ -1,6 +1,6 @@
 # Requirements and remaining work
 
-Updated: 2026-10-26 (Europe/Paris).
+Updated: 2026-10-31 (Europe/Paris).
 
 The owner has authorized implementation of the remaining features. The earlier review-only restriction and Astra-only allocation are superseded. Current AGENTS.md governs coordination: Sol High/XHigh handles implementation, testing, integration and delivery; Astra XHigh receives bounded complex scoping or critical analysis when justified.
 
@@ -9,6 +9,10 @@ The owner has authorized implementation of the remaining features. The earlier r
 The application collects received public Twitch IRC membership evidence autonomously, with optional official broadcast metadata. It records chat-connected accounts, including some accounts that never post. Chat membership is a different population from video viewers. A connected socket, a NAMES terminator or a viewer-count total does not establish complete membership.
 
 The original Community-panel sampling requirement remains unmet. Historical direct HTTP and autonomous browser experiments did not produce a maintainable working source; the recorded CommunityTab request failed an integrity check. These probes are not a production collector. No integrity or authorization control is bypassed by this implementation.
+
+On 2026-10-31, the owner superseded the anonymous-only requirement and authorized using a dedicated Twitch account. The Chrome for Testing sign-in attempt displayed Twitch's unsupported-browser error; this message does not identify its cause. No replacement browser was installed. The owner then signed in through the in-app Browser. Two native CommunityTab responses on a verified live channel returned 149 and 153 distinct accounts, including 100 viewers each, with 254 accounts in their union and no source errors. These are observations from that browser session; they establish neither autonomous operation nor statistically independent samples.
+
+The owner explicitly approved the existing WebView2 runtime after its Edge engine was explained. An isolated native Rust source proof is under `probes/community-webview2/`; it has its own profile, normal owner-operated sign-in, manually armed bounded samples, and aggregate-only evidence. Its Windows build and live rendering, login, session persistence, Community access, and cleanup are separate acceptance gates. Passwords and verification codes are entered directly into Twitch, never into chat or Veylurk's database. No cookies or other browser sessions are imported. The production collector, credentials, and history remain untouched; periodic Community sampling is not integrated into the application.
 
 Official documentation checked on 2026-10-25 states that IRC JOIN/PART delivery is unavailable above 1,000 chat-room users. Get Chatters requires authorized broadcaster/moderator access and the relevant scope; app client credentials alone do not authorize arbitrary third-party channels. See [IRC membership limits](https://dev.twitch.tv/docs/chat/irc/#part-command) and [Get Chatters](https://dev.twitch.tv/docs/api/reference/#get-chatters).
 
@@ -24,7 +28,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Simple English localhost interface | Implemented; listener on 127.0.0.1 with Host/Origin/JSON checks. |
 | Enter a channel list | Implemented; bulk normalization, deduplication, pause/resume/removal, up to 50 tracked channels. History survives removal. |
 | Autonomous operation without Brave or extensions | Implemented with one IRC WebSocket. No browser runtime is needed for collection. |
-| Repeated Community-list samples | Source-blocked; historical probes do not fulfill this feature. |
+| Repeated Community-list samples | Two signed-in in-app Browser responses verified; independent WebView2 proof and production scheduling remain pending. Historical probes and account setup do not fulfill this feature. |
 | Observe silent accounts | Partial source support: NAMES/JOIN/PART can expose nonposting chat-connected accounts; delivery and completeness are unknown. |
 | Discover 100% of video viewers | Unsupported by the available evidence and access rights. |
 | Population-adaptive request cadence | Source-blocked. Current IRC collection is event-driven; joins, retries, network backoff and metadata requests are paced. |

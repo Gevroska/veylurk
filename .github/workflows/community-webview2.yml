@@ -1,0 +1,83 @@
+name: Community WebView2 proof
+
+on:
+  push:
+    paths:
+      - '.github/workflows/community-webview2.yml'
+      - 'probes/community-webview2/**'
+  pull_request:
+    paths:
+      - '.github/workflows/community-webview2.yml'
+      - 'probes/community-webview2/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: target/community-webview2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Resolve the bootstrap lockfile only when missing
+        id: lockfile
+        shell: pwsh
+        run: |
+          $manifest = 'probes/community-webview2/Cargo.toml'
+          $generated = -not (Test-Path 'probes/community-webview2/Cargo.lock')
+          if ($generated) {
+            cargo generate-lockfile --manifest-path $manifest
+            if ($LASTEXITCODE -ne 0) { throw 'Lockfile generation failed' }
+          }
+          "generated=$($generated.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+      - name: Preserve the exact resolved lockfile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-webview2-lockfile
+          path: probes/community-webview2/Cargo.lock
+          if-no-files-found: error
+      - name: Check formatting
+        run: cargo fmt --manifest-path probes/community-webview2/Cargo.toml --all -- --check
+      - name: Lint the proof
+        run: cargo clippy --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Test parsing and bounds without Twitch
+        run: cargo test --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets
+      - name: Build the Windows proof
+        run: cargo build --manifest-path probes/community-webview2/Cargo.toml --locked --release
+      - name: Package the isolated proof without profiles or credentials
+        shell: pwsh
+        env:
+          GENERATED_LOCK: ${{ steps.lockfile.outputs.generated }}
+        run: |
+          $package = 'community-webview2-package'
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item -LiteralPath 'target/community-webview2/release/veylurk-community-webview2-proof.exe' -Destination $package
+          Copy-Item -LiteralPath 'probes/community-webview2/README.md' -Destination "$package/README.md"
+          Copy-Item -LiteralPath 'probes/community-webview2/Cargo.toml' -Destination "$package/Cargo.toml"
+          Copy-Item -LiteralPath 'probes/community-webview2/Cargo.lock' -Destination "$package/Cargo.lock"
+          $loader = 'target/community-webview2/release/WebView2Loader.dll'
+          if (Test-Path -LiteralPath $loader) { Copy-Item -LiteralPath $loader -Destination $package }
+          $manifest = [ordered]@{
+            source_revision = $env:GITHUB_SHA
+            source_tree = (git rev-parse 'HEAD^{tree}')
+            bootstrap_lock_generated = ($env:GENERATED_LOCK -eq 'true')
+            runtime_bundled = $false
+            profile_bundled = $false
+            live_source_validated = $false
+            files = @(Get-ChildItem -LiteralPath $package -File | Sort-Object Name | ForEach-Object {
+              @{ name = $_.Name; size = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+            })
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$package/build-manifest.json" -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: community-webview2-proof-windows-x64
+          path: community-webview2-package/*
+          if-no-files-found: error
