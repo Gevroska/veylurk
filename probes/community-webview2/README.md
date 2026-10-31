@@ -79,11 +79,14 @@ at most five additional seconds for browser-process exit confirmation.
 
 The existing profile is required. No automatic login is attempted. The source
 page must show the signed-in User Avatar, chat structure, Community control,
-and a loaded video whose paused state is corroborated by the normal Play
+and a video whose paused state is corroborated by the normal Play
 control. These prerequisites must remain ready for at least two seconds before
 observation is enabled. Structural selectors are conservative candidates; the
 runtime must validate them. No account identity, chat content, or media URL is
 returned or retained by this UI check.
+Video decoding/buffering readiness and ended state do not gate sampling. Their
+combined `video_ready` flag is diagnostic only: the proof never loads or plays
+media to make that flag true.
 
 Pause is checked again immediately before the ordinary Community click and
 after the response body arrives, before sample acceptance. The same checks
@@ -158,6 +161,9 @@ Each attempt also records video presence/paused state, whether pause was ever
 verified and verified before the trigger, normal Pause click count, the last
 pause-check time, and whether signed-in UI was observed. These are point-in-time
 observations; they do not establish continuous absence of playback or traffic.
+The last structural player observation is retained before applying the gate,
+including on failure. Its eight fields contain only booleans or null, separating
+video readiness, actual pause, Play-control presence, and channel UI readiness.
 Matched-source timing failures retain at most one numeric diagnostic containing
 the raw finite timestamps, differences, encoded length, and a specific reason
 code. Nonfinite numbers become null. No request IDs, URLs, headers, or accounts

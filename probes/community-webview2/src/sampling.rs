@@ -17,12 +17,13 @@ pub const MAX_CANDIDATES: usize = 4;
 pub const MAX_NAVIGATION_IDS: usize = 64;
 
 /// Structural observations only; no account labels, chat text, or media URLs.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PlayerObservation {
     pub signed_in: bool,
     pub chat_ready: bool,
     pub community_ready: bool,
     pub video_present: bool,
+    // Decoding/buffering state is diagnostic only; it does not prove pause.
     pub video_ready: bool,
     pub video_paused: Option<bool>,
     pub play_control: bool,
@@ -62,7 +63,6 @@ impl PlayerGate {
             self.pause_clicked = true;
         }
         let paused = observation.video_present
-            && observation.video_ready
             && observation.video_paused == Some(true)
             && observation.play_control;
         if !paused {
@@ -792,6 +792,7 @@ pub struct AttemptEvidence {
     pub player_pause_last_checked_ms: Option<u64>,
     pub normal_pause_clicks: usize,
     pub signed_in_ui_verified: bool,
+    pub last_player_observation: Option<PlayerObservation>,
     pub http_status: Option<u16>,
     pub provenance: Option<Provenance>,
     pub reported_chat_count: Option<u64>,
@@ -855,6 +856,7 @@ impl RunEvidence {
             player_pause_last_checked_ms: None,
             normal_pause_clicks: 0,
             signed_in_ui_verified: false,
+            last_player_observation: None,
             http_status: None,
             provenance: None,
             reported_chat_count: None,
@@ -950,6 +952,75 @@ mod tests {
         assert!(gate.observe(4_100, &ready, true).unwrap());
         assert!(gate.ready());
         assert!(!gate.may_click_pause());
+    }
+
+    #[test]
+    fn unbuffered_or_ended_video_can_prove_pause_without_requesting_playback() {
+        let mut gate = PlayerGate::default();
+        let mut observed = paused_channel();
+        // Both no decoded frame and ended media produce this diagnostic value.
+        observed.video_ready = false;
+        assert!(!gate.observe(0, &observed, true).unwrap());
+        assert!(gate.pause_verified());
+        assert!(!gate.may_click_pause());
+        assert!(!gate
+            .observe(PAUSED_READY_STABLE_MS - 1, &observed, true)
+            .unwrap());
+        assert!(gate
+            .observe(PAUSED_READY_STABLE_MS, &observed, true)
+            .unwrap());
+        assert!(gate.observe(3_000, &observed, false).unwrap());
+        assert!(!observed.pause_clicked);
+    }
+
+    #[test]
+    fn diagnostic_decode_readiness_never_substitutes_for_actual_pause() {
+        for missing in ["video", "paused", "known_paused", "control"] {
+            let mut gate = PlayerGate::default();
+            let mut observed = paused_channel();
+            match missing {
+                "video" => observed.video_present = false,
+                "paused" => observed.video_paused = Some(false),
+                "known_paused" => observed.video_paused = None,
+                _ => observed.play_control = false,
+            }
+            assert!(!gate.observe(0, &observed, true).unwrap());
+            assert!(!gate
+                .observe(PAUSED_READY_STABLE_MS, &observed, true)
+                .unwrap());
+            assert!(!gate.pause_verified());
+            assert!(!gate.ready());
+        }
+    }
+
+    #[test]
+    fn last_player_observation_serializes_only_allowlisted_booleans_or_null() {
+        let observed: PlayerObservation = serde_json::from_value(json!({
+            "signed_in":true,"chat_ready":true,"community_ready":false,
+            "video_present":true,"video_ready":false,"video_paused":null,
+            "play_control":false,"pause_clicked":false,
+            "account":"private_account","media_url":"private_url"
+        }))
+        .unwrap();
+        let config = Config::new(vec!["first".into(), "second".into()], 1, 60).unwrap();
+        let mut evidence = RunEvidence::new(&config);
+        evidence.start(Schedule::new(config).start_due(0).unwrap());
+        evidence.attempts[0].last_player_observation = Some(observed);
+        evidence.finish(25_000, "navigation_ui_deadline");
+        let saved = serde_json::to_value(evidence).unwrap();
+        let snapshot = saved
+            .pointer("/attempts/0/last_player_observation")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(snapshot.len(), 8);
+        assert!(snapshot
+            .values()
+            .all(|value| value.is_boolean() || value.is_null()));
+        assert_eq!(snapshot["video_ready"], false);
+        assert_eq!(snapshot["play_control"], false);
+        assert_eq!(snapshot["community_ready"], false);
+        assert!(!saved.to_string().contains("private_"));
     }
 
     #[test]

@@ -75,7 +75,7 @@ const COMMUNITY_UI: &str = r#"(() => {
     }
     if (!__CLICK__) return result('observed');
     if (!before.signed_in || !before.chat_ready || !before.community_ready
-        || !before.video_ready || before.video_paused !== true || !before.play_control)
+        || !before.video_present || before.video_paused !== true || !before.play_control)
       return result('pause_or_readiness_lost');
   }
   if (!target || target.disabled) return result('waiting_ui');
@@ -754,6 +754,7 @@ impl App {
                     attempt.player_pause_last_checked_ms = Some(app.elapsed_ms());
                     attempt.normal_pause_clicks += usize::from(ui.player.pause_clicked);
                     attempt.signed_in_ui_verified |= ui.player.signed_in;
+                    attempt.last_player_observation = Some(ui.player.clone());
                 }
             }
             let player_ready = if automatic
