@@ -87,11 +87,20 @@ returned or retained by this UI check.
 Video decoding/buffering readiness and ended state do not gate sampling. Their
 combined `video_ready` flag is diagnostic only: the proof never loads or plays
 media to make that flag true.
+During initial page setup, a preliminary paused/Play observation does not latch
+readiness. Changing controls reset the stability interval. If playback starts,
+the one allowed normal Pause action is followed by fresh confirmation and a full
+two-second stability interval; the proof does not assume the click took effect.
 
 Pause is checked again immediately before the ordinary Community click and
 after the response body arrives, before sample acceptance. The same checks
-continue during response waits and between attempts. A lost verified pause
-stops the run. The next navigation gets a new pause/readiness gate. There is no
+continue during response waits and between attempts. Once stable readiness is
+established, actual resumed playback or a missing video stops the run. A missing
+Play control while all videos remain paused instead withholds the trigger or
+sample acceptance until two seconds of stable reverification. Waiting does not
+reset the original deadline or repeat an actual Community click. Evidence
+distinguishes a trigger deadline, player-reverification deadline, and native
+response timeout. The next navigation gets a new pause/readiness gate. There is no
 mute substitute, media URL request, direct player API call, ad skip, DOM removal,
 or background/occlusion flag. A paused video does not prove absent video network
 traffic or low resource usage. Native buttons cannot redirect the autonomous
@@ -103,7 +112,7 @@ This route is explicit: autonomous mode never tries the chat popout and never
 falls back or retries after a denial. A normal full-channel control succeeded
 after a separate denied popout run; that does not establish the denial's cause.
 
-There is one ordinary Community click per attempt. No failed attempt is retried:
+There is at most one ordinary Community click per attempt. No failed attempt is retried:
 a channel that reaches a response deadline is skipped in later circuits while
 its paused page remains guarded. Navigation/UI failure stops the run because
 pause cannot be assured during a scheduling gap. HTTP 401/403/429, integrity,

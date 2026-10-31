@@ -127,6 +127,7 @@ struct State {
     auto_stage: Option<AutoStage>,
     player_gate: sampling::PlayerGate,
     pending_sample: Option<(community_webview2_proof::ParsedSample, BodyRequest)>,
+    trigger_pending: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -269,6 +270,7 @@ impl App {
         state.network_pending = false;
         state.tracker = None;
         state.pending_sample = None;
+        state.trigger_pending = false;
     }
 
     fn record_action(&self, target: &'static str) {
@@ -637,6 +639,7 @@ impl App {
             ));
             if state.schedule.is_some() {
                 state.auto_stage = Some(AutoStage::Sampling);
+                state.trigger_pending = true;
             }
         }
         {
@@ -665,6 +668,7 @@ impl App {
                 matches!(state.auto_stage, Some(AutoStage::Preparing(_)))
                     && state.player_gate.may_click_pause(),
                 click
+                    || state.trigger_pending
                     || matches!(
                         state.auto_stage,
                         Some(AutoStage::Preparing(_) | AutoStage::Ready(_))
@@ -786,12 +790,15 @@ impl App {
             match ui.code.as_str() {
                 "challenge_denied" => app.sample_failure(Failure::ChallengeDenied),
                 "wrong_page" => app.sample_failure(Failure::AuthenticationDenied),
-                "pause_or_readiness_lost" => app.fail(
-                    "pause_or_readiness_lost",
-                    "The paused channel prerequisites changed before the Community click.",
-                ),
+                // The script made no Community click. Actual playback loss has
+                // already failed the gate; missing controls wait within the
+                // original response deadline without rearming or a source retry.
+                "pause_or_readiness_lost" if automatic && click => (),
                 "observed" if automatic && !click => {
-                    let stage = app.state.borrow().auto_stage;
+                    let (stage, trigger_pending) = {
+                        let state = app.state.borrow();
+                        (state.auto_stage, state.trigger_pending)
+                    };
                     if player_ready {
                         match stage {
                             Some(AutoStage::Preparing(deadline)) => {
@@ -800,6 +807,7 @@ impl App {
                                 app.enable_network(false);
                             }
                             Some(AutoStage::Ready(_)) if require_readiness => app.begin_sample(),
+                            Some(AutoStage::Sampling) if trigger_pending => app.ui_step(true),
                             Some(AutoStage::Sampling) if checks_pending_sample => {
                                 app.finish_pending_sample()
                             }
@@ -836,7 +844,10 @@ impl App {
                             tracker.set_trigger(ui.trigger_unix_ms.ok_or("missing_trigger_time")?)
                         });
                     match outcome {
-                        Ok(()) => app.try_body(),
+                        Ok(()) => {
+                            app.state.borrow_mut().trigger_pending = false;
+                            app.try_body();
+                        }
                         Err(code) => {
                             app.fail(code, "Native trigger identity could not be verified.")
                         }
@@ -1235,7 +1246,7 @@ impl App {
             Some(AutoStage::Preparing(_) | AutoStage::Enabling(_) | AutoStage::Ready(_)) => {
                 self.ui_step(false)
             }
-            None if self.state.borrow().player_gate.ready() => self.ui_step(false),
+            None if self.state.borrow().player_gate.pause_verified() => self.ui_step(false),
             _ => (),
         }
     }
@@ -1338,7 +1349,17 @@ impl App {
             .is_some_and(|time| Instant::now() >= time)
         {
             if self.automatic() {
-                self.end_auto_attempt("native_sample_timeout", false);
+                let reason = {
+                    let state = self.state.borrow();
+                    if state.trigger_pending {
+                        "community_trigger_deadline"
+                    } else if state.pending_sample.is_some() {
+                        "player_reverification_deadline"
+                    } else {
+                        "native_sample_timeout"
+                    }
+                };
+                self.end_auto_attempt(reason, false);
             } else {
                 self.fail(
                     "native_sample_timeout",
