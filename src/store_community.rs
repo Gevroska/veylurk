@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const COMMUNITY_SCHEMA_VERSION: i64 = 1;
+pub const COMMUNITY_SCHEMA_VERSION: i64 = 2;
 pub const COMMUNITY_MAX_MEMBERS: usize = 4096;
 pub const COMMUNITY_ROLE_BROADCASTER: u32 = 1;
 pub const COMMUNITY_ROLE_STAFF: u32 = 2;
@@ -18,10 +18,35 @@ const ROLE_MASK: u32 = 63;
 const MAX_TIMING_MS: f64 = 86_400_000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommunityCadenceMode {
+    Fixed,
+    Adaptive,
+}
+
+impl CommunityCadenceMode {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Adaptive => "adaptive",
+        }
+    }
+
+    fn from_code(code: &str) -> Result<Self, StoreError> {
+        match code {
+            "fixed" => Ok(Self::Fixed),
+            "adaptive" => Ok(Self::Adaptive),
+            _ => Err(StoreError::Invalid),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommunitySettings {
     pub enabled: bool,
     pub target_interval_seconds: u32,
+    pub cadence_mode: CommunityCadenceMode,
 }
 
 impl Default for CommunitySettings {
@@ -29,6 +54,7 @@ impl Default for CommunitySettings {
         Self {
             enabled: false,
             target_interval_seconds: 300,
+            cadence_mode: CommunityCadenceMode::Adaptive,
         }
     }
 }
@@ -371,7 +397,8 @@ pub struct CommunityStats {
     pub last_received_at_utc: Option<String>,
 }
 
-const SCHEMA: &str = "
+// Released v1 definition: fresh databases use the same atomic evolution as existing v1 data.
+const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS community_schema_version(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
 INSERT OR IGNORE INTO community_schema_version VALUES(1,1);
 CREATE TABLE IF NOT EXISTS community_settings(id INTEGER PRIMARY KEY CHECK(id=1),enabled INTEGER NOT NULL CHECK(enabled IN(0,1)),target_interval_seconds INTEGER NOT NULL CHECK(target_interval_seconds BETWEEN 30 AND 86400));
@@ -396,32 +423,74 @@ CREATE INDEX IF NOT EXISTS community_members_sample_member ON community_members(
 CREATE TRIGGER IF NOT EXISTS community_members_success_only BEFORE INSERT ON community_members WHEN NOT EXISTS(SELECT 1 FROM community_samples WHERE id=NEW.sample_id AND outcome='success' AND channel=NEW.channel) BEGIN SELECT RAISE(ABORT,'community member requires a matching successful sample'); END;
 ";
 
+const MIGRATE_V2: &str = "
+ALTER TABLE community_settings ADD COLUMN cadence_mode TEXT NOT NULL DEFAULT 'fixed' CHECK(cadence_mode IN('fixed','adaptive'));
+UPDATE community_schema_version SET version=2 WHERE id=1;
+";
+
 /// Runs on the storage worker without a query progress handler. Creation and recovery commit together.
 pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
     let has_version: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='community_schema_version')", [], |r| r.get(0))?;
-    if has_version {
-        let versions: Vec<i64> = conn
-            .prepare("SELECT version FROM community_schema_version")?
-            .query_map([], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        if versions != [COMMUNITY_SCHEMA_VERSION] {
-            return Err(StoreError::Initialize);
+    let version = if has_version {
+        let versions = (|| -> rusqlite::Result<Vec<(i64, i64)>> {
+            conn.prepare("SELECT id,version FROM community_schema_version")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+        })()
+        .map_err(|_| StoreError::Initialize)?;
+        match versions.as_slice() {
+            [(1, version)] if matches!(*version, 1 | COMMUNITY_SCHEMA_VERSION) => Some(*version),
+            _ => return Err(StoreError::Initialize),
         }
     } else {
-        let retained: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN('community_settings','community_pause','community_runs','community_samples','community_members'))", [], |r| r.get(0))?;
+        let retained: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name GLOB 'community_*')",
+            [],
+            |r| r.get(0),
+        )?;
         if retained {
             return Err(StoreError::Initialize);
         }
-    }
+        None
+    };
     let tx = conn.transaction()?;
-    tx.execute_batch(SCHEMA)?;
-    // An unknown retained reason must not silently resume collection or perform recovery.
+    if version.is_none() {
+        tx.execute_batch(SCHEMA_V1)?;
+    }
+    if version.is_none_or(|version| version == 1) {
+        tx.execute_batch(MIGRATE_V2)?;
+        if version.is_none() {
+            tx.execute(
+                "UPDATE community_settings SET cadence_mode='adaptive' WHERE id=1",
+                [],
+            )?;
+        }
+    }
+    // Invalid retained configuration must not silently change cadence, clear a pause,
+    // or perform recovery. A failure rolls back schema and version changes as well.
+    read_community_settings(&tx).map_err(|_| StoreError::Initialize)?;
     read_community_pause(&tx).map_err(|_| StoreError::Initialize)?;
     let at = now();
     tx.execute("UPDATE community_samples SET outcome='interrupted',failure_code='process_interrupted',completed_at_utc=?1 WHERE outcome='pending'", [&at])?;
     tx.execute("UPDATE community_runs SET ended_at_utc=?1,end_reason='process_interrupted' WHERE ended_at_utc IS NULL", [&at])?;
     tx.commit()?;
     Ok(())
+}
+
+fn read_community_settings(conn: &Connection) -> Result<CommunitySettings, StoreError> {
+    let (enabled, interval, mode): (i64, i64, String) = conn.query_row(
+        "SELECT enabled,target_interval_seconds,cadence_mode FROM community_settings WHERE id=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if !matches!(enabled, 0 | 1) || !(30..=86400).contains(&interval) {
+        return Err(StoreError::Invalid);
+    }
+    Ok(CommunitySettings {
+        enabled: enabled == 1,
+        target_interval_seconds: interval as u32,
+        cadence_mode: CommunityCadenceMode::from_code(&mode)?,
+    })
 }
 
 fn read_community_pause(conn: &Connection) -> Result<Option<CommunityPauseReason>, StoreError> {
@@ -514,19 +583,8 @@ impl Store {
     }
 
     pub async fn community_settings(&self) -> Result<CommunitySettings, StoreError> {
-        self.call_read(Operation::Query, |conn| {
-            Ok(conn.query_row(
-                "SELECT enabled,target_interval_seconds FROM community_settings WHERE id=1",
-                [],
-                |r| {
-                    Ok(CommunitySettings {
-                        enabled: r.get(0)?,
-                        target_interval_seconds: r.get(1)?,
-                    })
-                },
-            )?)
-        })
-        .await
+        self.call_read(Operation::Query, |conn| read_community_settings(conn))
+            .await
     }
 
     pub async fn set_community_settings(
@@ -538,8 +596,8 @@ impl Store {
         }
         self.call_write(Operation::CommunityAppend, move |conn| {
             conn.execute(
-                "UPDATE community_settings SET enabled=?1,target_interval_seconds=?2 WHERE id=1",
-                params![settings.enabled, settings.target_interval_seconds],
+                "UPDATE community_settings SET enabled=?1,target_interval_seconds=?2,cadence_mode=?3 WHERE id=1",
+                params![settings.enabled, settings.target_interval_seconds,settings.cadence_mode.code()],
             )?;
             Ok(())
         })

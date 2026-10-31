@@ -101,6 +101,284 @@ fn insert_retained_community_rows(conn: &mut Connection, first: i64, last: i64) 
     tx.commit().unwrap();
 }
 
+fn v1_fixture(conn: &mut Connection, enabled: bool, interval: u32) {
+    // Execute the unchanged released DDL: this table genuinely lacks cadence_mode.
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    assert_eq!(
+        settings_columns(conn),
+        ["id", "enabled", "target_interval_seconds"]
+    );
+    insert_retained_community_rows(conn, 1, 3);
+    conn.execute(
+        "UPDATE community_settings SET enabled=?1,target_interval_seconds=?2 WHERE id=1",
+        params![enabled, interval],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "UPDATE community_pause SET reason='integrity_denied' WHERE id=1;
+        UPDATE community_runs SET ended_at_utc='2020-01-01T00:00:02.000Z',end_reason='shutdown';",
+    )
+    .unwrap();
+}
+
+fn settings_columns(conn: &Connection) -> Vec<String> {
+    conn.prepare("PRAGMA table_info(community_settings)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn component_schema(conn: &Connection) -> Vec<(String, Option<String>)> {
+    conn.prepare("SELECT name,sql FROM sqlite_master WHERE name GLOB 'community_*' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn actual_v1_migration_preserves_preferences_pause_and_history_and_reopen_is_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    for (enabled, interval) in [(false, 30), (true, 777)] {
+        let path = directory.path().join(format!("v1-{enabled}.sqlite3"));
+        let mut conn = Connection::open(&path).unwrap();
+        v1_fixture(&mut conn, enabled, interval);
+        let history = [
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let retained = snapshot(&conn, &history);
+        drop(conn);
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(
+            store.community_settings().await.unwrap(),
+            CommunitySettings {
+                enabled,
+                target_interval_seconds: interval,
+                cadence_mode: CommunityCadenceMode::Fixed,
+            }
+        );
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            Some(CommunityPauseReason::IntegrityDenied)
+        );
+        assert_eq!(store.community_stats().await.unwrap().schema_version, 2);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            settings_columns(&conn),
+            ["id", "enabled", "target_interval_seconds", "cadence_mode"]
+        );
+        assert_eq!(snapshot(&conn, &history), retained);
+        let all = [
+            "community_schema_version",
+            "community_settings",
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let migrated = snapshot(&conn, &all);
+        let schema = component_schema(&conn);
+        drop(conn);
+        let store = reopen(&path, store).await;
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(snapshot(&conn, &all), migrated);
+        assert_eq!(component_schema(&conn), schema);
+        assert_eq!(
+            store
+                .community_receipts(CommunityReceiptQuery::default())
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            3
+        );
+    }
+}
+
+#[tokio::test]
+async fn fresh_install_is_disabled_adaptive_and_typed_modes_round_trip_without_clearing_pause() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cadence.sqlite3");
+    let mut store = Store::open(&path).await.unwrap();
+    assert_eq!(
+        store.community_settings().await.unwrap(),
+        CommunitySettings {
+            enabled: false,
+            target_interval_seconds: 300,
+            cadence_mode: CommunityCadenceMode::Adaptive,
+        }
+    );
+    store
+        .set_community_pause(Some(CommunityPauseReason::SourceDenied))
+        .await
+        .unwrap();
+    for cadence_mode in [CommunityCadenceMode::Fixed, CommunityCadenceMode::Adaptive] {
+        let settings = CommunitySettings {
+            enabled: true,
+            target_interval_seconds: 600,
+            cadence_mode,
+        };
+        store.set_community_settings(settings).await.unwrap();
+        store = reopen(&path, store).await;
+        assert_eq!(store.community_settings().await.unwrap(), settings);
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            Some(CommunityPauseReason::SourceDenied)
+        );
+        assert_eq!(
+            serde_json::to_value(cadence_mode).unwrap(),
+            cadence_mode.code()
+        );
+    }
+    for json in [
+        r#"{"enabled":true,"target_interval_seconds":300}"#,
+        r#"{"enabled":true,"target_interval_seconds":300,"cadence_mode":"unknown"}"#,
+    ] {
+        assert!(serde_json::from_str::<CommunitySettings>(json).is_err());
+    }
+}
+
+#[test]
+fn malformed_version_and_false_v2_declarations_are_rejected_without_mutation() {
+    for values in [
+        "",
+        "(1,3)",
+        "(1,0)",
+        "(1,-1)",
+        "(1,NULL)",
+        "(1,'malformed')",
+        "(1,1.5)",
+        "(2,1)",
+        "(1,1),(2,1)",
+        "(1,1),(1,1)",
+    ] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        v1_fixture(&mut conn, true, 777);
+        conn.execute_batch("DROP TABLE community_schema_version;CREATE TABLE community_schema_version(id,version);").unwrap();
+        if !values.is_empty() {
+            conn.execute_batch(&format!(
+                "INSERT INTO community_schema_version VALUES {values};"
+            ))
+            .unwrap();
+        }
+        let tables = [
+            "community_schema_version",
+            "community_settings",
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let before = snapshot(&conn, &tables);
+        let schema = component_schema(&conn);
+        assert!(
+            matches!(initialize(&mut conn), Err(StoreError::Initialize)),
+            "{values}"
+        );
+        assert_eq!(snapshot(&conn, &tables), before, "{values}");
+        assert_eq!(component_schema(&conn), schema, "{values}");
+    }
+    let mut conn = Connection::open_in_memory().unwrap();
+    v1_fixture(&mut conn, true, 777);
+    conn.execute("UPDATE community_schema_version SET version=2", [])
+        .unwrap();
+    let schema = component_schema(&conn);
+    let before = snapshot(
+        &conn,
+        &[
+            "community_schema_version",
+            "community_settings",
+            "community_pause",
+        ],
+    );
+    assert!(matches!(initialize(&mut conn), Err(StoreError::Initialize)));
+    assert_eq!(component_schema(&conn), schema);
+    assert_eq!(
+        snapshot(
+            &conn,
+            &[
+                "community_schema_version",
+                "community_settings",
+                "community_pause"
+            ]
+        ),
+        before
+    );
+}
+
+#[test]
+fn failed_migration_rolls_back_added_column_version_and_recovery() {
+    for failure in ["invalid_pause", "invalid_mode", "version_write"] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        v1_fixture(&mut conn, true, 777);
+        conn.execute_batch("UPDATE community_runs SET ended_at_utc=NULL,end_reason=NULL;
+            INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,4,'room','2020-01-01T00:00:01.000Z','pending');").unwrap();
+        if failure == "invalid_pause" {
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;UPDATE community_pause SET reason='unknown';PRAGMA ignore_check_constraints=OFF;").unwrap();
+        } else if failure == "invalid_mode" {
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;
+                CREATE TRIGGER community_invalid_mode AFTER UPDATE ON community_schema_version BEGIN UPDATE community_settings SET cadence_mode='unknown'; END;").unwrap();
+        } else {
+            // The ALTER succeeds before this injected version-update failure.
+            conn.execute_batch("CREATE TRIGGER community_fail_version BEFORE UPDATE ON community_schema_version BEGIN SELECT RAISE(ABORT,'fixture version update'); END;").unwrap();
+        }
+        let tables = [
+            "community_schema_version",
+            "community_settings",
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let before = snapshot(&conn, &tables);
+        let schema = component_schema(&conn);
+        assert!(initialize(&mut conn).is_err(), "{failure}");
+        assert_eq!(snapshot(&conn, &tables), before, "{failure}");
+        assert_eq!(component_schema(&conn), schema, "{failure}");
+        assert_eq!(
+            settings_columns(&conn),
+            ["id", "enabled", "target_interval_seconds"]
+        );
+        assert!(conn.is_autocommit());
+    }
+}
+
+#[test]
+fn invalid_retained_v2_mode_blocks_recovery_without_mutation() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize(&mut conn).unwrap();
+    assert!(conn
+        .execute("UPDATE community_settings SET cadence_mode='unknown'", [])
+        .is_err());
+    conn.execute_batch("INSERT INTO community_runs VALUES(1,'2024-01-01T00:00:00.000Z',NULL,NULL,'fixture');
+        INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,1,'room','2024-01-01T00:00:00.000Z','pending');
+        UPDATE community_pause SET reason='integrity_denied';
+        PRAGMA ignore_check_constraints=ON;UPDATE community_settings SET cadence_mode='unknown';PRAGMA ignore_check_constraints=OFF;").unwrap();
+    let tables = [
+        "community_schema_version",
+        "community_settings",
+        "community_pause",
+        "community_runs",
+        "community_samples",
+    ];
+    let before = snapshot(&conn, &tables);
+    let schema = component_schema(&conn);
+    assert!(matches!(
+        read_community_settings(&conn),
+        Err(StoreError::Invalid)
+    ));
+    assert!(matches!(initialize(&mut conn), Err(StoreError::Initialize)));
+    assert_eq!(snapshot(&conn, &tables), before);
+    assert_eq!(component_schema(&conn), schema);
+    assert!(conn.is_autocommit());
+}
+
 #[tokio::test]
 async fn additive_migration_and_reopen_preserve_every_legacy_record_and_model_version() {
     let directory = tempfile::tempdir().unwrap();
@@ -172,7 +450,7 @@ fn unknown_component_version_is_rejected_before_component_creation_or_recovery()
     initialize(&mut conn).unwrap();
     conn.execute_batch("INSERT INTO community_runs VALUES(1,'2024-01-01T00:00:00Z',NULL,NULL,'fixture');
         INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,1,'room','2024-01-01T00:00:00Z','pending');
-        UPDATE community_schema_version SET version=999;").unwrap();
+        UPDATE community_schema_version SET version=3;").unwrap();
     let tables = [
         "community_schema_version",
         "community_settings",
@@ -217,6 +495,7 @@ async fn durable_pause_survives_recovery_and_preference_changes_until_explicit_c
     let settings = CommunitySettings {
         enabled: true,
         target_interval_seconds: 600,
+        cadence_mode: CommunityCadenceMode::Fixed,
     };
     store.set_community_settings(settings).await.unwrap();
     for reason in [
@@ -500,7 +779,8 @@ async fn malformed_inputs_fail_without_changing_pending_rows_or_settings() {
         assert!(store
             .set_community_settings(CommunitySettings {
                 enabled: true,
-                target_interval_seconds: interval
+                target_interval_seconds: interval,
+                cadence_mode: CommunityCadenceMode::Fixed,
             })
             .await
             .is_err());
@@ -513,6 +793,7 @@ async fn malformed_inputs_fail_without_changing_pending_rows_or_settings() {
         .set_community_settings(CommunitySettings {
             enabled: true,
             target_interval_seconds: 600,
+            cadence_mode: CommunityCadenceMode::Fixed,
         })
         .await
         .unwrap();
@@ -594,7 +875,7 @@ async fn malformed_inputs_fail_without_changing_pending_rows_or_settings() {
     assert_eq!(row.provenance.transport, CommunityTransport::Unknown);
     assert_eq!(row.provenance.finished_minus_response_ms, Some(-2.0));
     assert!(serde_json::from_str::<CommunitySettings>(
-        r#"{"enabled":true,"target_interval_seconds":300,"cookie":"secret"}"#
+        r#"{"enabled":true,"target_interval_seconds":300,"cadence_mode":"fixed","cookie":"secret"}"#
     )
     .is_err());
     assert!(serde_json::from_str::<CommunityProvenance>(r#"{"headers":{}}"#).is_err());
@@ -832,6 +1113,7 @@ async fn retained_account_and_channel_queries_use_component_indexes_and_query_ca
         .set_community_settings(CommunitySettings {
             enabled: true,
             target_interval_seconds: 300,
+            cadence_mode: CommunityCadenceMode::Fixed,
         })
         .await
         .unwrap();
@@ -945,7 +1227,7 @@ async fn initialization_failure_is_classified_as_community_initialization() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("future.sqlite3");
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("CREATE TABLE community_schema_version(id INTEGER PRIMARY KEY,version INTEGER);INSERT INTO community_schema_version VALUES(1,999);").unwrap();
+    conn.execute_batch("CREATE TABLE community_schema_version(id INTEGER PRIMARY KEY,version INTEGER);INSERT INTO community_schema_version VALUES(1,3);").unwrap();
     drop(conn);
     let diagnostics = crate::diagnostics::Diagnostics::new(&path);
     assert!(Store::open_with_diagnostics(&path, diagnostics.clone())

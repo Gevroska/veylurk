@@ -562,7 +562,10 @@ function metadataAt(extra = {}) {
 }
 
 function communityState(extra = {}) {
-  return { settings: { enabled: false, target_interval_seconds: 300 }, state: "disabled", paused: false, last_error: null, active_channel: null, next_channel: null, next_due_at_utc: null, last_received_at_utc: null, selected_channels: 1, delayed_channels: 0, global_start_gap_seconds: 30, achieved_interval_seconds: null, last_returned_accounts: null, cleanup_confirmed: null, ...extra };
+  return { settings: { enabled: false, target_interval_seconds: 300, cadence_mode: "adaptive" }, state: "disabled", paused: false, last_error: null, active_channel: null, next_channel: null, next_due_at_utc: null, last_received_at_utc: null, last_received_channel: null, channels: [], selected_channels: 1, delayed_channels: 0, global_start_gap_seconds: 30, achieved_interval_seconds: null, last_returned_accounts: null, cleanup_confirmed: null, ...extra };
+}
+function communityChannel(channel = "sample_channel", extra = {}) {
+  return { channel, effective_interval_seconds: 60, cadence_basis: "adaptive", reported_chatters: 500, viewer_category_rows: 100, achieved_interval_seconds: 67.5, failures: 0, next_eligible_at_utc: "2026-10-23T12:01:00Z", last_received_at_utc: received, ...extra };
 }
 function communityReceipt(memberId, extra = {}) {
   return { member_id: memberId, sample_id: 700, run_id: 3, job_id: 8, source: "community", channel: "sample_channel", account: "community_account", roles: 36, started_at_utc: "2026-10-23T11:59:59Z", received_at_utc: received, reported_chatters: 200, returned_accounts: 100, categories: { broadcasters: 1, staff: 0, moderators: 4, vips: 5, chatbots: 0, viewers: 90 }, provenance: { transport: "network_response", server_freshness: "unknown", request_after_trigger_verified: true, from_disk_cache: false, from_service_worker: false, from_prefetch_cache: null, served_from_cache_event: false }, ...extra };
@@ -573,6 +576,8 @@ test("Community starts disabled without browser actions and reports scheduling l
   await settle();
   assert.equal(app.get("community-enabled").value, "false");
   assert.equal(app.get("community-interval").value, "300");
+  assert.equal(app.get("community-cadence").value, "adaptive");
+  assert.equal(app.get("community-interval-label").textContent, "Slow-chat / unknown-count interval (seconds)");
   assert.equal(app.get("community-resume").disabled, true);
   assert.equal(app.calls.some((call) => call.options.method !== "GET"), false);
   assert.match(app.get("community-status").textContent, /Selected channels50Delayed channels49/);
@@ -601,12 +606,116 @@ test("Community settings validate full writes and preserve unsaved values across
   await app.get("community-settings-form").dispatch("submit"); await settle();
   const patch = app.calls.find((call) => call.target.pathname === "/api/community/settings");
   assert.equal(patch.options.method, "PATCH");
-  assert.deepEqual(JSON.parse(patch.options.body), { enabled: true, target_interval_seconds: 30 });
+  assert.deepEqual(JSON.parse(patch.options.body), { enabled: true, target_interval_seconds: 30, cadence_mode: "fixed" });
   app.get("community-interval").value = "87";
   await app.get("community-interval").dispatch("input");
   await app.get("refresh-status").dispatch("click"); await settle();
   assert.equal(app.get("community-interval").value, "87");
   assert.match(app.get("community-settings-message").textContent, /Save to apply/);
+});
+
+test("legacy Community settings select Fixed and cadence-only changes save the full settings contract", async () => {
+  let saved = { enabled: false, target_interval_seconds: 300 };
+  const app = createApp((target, options) => {
+    if (target.pathname === "/api/community/status") return communityState({ settings: saved });
+    if (target.pathname === "/api/community/settings") { saved = JSON.parse(options.body); return saved; }
+  });
+  await settle();
+  assert.equal(app.get("community-cadence").value, "fixed");
+  assert.equal(app.get("community-interval-label").textContent, "Interval per channel (seconds)");
+  app.get("community-cadence").value = "adaptive";
+  await app.get("community-cadence").dispatch("change");
+  assert.equal(app.get("community-interval-label").textContent, "Slow-chat / unknown-count interval (seconds)");
+  assert.match(app.get("community-settings-message").textContent, /Save to apply/);
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.equal(app.get("community-cadence").value, "adaptive");
+  await app.get("community-settings-form").dispatch("submit"); await settle();
+  const patch = app.calls.find((call) => call.target.pathname === "/api/community/settings");
+  assert.deepEqual(JSON.parse(patch.options.body), { enabled: false, target_interval_seconds: 300, cadence_mode: "adaptive" });
+  assert.equal(app.get("community-cadence").value, "adaptive");
+  assert.match(app.get("community-settings-message").textContent, /settings saved/);
+});
+
+test("cadence edits made during a pending save remain dirty through the queued status refresh", async () => {
+  const pending = deferred(), oldStatus = deferred();
+  let saved = { enabled: true, target_interval_seconds: 300, cadence_mode: "fixed" }, statusRequests = 0;
+  const app = createApp((target, options) => {
+    if (target.pathname === "/api/community/status") { statusRequests += 1; return statusRequests === 2 ? oldStatus.promise : communityState({ settings: saved }); }
+    if (target.pathname === "/api/community/settings") { saved = JSON.parse(options.body); return pending.promise; }
+  });
+  await settle();
+  const refreshing = app.get("refresh-status").dispatch("click"); await settle();
+  app.get("community-cadence").value = "adaptive"; await app.get("community-cadence").dispatch("input");
+  const saving = app.get("community-settings-form").dispatch("submit"); await settle();
+  app.get("community-cadence").value = "fixed"; await app.get("community-cadence").dispatch("change");
+  pending.resolve({ accepted: true }); await saving; await settle();
+  oldStatus.resolve(communityState({ settings: { enabled: true, target_interval_seconds: 300, cadence_mode: "fixed" } })); await refreshing; await settle();
+  assert.equal(statusRequests, 3);
+  assert.equal(app.get("community-cadence").value, "fixed");
+  assert.equal(app.get("community-interval-label").textContent, "Interval per channel (seconds)");
+  assert.match(app.get("community-settings-message").textContent, /newer changes are not saved yet/);
+  assert.equal(JSON.parse(app.calls.find((call) => call.target.pathname === "/api/community/settings").options.body).cadence_mode, "adaptive");
+  await app.get("community-settings-form").dispatch("submit"); await settle();
+  assert.equal(JSON.parse(app.calls.filter((call) => call.target.pathname === "/api/community/settings").at(-1).options.body).cadence_mode, "fixed");
+});
+
+test("per-channel cadence distinguishes calculated targets, measured intervals, response counts and fallback reasons", async () => {
+  const hostile = '<img src=x onerror="injected()">';
+  const app = createApp((target) => target.pathname === "/api/community/status" ? communityState({
+    achieved_interval_seconds: 67.5, last_received_channel: "sample_channel", channels: [
+      communityChannel(),
+      communityChannel("fixed_channel", { cadence_basis: "fixed", effective_interval_seconds: 300, achieved_interval_seconds: null }),
+      communityChannel("new_channel", { cadence_basis: "no_sample", reported_chatters: null, viewer_category_rows: null, last_received_at_utc: null, next_eligible_at_utc: null }),
+      communityChannel("missing_count", { cadence_basis: "missing_reported_count", reported_chatters: null }),
+      communityChannel("zero_count", { cadence_basis: "zero_reported_count", reported_chatters: 0 }),
+      communityChannel("no_category", { cadence_basis: "no_viewer_rows", viewer_category_rows: 0 }),
+      communityChannel(hostile, { cadence_basis: "inconsistent_counts", reported_chatters: 1, viewer_category_rows: 100, failures: 2 }),
+    ],
+  }) : undefined);
+  await settle();
+  const status = app.get("community-status"), table = status.querySelector(".table-wrap");
+  assert.ok(table);
+  assert.match(status.textContent, /Latest achieved interval.*seconds · sample_channel/);
+  assert.match(table.textContent, /Calculated targetActual interval/);
+  assert.match(table.textContent, /60 seconds/);
+  assert.ok(table.textContent.includes(new Intl.NumberFormat().format(67.5) + " seconds"));
+  assert.match(table.textContent, /100 Viewer-category rows \/ 500 reported chat accounts/);
+  for (const reason of ["Fixed interval", "Waiting for the first response", "total chat count was not reported", "reported total is zero", "no accounts in the Viewer category", "response counts do not agree"]) assert.ok(table.textContent.includes(reason));
+  assert.match(table.textContent, /Not measured/);
+  assert.match(table.textContent, /Not scheduled/);
+  assert.match(table.textContent, /Not recorded/);
+  assert.match(table.textContent, /<img src=x/);
+  assert.equal(descendants(status).some((element) => element.tagName === "IMG"), false);
+  assert.doesNotMatch(table.textContent, /missing_reported_count|inconsistent_counts|video viewers|99%/);
+});
+
+test("Community status refresh preserves cadence table scroll and focus and renders at most fifty channels", async () => {
+  const app = createApp((target) => target.pathname === "/api/community/status" ? communityState({ channels: Array.from({ length: 52 }, (_, index) => communityChannel("channel_" + index)) }) : undefined);
+  await settle();
+  const first = app.get("community-status").querySelector(".table-wrap");
+  first.scrollLeft = 320; first.focus();
+  await app.get("refresh-status").dispatch("click"); await settle();
+  const next = app.get("community-status").querySelector(".table-wrap");
+  assert.equal(next.scrollLeft, 320);
+  assert.equal(app.document.activeElement, next);
+  assert.equal(descendants(next).filter((element) => element.tagName === "TR").length, 51);
+  assert.equal(next.textContent.includes("channel_51"), false);
+});
+
+test("legacy Community status leaves missing per-channel cadence and receipt-channel attribution explicit", async () => {
+  const app = createApp((target) => target.pathname === "/api/community/status" ? communityState({ settings: { enabled: false, target_interval_seconds: 300 }, channels: undefined, last_received_channel: undefined, achieved_interval_seconds: 100 }) : undefined);
+  await settle();
+  assert.equal(app.get("community-cadence").value, "fixed");
+  assert.match(app.get("community-status").textContent, /100 seconds · channel not reported/);
+  assert.match(app.get("community-status").textContent, /Per-channel cadence is not reported by this app version/);
+  assert.equal(app.get("community-status").querySelector(".table-wrap"), null);
+});
+
+test("the desktop Until control spans the narrow result-size column while smaller layouts keep their columns", () => {
+  assert.match(html, /class="field search-until"><label for="search-to"/);
+  assert.match(stylesheet, /@media \(min-width: 901px\)\s*\{\s*#search-form \.search-until\s*\{\s*grid-column:\s*3\s*\/\s*-1;/);
+  assert.match(stylesheet, /@media \(max-width: 900px\)[\s\S]*?\.search-form\s*\{\s*grid-template-columns: 1fr 1fr;/);
+  assert.match(stylesheet, /@media \(max-width: 600px\)[\s\S]*?\.search-form\s*\{\s*grid-template-columns: 1fr;/);
 });
 
 test("a Community write supersedes an older status refresh and triggers a current follow-up", async () => {

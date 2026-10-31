@@ -8,7 +8,7 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use community_source::host::{HostEvent, HostHandle, HostOptions, SourceSample};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -30,20 +30,71 @@ pub struct Status {
     pub next_channel: Option<String>,
     pub next_due_at_utc: Option<String>,
     pub last_received_at_utc: Option<String>,
+    pub last_received_channel: Option<String>,
     pub selected_channels: usize,
     pub delayed_channels: usize,
     pub global_start_gap_seconds: u64,
     pub achieved_interval_seconds: Option<f64>,
     pub last_returned_accounts: Option<usize>,
     pub cleanup_confirmed: Option<bool>,
+    pub channels: Vec<ChannelCadenceStatus>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ChannelCadenceStatus {
+    pub channel: String,
+    pub effective_interval_seconds: u32,
+    pub cadence_basis: CadenceBasis,
+    pub reported_chatters: Option<u64>,
+    pub viewer_category_rows: Option<u64>,
+    pub achieved_interval_seconds: Option<f64>,
+    pub failures: u32,
+    pub next_eligible_at_utc: Option<String>,
+    pub last_received_at_utc: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CadenceBasis {
+    Fixed,
+    Adaptive,
+    NoSample,
+    MissingReportedCount,
+    ZeroReportedCount,
+    NoViewerRows,
+    InconsistentCounts,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommunitySettingsUpdate {
+    enabled: bool,
+    target_interval_seconds: u32,
+    cadence_mode: Option<CommunityCadenceMode>,
+}
+
+impl From<CommunitySettings> for CommunitySettingsUpdate {
+    fn from(value: CommunitySettings) -> Self {
+        Self {
+            enabled: value.enabled,
+            target_interval_seconds: value.target_interval_seconds,
+            cadence_mode: Some(value.cadence_mode),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ControlReply {
+    Accepted,
+    Settings(CommunitySettings),
 }
 
 enum Command {
-    Settings(CommunitySettings),
+    Settings(CommunitySettingsUpdate),
     Login,
     Resume,
 }
-type Reply = oneshot::Sender<Result<(), &'static str>>;
+type Reply = oneshot::Sender<Result<ControlReply, &'static str>>;
 
 #[derive(Clone)]
 pub struct Community {
@@ -80,9 +131,91 @@ struct Pending {
     started_at_utc: String,
 }
 struct Schedule {
-    due: Instant,
+    cadence_due: Instant,
+    retry_not_before: Instant,
+    last_attempt: Option<Instant>,
+    counts: Option<SampleCounts>,
     failures: u32,
     last_received: Option<Instant>,
+    last_received_at_utc: Option<String>,
+    achieved_interval_seconds: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct SampleCounts {
+    reported_chatters: Option<u64>,
+    viewer_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CadenceDecision {
+    seconds: u32,
+    basis: CadenceBasis,
+}
+
+impl Schedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            cadence_due: now,
+            retry_not_before: now,
+            last_attempt: None,
+            counts: None,
+            failures: 0,
+            last_received: None,
+            last_received_at_utc: None,
+            achieved_interval_seconds: None,
+        }
+    }
+    fn eligible(&self) -> Instant {
+        self.cadence_due.max(self.retry_not_before)
+    }
+    fn rebase(&mut self, settings: CommunitySettings, now: Instant) {
+        let Some(anchor) = self.last_attempt else {
+            return;
+        };
+        let candidate = anchor + Duration::from_secs(cadence(settings, self.counts).seconds.into());
+        // Changing settings never postpones an already overdue opportunity.
+        self.cadence_due = if self.cadence_due <= now {
+            self.cadence_due.min(candidate)
+        } else {
+            candidate
+        };
+    }
+}
+
+fn cadence(settings: CommunitySettings, counts: Option<SampleCounts>) -> CadenceDecision {
+    let base = settings.target_interval_seconds;
+    let fallback = |basis| CadenceDecision {
+        seconds: base,
+        basis,
+    };
+    if settings.cadence_mode == CommunityCadenceMode::Fixed {
+        return fallback(CadenceBasis::Fixed);
+    }
+    let Some(counts) = counts else {
+        return fallback(CadenceBasis::NoSample);
+    };
+    let Some(population) = counts.reported_chatters else {
+        return fallback(CadenceBasis::MissingReportedCount);
+    };
+    if population == 0 {
+        return fallback(CadenceBasis::ZeroReportedCount);
+    }
+    if counts.viewer_rows == 0 {
+        return fallback(CadenceBasis::NoViewerRows);
+    }
+    if population < counts.viewer_rows {
+        return fallback(CadenceBasis::InconsistentCounts);
+    }
+    // A scheduling heuristic only. These source counts do not validate a
+    // population, independent sampling, coverage or an absence probability.
+    let numerator = u128::from(base) * u128::from(counts.viewer_rows);
+    let denominator = u128::from(population);
+    let seconds = numerator.div_ceil(denominator).max(30);
+    CadenceDecision {
+        seconds: u32::try_from(seconds).expect("k <= N bounds the target by its validated base"),
+        basis: CadenceBasis::Adaptive,
+    }
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -132,12 +265,14 @@ impl Community {
             next_channel: None,
             next_due_at_utc: None,
             last_received_at_utc: None,
+            last_received_channel: None,
             selected_channels: 0,
             delayed_channels: 0,
             global_start_gap_seconds: START_GAP.as_secs(),
             achieved_interval_seconds: None,
             last_returned_accounts: None,
             cleanup_confirmed: None,
+            channels: Vec::new(),
         }));
         let (commands, receiver) = mpsc::channel(8);
         let service = Self {
@@ -185,7 +320,8 @@ impl Community {
             .try_send((command, reply))
             .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "busy"))?;
         match tokio::time::timeout(Duration::from_secs(14), response).await {
-            Ok(Ok(Ok(()))) => Ok(Json(json!({"accepted":true}))),
+            Ok(Ok(Ok(ControlReply::Accepted))) => Ok(Json(json!({"accepted":true}))),
+            Ok(Ok(Ok(ControlReply::Settings(settings)))) => Ok(Json(json!(settings))),
             Ok(Ok(Err(code))) => Err(error(StatusCode::SERVICE_UNAVAILABLE, code)),
             _ => Err(error(StatusCode::SERVICE_UNAVAILABLE, "busy")),
         }
@@ -204,14 +340,13 @@ async fn settings(State(service): State<Community>) -> ApiResult {
 }
 async fn update_settings(
     State(service): State<Community>,
-    input: Result<Json<CommunitySettings>, JsonRejection>,
+    input: Result<Json<CommunitySettingsUpdate>, JsonRejection>,
 ) -> ApiResult {
     let Json(input) = input.map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_query"))?;
     if !(30..=86_400).contains(&input.target_interval_seconds) {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_query"));
     }
-    let _ = service.command(Command::Settings(input)).await?;
-    Ok(Json(json!(input)))
+    service.command(Command::Settings(input)).await
 }
 async fn login(
     State(service): State<Community>,
@@ -272,7 +407,7 @@ impl Coordinator {
                             let _ = reply.send(Err("disabled"));
                             continue;
                         }
-                        if !matches!(command, Command::Settings(CommunitySettings { enabled: false, .. }))
+                        if !matches!(command, Command::Settings(CommunitySettingsUpdate { enabled: false, .. }))
                             && self.service.status.read().await.cleanup_confirmed == Some(false)
                         {
                             let _ = reply.send(Err("cleanup_unconfirmed"));
@@ -280,7 +415,7 @@ impl Coordinator {
                         }
                         let answer = self.control(command).await;
                         let fatal = answer.is_err();
-                        let _ = reply.send(answer.as_ref().map(|_| ()).map_err(|_| "storage_unavailable"));
+                        let _ = reply.send(answer.as_ref().copied().map_err(|_| "storage_unavailable"));
                         if fatal { answer?; }
                     }
                 }
@@ -302,11 +437,9 @@ impl Coordinator {
             .retain(|channel, _| channels.contains(channel));
         let now = Instant::now();
         for channel in channels {
-            self.schedule.entry(channel.clone()).or_insert(Schedule {
-                due: now,
-                failures: 0,
-                last_received: None,
-            });
+            self.schedule
+                .entry(channel.clone())
+                .or_insert_with(|| Schedule::new(now));
         }
         if self
             .pending
@@ -378,12 +511,22 @@ impl Coordinator {
         }
     }
 
-    async fn control(&mut self, command: Command) -> Result<(), StoreError> {
+    async fn control(&mut self, command: Command) -> Result<ControlReply, StoreError> {
         match command {
-            Command::Settings(settings) => {
+            Command::Settings(update) => {
+                // Resolve omitted legacy fields at dequeue time, after earlier commands.
+                let settings = CommunitySettings {
+                    enabled: update.enabled,
+                    target_interval_seconds: update.target_interval_seconds,
+                    cadence_mode: update.cadence_mode.unwrap_or(self.settings.cadence_mode),
+                };
                 self.service.store.set_community_settings(settings).await?;
                 let was_enabled = self.settings.enabled;
                 self.settings = settings;
+                let now = Instant::now();
+                for schedule in self.schedule.values_mut() {
+                    schedule.rebase(settings, now);
+                }
                 if !settings.enabled {
                     self.retire(CommunityRunEndReason::Disabled).await?;
                 }
@@ -393,16 +536,17 @@ impl Coordinator {
                         if self.paused { "paused" } else { "starting" };
                 }
                 self.service.status.write().await.settings = settings;
+                return Ok(ControlReply::Settings(settings));
             }
             Command::Login => {
                 self.paused = true;
                 self.retire(CommunityRunEndReason::SignIn).await?;
                 if self.stopping() {
-                    return Ok(());
+                    return Ok(ControlReply::Accepted);
                 }
                 if self.ensure_host().await {
                     if self.stopping() {
-                        return Ok(());
+                        return Ok(ControlReply::Accepted);
                     }
                     if self
                         .host
@@ -418,12 +562,12 @@ impl Coordinator {
             Command::Resume => {
                 if !self.settings.enabled {
                     self.pause("disabled").await;
-                    return Ok(());
+                    return Ok(ControlReply::Accepted);
                 }
                 self.retire(CommunityRunEndReason::Paused).await?;
                 if self.service.status.read().await.cleanup_confirmed == Some(false) {
                     self.pause("cleanup_unconfirmed").await;
-                    return Ok(());
+                    return Ok(ControlReply::Accepted);
                 }
                 self.paused = false;
                 self.service.store.set_community_pause(None).await?;
@@ -433,7 +577,7 @@ impl Coordinator {
                 self.service.status.write().await.state = "starting";
             }
         }
-        Ok(())
+        Ok(ControlReply::Accepted)
     }
 
     async fn step(&mut self) -> Result<(), StoreError> {
@@ -461,10 +605,16 @@ impl Coordinator {
         if !self.prepare_sample(channel.clone()).await? {
             return Ok(());
         }
-        let now = Instant::now();
+        let now = self
+            .pending
+            .as_ref()
+            .expect("durably prepared attempt")
+            .started;
         self.next_start = now + START_GAP;
         if let Some(schedule) = self.schedule.get_mut(&channel) {
-            schedule.due = now + Duration::from_secs(self.settings.target_interval_seconds.into());
+            schedule.last_attempt = Some(now);
+            schedule.cadence_due =
+                now + Duration::from_secs(cadence(self.settings, schedule.counts).seconds.into());
         }
         if self
             .host
@@ -619,6 +769,10 @@ impl Coordinator {
         let received_at_utc = chrono::DateTime::from_timestamp_millis(sample.received_at_unix_ms)
             .map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true));
         let count = sample.members.len();
+        let counts = SampleCounts {
+            reported_chatters: sample.reported_chatters,
+            viewer_rows: sample.category_counts[5],
+        };
         let projection = received_at_utc
             .as_ref()
             .ok_or(StoreError::Invalid)
@@ -648,7 +802,8 @@ impl Coordinator {
         let pending = self.pending.take().ok_or(StoreError::Invalid)?;
         self.next_start = self.next_start.max(Instant::now() + START_GAP);
         let mut status = self.service.status.write().await;
-        status.last_received_at_utc = received_at_utc;
+        status.last_received_at_utc = received_at_utc.clone();
+        status.last_received_channel = Some(pending.channel.clone());
         status.last_returned_accounts = Some(count);
         status.last_error = None;
         if let Some(schedule) = self.schedule.get_mut(&pending.channel) {
@@ -657,6 +812,13 @@ impl Coordinator {
                 .last_received
                 .map(|last| now.duration_since(last).as_secs_f64());
             schedule.last_received = Some(now);
+            schedule.last_received_at_utc = received_at_utc;
+            schedule.achieved_interval_seconds = status.achieved_interval_seconds;
+            schedule.counts = Some(counts);
+            schedule.last_attempt = Some(pending.started);
+            schedule.cadence_due = pending.started
+                + Duration::from_secs(cadence(self.settings, schedule.counts).seconds.into());
+            schedule.retry_not_before = now;
             schedule.failures = 0;
         }
         Ok(())
@@ -692,9 +854,7 @@ impl Coordinator {
             let delay = 30u64
                 .saturating_mul(1u64 << schedule.failures.min(6))
                 .min(1800);
-            schedule.due = schedule
-                .due
-                .max(Instant::now() + Duration::from_secs(delay));
+            schedule.retry_not_before = Instant::now() + Duration::from_secs(delay);
         }
         Ok(())
     }
@@ -740,7 +900,21 @@ impl Coordinator {
         let next = self
             .schedule
             .iter()
-            .min_by_key(|(channel, schedule)| (schedule.due, *channel));
+            .min_by_key(|(channel, schedule)| (schedule.eligible(), *channel));
+        // With a job still active, the completion barrier cannot expire sooner
+        // than thirty seconds from this observation. This is only an estimate.
+        let global_floor = if self.pending.is_some() {
+            self.next_start.max(now + START_GAP)
+        } else {
+            self.next_start
+        };
+        let allowed = self.settings.enabled && !self.paused;
+        let wall_now = Utc::now();
+        let estimate = |due: Instant| {
+            let delay = due.max(global_floor).saturating_duration_since(now);
+            (wall_now + chrono::Duration::from_std(delay).unwrap_or_default())
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+        };
         let mut status = self.service.status.write().await;
         status.settings = self.settings;
         status.paused = self.paused;
@@ -749,21 +923,34 @@ impl Coordinator {
         status.delayed_channels = self
             .schedule
             .values()
-            .filter(|schedule| schedule.due < now && now.duration_since(schedule.due) >= START_GAP)
+            .filter(|schedule| {
+                schedule.eligible() < now && now.duration_since(schedule.eligible()) >= START_GAP
+            })
             .count();
         status.next_channel = next.map(|(channel, _)| channel.clone());
-        status.next_due_at_utc = if self.settings.enabled && !self.paused {
-            next.map(|(_, schedule)| {
-                let delay = schedule
-                    .due
-                    .max(self.next_start)
-                    .saturating_duration_since(now);
-                (Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default())
-                    .to_rfc3339_opts(SecondsFormat::Millis, true)
-            })
+        status.next_due_at_utc = if allowed {
+            next.map(|(_, schedule)| estimate(schedule.eligible()))
         } else {
             None
         };
+        status.channels = self
+            .schedule
+            .iter()
+            .map(|(channel, schedule)| {
+                let decision = cadence(self.settings, schedule.counts);
+                ChannelCadenceStatus {
+                    channel: channel.clone(),
+                    effective_interval_seconds: decision.seconds,
+                    cadence_basis: decision.basis,
+                    reported_chatters: schedule.counts.and_then(|counts| counts.reported_chatters),
+                    viewer_category_rows: schedule.counts.map(|counts| counts.viewer_rows),
+                    achieved_interval_seconds: schedule.achieved_interval_seconds,
+                    failures: schedule.failures,
+                    next_eligible_at_utc: allowed.then(|| estimate(schedule.eligible())),
+                    last_received_at_utc: schedule.last_received_at_utc.clone(),
+                }
+            })
+            .collect();
         if status.state != "sign_in" || !self.settings.enabled && self.host.is_none() {
             status.state = if !self.settings.enabled {
                 "disabled"
@@ -785,8 +972,8 @@ impl Coordinator {
 fn next_channel(schedule: &BTreeMap<String, Schedule>, now: Instant) -> Option<String> {
     schedule
         .iter()
-        .filter(|(_, schedule)| schedule.due <= now)
-        .min_by_key(|(channel, schedule)| (schedule.due, *channel))
+        .filter(|(_, schedule)| schedule.eligible() <= now)
+        .min_by_key(|(channel, schedule)| (schedule.eligible(), *channel))
         .map(|(channel, _)| channel.clone())
 }
 
@@ -873,6 +1060,10 @@ fn failure_code(code: &str) -> CommunityFailureCode {
 #[cfg(test)]
 #[path = "community_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "community_cadence_tests.rs"]
+mod cadence_tests;
 
 fn start_host(options: HostOptions) -> Result<HostHandle, community_source::host::HostError> {
     #[cfg(not(test))]

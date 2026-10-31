@@ -7,22 +7,15 @@ async fn serial_schedule_is_fair_and_backoff_does_not_block_other_rooms() {
     let now = Instant::now();
     let mut schedule = BTreeMap::new();
     for channel in ["alpha", "bravo", "charlie"] {
-        schedule.insert(
-            channel.to_owned(),
-            Schedule {
-                due: now,
-                failures: 0,
-                last_received: None,
-            },
-        );
+        schedule.insert(channel.to_owned(), Schedule::new(now));
     }
     for (offset, expected) in [(0, "alpha"), (30, "bravo"), (60, "charlie")] {
         let at = now + Duration::from_secs(offset);
         assert_eq!(next_channel(&schedule, at).as_deref(), Some(expected));
-        schedule.get_mut(expected).unwrap().due = at + Duration::from_secs(300);
+        schedule.get_mut(expected).unwrap().cadence_due = at + Duration::from_secs(300);
     }
     assert!(next_channel(&schedule, now + Duration::from_secs(90)).is_none());
-    schedule.get_mut("alpha").unwrap().due = now + Duration::from_secs(1800);
+    schedule.get_mut("alpha").unwrap().cadence_due = now + Duration::from_secs(1800);
     assert_eq!(
         next_channel(&schedule, now + Duration::from_secs(330)).as_deref(),
         Some("bravo")
@@ -127,7 +120,7 @@ fn source_projection_retains_signed_native_timing_and_distinct_source_identity()
     );
 }
 
-fn source_sample() -> SourceSample {
+pub(super) fn source_sample() -> SourceSample {
     SourceSample {
         received_at_unix_ms: 0,
         reported_chatters: Some(400),
@@ -154,7 +147,7 @@ fn source_sample() -> SourceSample {
     }
 }
 
-async fn pending_fixture() -> (tempfile::TempDir, Store, Coordinator) {
+pub(super) async fn pending_fixture() -> (tempfile::TempDir, Store, Coordinator) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path().join("test.sqlite3"))
         .await
@@ -416,9 +409,10 @@ async fn denied_pause_restores_on_startup_and_only_explicit_resume_clears_it() {
         .unwrap();
     runner.retire(CommunityRunEndReason::Paused).await.unwrap();
     runner
-        .control(Command::Settings(CommunitySettings {
+        .control(Command::Settings(CommunitySettingsUpdate {
             enabled: true,
             target_interval_seconds: 30,
+            cadence_mode: Some(CommunityCadenceMode::Fixed),
         }))
         .await
         .unwrap();
@@ -476,6 +470,7 @@ async fn denial_latch_survives_a_later_terminal_write_failure() {
         .set_community_settings(CommunitySettings {
             enabled: true,
             target_interval_seconds: 30,
+            cadence_mode: CommunityCadenceMode::Fixed,
         })
         .await
         .unwrap();

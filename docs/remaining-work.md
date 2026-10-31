@@ -1,6 +1,6 @@
 # Requirements and remaining work
 
-Updated: 2026-10-31 (Europe/Paris).
+Updated: 2026-11-01 (Europe/Paris).
 
 The owner has authorized implementation of the remaining features. The earlier review-only restriction and Astra-only allocation are superseded. Current AGENTS.md governs coordination: Sol High/XHigh handles implementation, testing, integration and delivery; Astra XHigh receives bounded complex scoping or critical analysis when justified.
 
@@ -50,7 +50,7 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Repeated Community-list samples | Finite autonomous full-channel rotation, sampling after minimization, normal cleanup and sign-in persistence verified. Shared-host/storage/UI integration is implemented; isolated application acceptance passed at `43831ae`. |
 | Observe silent accounts | Partial source support: NAMES/JOIN/PART can expose nonposting chat-connected accounts; delivery and completeness are unknown. |
 | Discover 100% of video viewers | Unsupported by the available evidence and access rights. |
-| Population-adaptive request cadence | Pending validation of source population and independence. Community integration uses a configurable per-channel target, a conservative global30-second start gap, fair scheduling and failure backoff; this is not a Twitch rate allowance. |
+| Population-adaptive request cadence | Implemented as an optional response-count scheduling heuristic, with Fixed mode, separate retry fences and per-channel target/actual status. New v2 migration and Windows/live acceptance are pending. Population validity, independence, coverage and absence probabilities remain unvalidated separately. |
 | Detect live state and retain titles/details | Implemented using optional Helix credentials; retains stream identity, start, titles/category/language, viewer-count checks and observed offline checks. Failures and stale checks remain Unknown. |
 | Collect during live broadcasts | Implemented selectable All enabled channels / Live channels only policy, persisted in SQLite. Live-only pauses only after a fresh successful offline check. Unknown or stale metadata keeps observation enabled. |
 | First/last positive observations | Implemented per account/channel evidence visit and broadcast summaries; PART never extends the last positive receipt. |
@@ -123,3 +123,13 @@ UI visual checks use a clearly marked fictional localhost fixture, without a col
 ## Further constraints
 
 Windows, English source/UI/documentation, local credentials, indefinite retention and no CSV remain unchanged. Source limitations are outstanding original requirements rather than silently completed items. No routine stage-by-stage permission gate is imposed. The only planned interruption is the owner's new-executable firewall gate or a concrete product decision that cannot be resolved from existing authorization.
+
+## Adaptive cadence acceptance
+
+The current candidate adds count-based Adaptive/Fixed scheduling and a real atomic
+Community v1-to-v2 settings migration. Existing installations keep Fixed mode and
+their saved preferences, pause and history; fresh installs remain disabled with
+Adaptive/300 defaults. Independent source review is closed, and 79 UI tests pass.
+Exact Windows compilation, migration and isolated live acceptance remain pending.
+The last accepted binary remains revision `43831ae` until those gates pass.
+See [the cadence contract](community-cadence.md).

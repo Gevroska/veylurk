@@ -570,15 +570,50 @@
     return typeof value === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(value) ? value : "unknown";
   }
 
+  function communityCadence() {
+    return $("community-cadence").value === "adaptive" ? "adaptive" : "fixed";
+  }
+
+  function updateCommunityIntervalLabel() {
+    $("community-interval-label").textContent = communityCadence() === "adaptive" ? "Slow-chat / unknown-count interval (seconds)" : "Interval per channel (seconds)";
+  }
+
+  function communityInterval(value, fallback = "Not measured") {
+    return Number.isFinite(value) && value >= 0 ? `${count(value)} seconds` : fallback;
+  }
+
+  function communityCadenceTable(channels) {
+    const basisLabels = {
+      fixed: "Fixed interval",
+      adaptive: "Adjusted from Community response counts",
+      no_sample: "Waiting for the first response",
+      missing_reported_count: "Fallback: total chat count was not reported",
+      zero_reported_count: "Fallback: reported total is zero",
+      no_viewer_rows: "Fallback: no accounts in the Viewer category",
+      inconsistent_counts: "Fallback: response counts do not agree",
+    };
+    const result = table(["Channel", "Calculated target", "Actual interval", "Basis / response counts", "Failures", "Next eligible", "Latest local receipt"], channels.slice(0, 50), (channel) => {
+      const row = node("tr");
+      const basis = node("div", basisLabels[channel.cadence_basis] || "Cadence basis not reported");
+      basis.append(node("span", `${count(channel.viewer_category_rows)} Viewer-category rows / ${count(channel.reported_chatters)} reported chat accounts`, "secondary-line"));
+      row.append(cell(channel.channel), cell(communityInterval(channel.effective_interval_seconds, "Not reported")), cell(communityInterval(channel.achieved_interval_seconds)), cell(basis), cell(count(channel.failures), "number"), cell(channel.next_eligible_at_utc ? timestamp(channel.next_eligible_at_utc) : "Not scheduled", "time"), cell(timestamp(channel.last_received_at_utc), "time"));
+      return row;
+    }, "Per-channel Community cadence · calculated targets and measured intervals · actual intervals can be longer");
+    result.classList.add("community-cadence-table");
+    return result;
+  }
+
   function renderCommunity(data, updateSettings = true) {
     communityStatus = data;
     if (updateSettings && data.settings && typeof data.settings.enabled === "boolean" && Number.isInteger(data.settings.target_interval_seconds)) {
-      communitySettings = data.settings;
+      communitySettings = { ...data.settings, cadence_mode: data.settings.cadence_mode === "adaptive" ? "adaptive" : "fixed" };
       if (!communityDirty && !communitySaving) {
         $("community-enabled").value = String(communitySettings.enabled);
         $("community-interval").value = String(communitySettings.target_interval_seconds);
+        $("community-cadence").value = communitySettings.cadence_mode;
       }
     }
+    updateCommunityIntervalLabel();
     $("community-save").disabled = !communitySettings || communitySaving || stopping;
     $("community-login").disabled = communitySaving || stopping;
     $("community-resume").disabled = communitySaving || stopping || !data.paused || !communitySettings || !communitySettings.enabled;
@@ -591,12 +626,18 @@
     detail(summary, "Next channel", data.next_channel || "Not scheduled");
     detail(summary, "Next job due", data.next_due_at_utc ? timestamp(data.next_due_at_utc) : "Not scheduled");
     detail(summary, "Latest local receipt", data.last_received_at_utc ? timestamp(data.last_received_at_utc) : "Not recorded");
-    detail(summary, "Achieved interval", Number.isFinite(data.achieved_interval_seconds) ? `${count(data.achieved_interval_seconds)} seconds per channel (latest reported)` : "Not measured");
+    detail(summary, "Latest achieved interval", Number.isFinite(data.achieved_interval_seconds) ? `${communityInterval(data.achieved_interval_seconds)} · ${data.last_received_channel || "channel not reported"}` : "Not measured");
     detail(summary, "Global start gap", `${count(data.global_start_gap_seconds)} seconds minimum between job starts`);
     detail(summary, "Latest returned accounts", count(data.last_returned_accounts));
     detail(summary, "Browser shutdown confirmation", data.cleanup_confirmed === true ? "Confirmed" : data.cleanup_confirmed === false ? "Not confirmed" : "Not reported");
     detail(summary, "Latest safe error code", data.last_error ? communityCode(data.last_error) : "None");
-    $("community-status").replaceChildren(summary);
+    const oldTable = $("community-status").querySelector(".table-wrap");
+    const tableScroll = oldTable ? oldTable.scrollLeft : 0;
+    const tableFocused = oldTable && document.activeElement === oldTable;
+    const channelRows = Array.isArray(data.channels) ? data.channels : null;
+    const cadence = channelRows && channelRows.length ? communityCadenceTable(channelRows) : node("p", channelRows ? "No per-channel cadence has been reported yet." : "Per-channel cadence is not reported by this app version.", "table-note");
+    $("community-status").replaceChildren(summary, cadence);
+    if (channelRows && channelRows.length) { cadence.scrollLeft = tableScroll; if (tableFocused) cadence.focus({ preventScroll: true }); }
     $("community-status").classList.remove("stale");
     $("community-status").setAttribute("aria-busy", "false");
   }
@@ -610,7 +651,7 @@
         message("community-settings-message", "Enter a whole target interval from 30 to 86400 seconds.", "error"); return;
       }
       if (!communitySettings) return;
-      submitted = { enabled: $("community-enabled").value === "true", target_interval_seconds: interval };
+      submitted = { enabled: $("community-enabled").value === "true", target_interval_seconds: interval, cadence_mode: communityCadence() };
     }
     communitySaving = true;
     communityGeneration += 1;
@@ -619,7 +660,7 @@
     try {
       const response = await api("/api/community/" + action, { method: action === "settings" ? "PATCH" : "POST", body: submitted || {} });
       if (response.accepted !== true && !(action === "settings" && typeof response.enabled === "boolean" && Number.isInteger(response.target_interval_seconds))) throw new Error("The local app did not acknowledge this Community request. Refresh status to check its state.");
-      if (submitted) communityDirty = $("community-enabled").value !== String(submitted.enabled) || Number($("community-interval").value) !== submitted.target_interval_seconds;
+      if (submitted) communityDirty = $("community-enabled").value !== String(submitted.enabled) || Number($("community-interval").value) !== submitted.target_interval_seconds || communityCadence() !== submitted.cadence_mode;
       message("community-settings-message", action === "login" ? "Sign-in requested in the application-owned Twitch window. Collection remains paused until you explicitly resume." : action === "resume" ? "Resume requested. The current collector state is shown below." : communityDirty ? "Settings saved. Your newer changes are not saved yet." : "Community settings saved. Stored receipts are retained.", communityDirty ? "warning" : "success");
     } catch (error) { message("community-settings-message", failure(error), "error"); }
     finally {
@@ -1458,7 +1499,11 @@
   }
 
   $("add-channels-form").addEventListener("submit", addChannels);
-  for (const id of ["community-enabled", "community-interval"]) $(id).addEventListener("input", () => { communityDirty = true; message("community-settings-message", "Community settings changed. Save to apply them.", "warning"); });
+  function markCommunitySettingsDirty() {
+    communityDirty = true; updateCommunityIntervalLabel(); message("community-settings-message", "Community settings changed. Save to apply them.", "warning");
+  }
+  for (const id of ["community-enabled", "community-interval", "community-cadence"]) $(id).addEventListener("input", markCommunitySettingsDirty);
+  $("community-cadence").addEventListener("change", markCommunitySettingsDirty);
   $("community-settings-form").addEventListener("submit", (event) => { event.preventDefault(); return changeCommunity("settings"); });
   $("community-login").addEventListener("click", () => changeCommunity("login"));
   $("community-resume").addEventListener("click", () => changeCommunity("resume"));
