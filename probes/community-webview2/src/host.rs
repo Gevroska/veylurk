@@ -15,7 +15,7 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::{w, Interface, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::{Com::*, LibraryLoader::GetModuleHandleW},
         UI::WindowsAndMessaging::*,
     },
@@ -56,6 +56,8 @@ struct Engine {
     response_token: i64,
     exit_token: i64,
     new_window_token: i64,
+    navigation_token: i64,
+    source_token: i64,
 }
 
 #[derive(Default)]
@@ -156,7 +158,7 @@ impl App {
             .borrow()
             .as_ref()
             .map(|engine| engine.core.clone())
-            .ok_or_else(windows::core::Error::from_win32)?;
+            .ok_or_else(|| windows::core::Error::from_hresult(E_UNEXPECTED))?;
         unsafe {
             let mut uri = PWSTR::null();
             core.Source(&mut uri)?;
@@ -189,6 +191,26 @@ impl App {
         let mut state = self.state.borrow_mut();
         state.generation += 1;
         state.armed_until = None;
+    }
+
+    fn navigation_changed(&self) {
+        let active = {
+            let state = self.state.borrow();
+            state.closing_at.is_none()
+                && (state.armed_until.is_some() || state.pending || state.script_pending)
+        };
+        if !active {
+            return;
+        }
+        self.cancel_round();
+        {
+            let mut evidence = self.evidence.borrow_mut();
+            evidence.phase = "sample_cancelled";
+            evidence.status = "navigation_changed";
+        }
+        if self.save() {
+            self.status("Navigation cancelled the sample. Open the intended channel before another manual attempt.");
+        }
     }
 
     fn open_channel(&self) {
@@ -527,6 +549,10 @@ impl App {
                 let _ = engine
                     .core
                     .remove_NewWindowRequested(engine.new_window_token);
+                let _ = engine
+                    .core
+                    .remove_NavigationStarting(engine.navigation_token);
+                let _ = engine.core.remove_SourceChanged(engine.source_token);
                 let _ = engine.controller.Close();
             }
         }
@@ -603,7 +629,7 @@ unsafe fn read_stream(
     stream: &IStream,
     cap: usize,
     preserve: bool,
-) -> Result<Vec<u8>, StreamFailure> {
+) -> std::result::Result<Vec<u8>, StreamFailure> {
     let mut position = 0;
     if preserve {
         stream.Seek(0, STREAM_SEEK_CUR, Some(&mut position))?;
@@ -747,6 +773,24 @@ unsafe fn attach(
     }));
     let mut new_window_token = 0;
     core.add_NewWindowRequested(&popup_handler, &mut new_window_token)?;
+    let weak = Rc::downgrade(app);
+    let navigation_handler = NavigationStartingEventHandler::create(Box::new(move |_, _| {
+        if let Some(app) = weak.upgrade() {
+            app.navigation_changed();
+        }
+        Ok(())
+    }));
+    let mut navigation_token = 0;
+    core.add_NavigationStarting(&navigation_handler, &mut navigation_token)?;
+    let weak = Rc::downgrade(app);
+    let source_handler = SourceChangedEventHandler::create(Box::new(move |_, _| {
+        if let Some(app) = weak.upgrade() {
+            app.navigation_changed();
+        }
+        Ok(())
+    }));
+    let mut source_token = 0;
+    core.add_SourceChanged(&source_handler, &mut source_token)?;
     controller.SetIsVisible(true)?;
     *app.engine.borrow_mut() = Some(Engine {
         controller,
@@ -757,6 +801,8 @@ unsafe fn attach(
         response_token,
         exit_token,
         new_window_token,
+        navigation_token,
+        source_token,
     });
     close_on_failure.0 = None;
     app.resize();
@@ -838,7 +884,7 @@ unsafe fn make_window(directory: PathBuf) -> windows::core::Result<Rc<App>> {
         ..Default::default()
     };
     if RegisterClassW(&wc) == 0 {
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     let hwnd = CreateWindowExW(
         Default::default(),
@@ -914,7 +960,7 @@ unsafe fn make_window(directory: PathBuf) -> windows::core::Result<Rc<App>> {
     if SetTimer(Some(hwnd), 1, 250, None) == 0 {
         APP.with(|slot| slot.borrow_mut().take());
         let _ = DestroyWindow(hwnd);
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     let _ = ShowWindow(hwnd, SW_SHOW);
     app.save();
@@ -927,7 +973,7 @@ fn startup() -> windows::core::Result<()> {
         let directory = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(PathBuf::from))
-            .ok_or_else(windows::core::Error::from_win32)?;
+            .ok_or_else(|| windows::core::Error::from_hresult(E_UNEXPECTED))?;
         let app = make_window(directory.clone())?;
         // Do not inherit profile/browser/argument overrides that could select
         // another browser or alter default security. Never rewrite them.
