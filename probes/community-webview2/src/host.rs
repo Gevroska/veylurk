@@ -15,7 +15,7 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
     core::{w, Interface, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{BOOL, E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::{Com::*, LibraryLoader::GetModuleHandleW},
         UI::WindowsAndMessaging::*,
     },
@@ -24,6 +24,7 @@ use windows::{
 const LOGIN_ID: usize = 101;
 const OPEN_ID: usize = 102;
 const SAMPLE_ID: usize = 103;
+const RENDER_ID: usize = 104;
 const ARM_TIME: Duration = Duration::from_secs(25);
 const ROUND_GAP: Duration = Duration::from_secs(30);
 const FLUSH_TIME: Duration = Duration::from_secs(5);
@@ -58,6 +59,9 @@ struct Engine {
     new_window_token: i64,
     navigation_token: i64,
     source_token: i64,
+    navigation_completed_token: i64,
+    document_loaded_token: i64,
+    process_failed_token: i64,
 }
 
 #[derive(Default)]
@@ -171,6 +175,7 @@ impl App {
             return;
         }
         self.cancel_round();
+        self.record_action("twitch_login");
         let core = self
             .engine
             .borrow()
@@ -191,6 +196,39 @@ impl App {
         let mut state = self.state.borrow_mut();
         state.generation += 1;
         state.armed_until = None;
+    }
+
+    fn record_action(&self, target: &'static str) {
+        {
+            let mut evidence = self.evidence.borrow_mut();
+            evidence.browser_diagnostics.requested_target = target;
+            evidence.browser_diagnostics.native_action_count += 1;
+        }
+        self.save();
+    }
+
+    fn check_rendering(&self) {
+        if self.state.borrow().closing_at.is_some() {
+            return;
+        }
+        self.cancel_round();
+        self.record_action("local_render_check");
+        let core = self
+            .engine
+            .borrow()
+            .as_ref()
+            .map(|engine| engine.core.clone());
+        if let Some(core) = core {
+            let html = w!("<!doctype html><html lang=en><meta charset=utf-8><title>Local rendering check</title><body style='background:white;color:#173c28;font:24px system-ui;padding:50px'><h1>Local browser rendering works</h1><p>This page needs no Internet connection.</p><p>Use Open login to return to Twitch.</p></body></html>");
+            if unsafe { core.NavigateToString(html) }.is_err() {
+                self.fail(
+                    "local_render_navigation_failed",
+                    "Could not open the local rendering check.",
+                );
+            } else {
+                self.status("Local rendering check requested. Its text must appear below; then use Open login.");
+            }
+        }
     }
 
     fn navigation_changed(&self) {
@@ -233,6 +271,7 @@ impl App {
             return;
         }
         self.cancel_round();
+        self.record_action("twitch_channel");
         self.state.borrow_mut().selected_channel = Some(channel.clone());
         self.evidence.borrow_mut().channel = Some(channel.clone());
         let core = self
@@ -553,6 +592,15 @@ impl App {
                     .core
                     .remove_NavigationStarting(engine.navigation_token);
                 let _ = engine.core.remove_SourceChanged(engine.source_token);
+                let _ = engine
+                    .core
+                    .remove_NavigationCompleted(engine.navigation_completed_token);
+                let _ = engine
+                    .core2
+                    .remove_DOMContentLoaded(engine.document_loaded_token);
+                let _ = engine
+                    .core
+                    .remove_ProcessFailed(engine.process_failed_token);
                 let _ = engine.controller.Close();
             }
         }
@@ -774,9 +822,19 @@ unsafe fn attach(
     let mut new_window_token = 0;
     core.add_NewWindowRequested(&popup_handler, &mut new_window_token)?;
     let weak = Rc::downgrade(app);
-    let navigation_handler = NavigationStartingEventHandler::create(Box::new(move |_, _| {
+    let navigation_handler = NavigationStartingEventHandler::create(Box::new(move |_, args| {
         if let Some(app) = weak.upgrade() {
             app.navigation_changed();
+            let mut id = 0;
+            if let Some(args) = args {
+                args.NavigationId(&mut id)?;
+            }
+            {
+                let mut evidence = app.evidence.borrow_mut();
+                evidence.browser_diagnostics.navigation_started_count += 1;
+                evidence.browser_diagnostics.last_navigation_id = Some(id);
+            }
+            app.save();
         }
         Ok(())
     }));
@@ -791,6 +849,74 @@ unsafe fn attach(
     }));
     let mut source_token = 0;
     core.add_SourceChanged(&source_handler, &mut source_token)?;
+    let weak = Rc::downgrade(app);
+    let navigation_completed_handler = NavigationCompletedEventHandler::create(Box::new(
+        move |_, args| {
+            if let (Some(app), Some(args)) = (weak.upgrade(), args) {
+                if app.state.borrow().closing_at.is_some() {
+                    return Ok(());
+                }
+                let mut success = BOOL(0);
+                let mut error = COREWEBVIEW2_WEB_ERROR_STATUS(0);
+                let mut id = 0;
+                args.IsSuccess(&mut success)?;
+                args.WebErrorStatus(&mut error)?;
+                args.NavigationId(&mut id)?;
+                {
+                    let mut evidence = app.evidence.borrow_mut();
+                    evidence.browser_diagnostics.navigation_completed_count += 1;
+                    evidence.browser_diagnostics.last_navigation_id = Some(id);
+                    evidence.browser_diagnostics.last_navigation_success = Some(success.as_bool());
+                    evidence.browser_diagnostics.last_web_error_status = Some(error.0);
+                }
+                if app.save() && !success.as_bool() {
+                    app.status(&format!("Browser navigation failed (WebView2 error {}). No login or Community sample is verified.", error.0));
+                }
+            }
+            Ok(())
+        },
+    ));
+    let mut navigation_completed_token = 0;
+    core.add_NavigationCompleted(
+        &navigation_completed_handler,
+        &mut navigation_completed_token,
+    )?;
+    let weak = Rc::downgrade(app);
+    let document_loaded_handler = DOMContentLoadedEventHandler::create(Box::new(move |_, _| {
+        if let Some(app) = weak.upgrade() {
+            if app.state.borrow().closing_at.is_none() {
+                app.evidence
+                    .borrow_mut()
+                    .browser_diagnostics
+                    .document_loaded_count += 1;
+                app.save();
+            }
+        }
+        Ok(())
+    }));
+    let mut document_loaded_token = 0;
+    core2.add_DOMContentLoaded(&document_loaded_handler, &mut document_loaded_token)?;
+    let weak = Rc::downgrade(app);
+    let process_failed_handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
+        if let (Some(app), Some(args)) = (weak.upgrade(), args) {
+            if app.state.borrow().closing_at.is_some() {
+                return Ok(());
+            }
+            let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(0);
+            args.ProcessFailedKind(&mut kind)?;
+            app.evidence
+                .borrow_mut()
+                .browser_diagnostics
+                .process_failure_kind = Some(kind.0);
+            app.fail(
+                "browser_process_failed",
+                "An embedded browser process failed. No automatic retry.",
+            );
+        }
+        Ok(())
+    }));
+    let mut process_failed_token = 0;
+    core.add_ProcessFailed(&process_failed_handler, &mut process_failed_token)?;
     controller.SetIsVisible(true)?;
     *app.engine.borrow_mut() = Some(Engine {
         controller,
@@ -803,6 +929,9 @@ unsafe fn attach(
         new_window_token,
         navigation_token,
         source_token,
+        navigation_completed_token,
+        document_loaded_token,
+        process_failed_token,
     });
     close_on_failure.0 = None;
     app.resize();
@@ -840,6 +969,7 @@ unsafe extern "system" fn window_proc(
                     LOGIN_ID => app.open_login(),
                     OPEN_ID => app.open_channel(),
                     SAMPLE_ID => app.arm(),
+                    RENDER_ID => app.check_rendering(),
                     _ => (),
                 }
             }
@@ -933,6 +1063,7 @@ unsafe fn make_window(directory: PathBuf) -> windows::core::Result<Rc<App>> {
     )?;
     button(w!("Open channel"), 336, 120, OPEN_ID)?;
     button(w!("Sample Community"), 468, 170, SAMPLE_ID)?;
+    button(w!("Check rendering"), 650, 150, RENDER_ID)?;
     let status = CreateWindowExW(
         Default::default(),
         w!("STATIC"),

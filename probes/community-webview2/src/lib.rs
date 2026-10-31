@@ -275,6 +275,35 @@ pub struct SampleEvidence {
 }
 
 #[derive(Debug, Serialize)]
+pub struct BrowserDiagnostics {
+    pub requested_target: &'static str,
+    pub native_action_count: u64,
+    pub navigation_started_count: u64,
+    pub navigation_completed_count: u64,
+    pub last_navigation_id: Option<u64>,
+    pub last_navigation_success: Option<bool>,
+    pub last_web_error_status: Option<i32>,
+    pub document_loaded_count: u64,
+    pub process_failure_kind: Option<i32>,
+}
+
+impl Default for BrowserDiagnostics {
+    fn default() -> Self {
+        Self {
+            requested_target: "none",
+            native_action_count: 0,
+            navigation_started_count: 0,
+            navigation_completed_count: 0,
+            last_navigation_id: None,
+            last_navigation_success: None,
+            last_web_error_status: None,
+            document_loaded_count: 0,
+            process_failure_kind: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub struct Evidence {
     pub schema_version: u8,
     pub source: &'static str,
@@ -287,6 +316,7 @@ pub struct Evidence {
     pub source_errors: Vec<&'static str>,
     pub browser_cleanup: &'static str,
     pub samples: Vec<SampleEvidence>,
+    pub browser_diagnostics: BrowserDiagnostics,
     #[serde(skip)]
     previous: HashSet<String>,
     #[serde(skip)]
@@ -307,6 +337,7 @@ impl Default for Evidence {
             source_errors: Vec::new(),
             browser_cleanup: "not_started",
             samples: Vec::new(),
+            browser_diagnostics: BrowserDiagnostics::default(),
             previous: HashSet::new(),
             union: HashSet::new(),
         }

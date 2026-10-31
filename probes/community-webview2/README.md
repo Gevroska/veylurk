@@ -44,6 +44,14 @@ tool installation is needed for this preparation workflow.
 
 ## Owner-operated live proof
 
+If the browser area remains blank, **Check rendering** opens a built-in static
+page that needs no network access. Its visible text separates local rendering
+from Twitch page loading. **Open login** returns to Twitch. Browser diagnostics
+in the aggregate JSON record only native action/navigation counts, navigation
+IDs, success flags, WebView2 error numbers, document-loaded counts, and process
+failure kinds. They contain no page text, URLs, credentials, or cookies, and
+successful navigation never establishes account login or Community access.
+
 Launch of this new executable that accesses the Internet remains a separate
 owner approval gate. Nothing here launches the executable automatically.
 
