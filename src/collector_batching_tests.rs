@@ -17,9 +17,19 @@ struct BatchFixture {
 
 fn receipt(index: usize) -> NewObservation {
     NewObservation {
-        channel: if index % 2 == 0 { "alpha" } else { "beta" }.into(),
+        channel: if index.is_multiple_of(2) {
+            "alpha"
+        } else {
+            "beta"
+        }
+        .into(),
         account: Some(format!("account{index}")),
-        kind: if index % 3 == 0 { "part" } else { "join" }.into(),
+        kind: if index.is_multiple_of(3) {
+            "part"
+        } else {
+            "join"
+        }
+        .into(),
         received_at: format!("2026-01-01T00:{:02}:{:02}.000Z", index / 60, index % 60),
     }
 }
@@ -132,8 +142,7 @@ async fn backlog_coalesces_to_1024_without_waiting_or_consuming_the_next_payload
     for name in ["alpha", "beta"] {
         let expected = (0..1024)
             .map(receipt)
-            .filter(|row| row.channel == name && row.kind == "join")
-            .next_back()
+            .rfind(|row| row.channel == name && row.kind == "join")
             .unwrap();
         assert_eq!(
             batch.rooms[name].last_positive_at.as_deref(),
