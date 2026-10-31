@@ -32,10 +32,14 @@ const ROUND_GAP: Duration = Duration::from_secs(30);
 const FLUSH_TIME: Duration = Duration::from_secs(5);
 const TOOLBAR_HEIGHT: i32 = 92;
 
-// Reads only source-page structure; never executes on login. The browser clock
-// immediately before the ordinary click fences delayed pre-arm requests.
+// Checks the source location before any DOM read, including navigation races.
+// The browser clock before the ordinary click fences delayed pre-arm requests.
 const COMMUNITY_UI: &str = r#"(() => {
   const expected = __POPOUT__ ? '/popout/__CHANNEL__/chat' : '/__CHANNEL__';
+  if (location.origin !== 'https://www.twitch.tv' || location.pathname.toLowerCase() !== expected)
+    return {code:'wrong_page', signed_in:false, chat_ready:false, community_ready:false,
+      video_present:false, video_ready:false, video_paused:null, play_control:false,
+      pause_clicked:false, trigger_unix_ms:null};
   const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
   const buttons = [...document.querySelectorAll('button,[role="tab"]')].filter(visible);
   const label = e => (e.getAttribute('aria-label') || '').trim();
@@ -58,8 +62,6 @@ const COMMUNITY_UI: &str = r#"(() => {
       play_control:!!player && !player.disabled && /^Play(?: \(space\/k\))?$/.test(label(player)), pause_clicked};
   };
   const result = code => ({code, ...snapshot(), trigger_unix_ms:null});
-  if (location.origin !== 'https://www.twitch.tv' || location.pathname.toLowerCase() !== expected)
-    return result('wrong_page');
   if (/access denied|verify you are human|unusual traffic/i.test(document.title)
       || document.querySelector('iframe[src*="captcha" i],iframe[src*="challenge" i],form[action*="challenge" i]'))
     return result('challenge_denied');
