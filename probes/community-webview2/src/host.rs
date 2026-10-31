@@ -39,7 +39,7 @@ const COMMUNITY_UI: &str = r#"(() => {
   if (location.origin !== 'https://www.twitch.tv' || location.pathname.toLowerCase() !== expected)
     return {code:'wrong_page', signed_in:false, chat_ready:false, community_ready:false,
       video_present:false, video_ready:false, video_paused:null, play_control:false,
-      pause_clicked:false, trigger_unix_ms:null};
+      pause_clicked:false, trigger_unix_ms:null, observed_unix_ms:null};
   const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
   const buttons = [...document.querySelectorAll('button,[role="tab"]')].filter(visible);
   const label = e => (e.getAttribute('aria-label') || '').trim();
@@ -61,7 +61,8 @@ const COMMUNITY_UI: &str = r#"(() => {
       video_paused:videos.length > 0 ? videos.every(v => v.paused) : null,
       play_control:!!player && !player.disabled && /^Play(?: \(space\/k\))?$/.test(label(player)), pause_clicked};
   };
-  const result = code => ({code, ...snapshot(), trigger_unix_ms:null});
+  const result = code => ({code, ...snapshot(), trigger_unix_ms:null,
+    observed_unix_ms:performance.timeOrigin + performance.now()});
   if (/access denied|verify you are human|unusual traffic/i.test(document.title)
       || document.querySelector('iframe[src*="captcha" i],iframe[src*="challenge" i],form[action*="challenge" i]'))
     return result('challenge_denied');
@@ -80,10 +81,14 @@ const COMMUNITY_UI: &str = r#"(() => {
   }
   if (!target || target.disabled) return result('waiting_ui');
   if (!__CLICK__) return result('ready');
-  const trigger_unix_ms = performance.timeOrigin + performance.now();
   const observed = snapshot();
+  const trigger_unix_ms = performance.timeOrigin + performance.now();
+  const deadline = __TRIGGER_DEADLINE_MS__;
+  if (!Number.isFinite(deadline) || !Number.isFinite(trigger_unix_ms)
+      || trigger_unix_ms <= 0 || trigger_unix_ms >= deadline)
+    return {code:'community_trigger_deadline',...observed,trigger_unix_ms:null,observed_unix_ms:trigger_unix_ms};
   target.click();
-  return {code:'native_community_clicked',...observed,trigger_unix_ms};
+  return {code:'native_community_clicked',...observed,trigger_unix_ms,observed_unix_ms:trigger_unix_ms};
 })()"#;
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -128,6 +133,7 @@ struct State {
     player_gate: sampling::PlayerGate,
     pending_sample: Option<(community_webview2_proof::ParsedSample, BodyRequest)>,
     trigger_pending: bool,
+    trigger_deadline: Option<sampling::TriggerDeadline>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +151,7 @@ struct UiResult {
     #[serde(flatten)]
     player: sampling::PlayerObservation,
     trigger_unix_ms: Option<f64>,
+    observed_unix_ms: Option<f64>,
 }
 
 struct App {
@@ -271,6 +278,7 @@ impl App {
         state.tracker = None;
         state.pending_sample = None;
         state.trigger_pending = false;
+        state.trigger_deadline = None;
     }
 
     fn record_action(&self, target: &'static str) {
@@ -547,7 +555,7 @@ impl App {
                     state.network_enabled = true;
                 }
                 if manual_arm {
-                    app.begin_sample();
+                    app.ui_step(false);
                 } else {
                     let stage = app.state.borrow().auto_stage;
                     if let Some(AutoStage::Enabling(deadline)) = stage {
@@ -613,7 +621,7 @@ impl App {
         self.enable_network(true);
     }
 
-    fn begin_sample(self: &Rc<Self>) {
+    fn begin_sample(self: &Rc<Self>, browser_observed_ms: Option<f64>) {
         if self.automatic() && !self.state.borrow().player_gate.ready() {
             self.fail(
                 "player_pause_not_verified",
@@ -627,7 +635,25 @@ impl App {
             let mut state = self.state.borrow_mut();
             state.generation += 1;
             generation = state.generation;
-            state.armed_until = Some(Instant::now() + ARM_TIME);
+            let budget = state
+                .schedule
+                .as_ref()
+                .map_or(sampling::RESPONSE_MS, |schedule| {
+                    (schedule.config.max_seconds * 1000)
+                        .saturating_sub(now)
+                        .min(sampling::RESPONSE_MS)
+                });
+            state.trigger_deadline = browser_observed_ms
+                .and_then(|clock| sampling::TriggerDeadline::new(generation, now, clock, budget));
+            if state.trigger_deadline.is_none() {
+                drop(state);
+                self.fail(
+                    "invalid_trigger_deadline",
+                    "A bounded browser-clock trigger deadline could not be established.",
+                );
+                return;
+            }
+            state.armed_until = Some(Instant::now() + Duration::from_millis(budget));
             state.last_round = Some(Instant::now());
             if let Some(schedule) = state.schedule.as_mut() {
                 schedule.note_trigger_started(now);
@@ -655,6 +681,27 @@ impl App {
         self.ui_step(true);
     }
 
+    fn trigger_dispatch_allowed(&self, generation: u64) -> bool {
+        self.is_active(generation)
+            && self
+                .state
+                .borrow()
+                .trigger_deadline
+                .as_ref()
+                .is_some_and(|deadline| deadline.allows_dispatch(generation, self.elapsed_ms()))
+    }
+
+    fn expire_trigger(&self) {
+        if self.automatic() {
+            self.end_auto_attempt("community_trigger_deadline", false);
+        } else {
+            self.fail(
+                "community_trigger_deadline",
+                "The Community trigger deadline elapsed. No click or automatic retry.",
+            );
+        }
+    }
+
     fn ui_step(self: &Rc<Self>, click: bool) {
         let (channel, generation, automatic, allow_pause, require_readiness, checks_pending_sample) = {
             let state = self.state.borrow();
@@ -676,6 +723,10 @@ impl App {
                 state.pending_sample.is_some(),
             )
         };
+        if click && !self.trigger_dispatch_allowed(generation) {
+            self.expire_trigger();
+            return;
+        }
         let Ok(uri) = self.current_uri() else {
             self.fail(
                 "source_uri_unavailable",
@@ -688,6 +739,13 @@ impl App {
             return;
         }
         let popout = is_popout_page(&uri, &channel);
+        let deadline_json = self
+            .state
+            .borrow()
+            .trigger_deadline
+            .as_ref()
+            .map(|deadline| deadline.browser_expires_unix_ms().to_string())
+            .unwrap_or("null".into());
         let script = COMMUNITY_UI
             .replace("__CHANNEL__", &channel)
             .replace("__POPOUT__", if popout { "true" } else { "false" })
@@ -696,6 +754,7 @@ impl App {
                 "__ALLOW_PAUSE__",
                 if allow_pause { "true" } else { "false" },
             )
+            .replace("__TRIGGER_DEADLINE_MS__", &deadline_json)
             .replace("__CLICK__", if click { "true" } else { "false" });
         self.state.borrow_mut().script_pending = true;
         let weak = Rc::downgrade(self);
@@ -736,6 +795,10 @@ impl App {
                     );
                     return Ok(());
                 }
+            }
+            if app.state.borrow().trigger_pending && !app.trigger_dispatch_allowed(generation) {
+                app.expire_trigger();
+                return Ok(());
             }
             if result.is_err() || json.len() > 1024 {
                 app.fail(
@@ -806,7 +869,9 @@ impl App {
                                     Some(AutoStage::Enabling(deadline));
                                 app.enable_network(false);
                             }
-                            Some(AutoStage::Ready(_)) if require_readiness => app.begin_sample(),
+                            Some(AutoStage::Ready(_)) if require_readiness => {
+                                app.begin_sample(ui.observed_unix_ms)
+                            }
                             Some(AutoStage::Sampling) if trigger_pending => app.ui_step(true),
                             Some(AutoStage::Sampling) if checks_pending_sample => {
                                 app.finish_pending_sample()
@@ -820,8 +885,30 @@ impl App {
                     "community_control_unavailable",
                     "The ordinary Community control is unavailable. No repeated click.",
                 ),
-                "ready" if !click && !automatic => (),
+                "ready" if !click && !automatic => {
+                    let preparing = app.state.borrow().tracker.is_none();
+                    if preparing {
+                        if app.is_active(generation) {
+                            app.begin_sample(ui.observed_unix_ms);
+                        } else {
+                            app.expire_trigger();
+                        }
+                    }
+                }
+                "community_trigger_deadline" if click => app.expire_trigger(),
                 "native_community_clicked" if click => {
+                    if !app.trigger_dispatch_allowed(generation)
+                        || !ui.trigger_unix_ms.is_some_and(|clock| {
+                            app.state
+                                .borrow()
+                                .trigger_deadline
+                                .as_ref()
+                                .is_some_and(|deadline| deadline.allows_browser_click(clock))
+                        })
+                    {
+                        app.expire_trigger();
+                        return Ok(());
+                    }
                     if automatic && !player_ready {
                         app.fail(
                             "player_pause_not_verified",
@@ -867,6 +954,12 @@ impl App {
         }));
         if let Some(core) = self.core() {
             let script = wide(&script);
+            // Recheck immediately before dispatch, including delayed callbacks.
+            if click && !self.trigger_dispatch_allowed(generation) {
+                self.state.borrow_mut().script_pending = false;
+                self.expire_trigger();
+                return;
+            }
             if unsafe { core.ExecuteScript(PCWSTR(script.as_ptr()), &done) }.is_err() {
                 self.state.borrow_mut().script_pending = false;
                 self.fail(
@@ -1114,6 +1207,7 @@ impl App {
             }
             self.evidence.borrow_mut().source_proven_in_this_run = true;
             self.end_auto_attempt("sample_received", false);
+            self.minimize_after_first_sample();
         } else {
             self.cancel_round();
             self.disable_network();
@@ -1125,6 +1219,41 @@ impl App {
             drop(evidence);
             self.save();
             self.status("Native sample saved. Fresh server state remains unproved; wait 30 seconds for another manual attempt.");
+        }
+    }
+
+    fn minimize_after_first_sample(&self) {
+        if self.state.borrow().evidence_write_failed {
+            return;
+        }
+        let first_persisted = self
+            .evidence
+            .borrow()
+            .autonomous
+            .as_ref()
+            .is_some_and(|run| {
+                run.source_samples_received == 1 && run.minimize_milestone_ms.is_none()
+            });
+        if !first_persisted {
+            return;
+        }
+        let milestone = self.elapsed_ms();
+        // end_auto_attempt saved the accepted sample. No RefCell guard crosses
+        // ShowWindow, which can synchronously deliver native window messages.
+        let minimized = unsafe {
+            let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+            IsIconic(self.hwnd).as_bool()
+        };
+        if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
+            run.minimize_milestone_ms = Some(milestone);
+            run.minimized_verified = Some(minimized);
+        }
+        self.save();
+        if !minimized {
+            self.fail(
+                "native_minimize_unverified",
+                "Native minimization was not verified. The finite proof is stopped.",
+            );
         }
     }
 

@@ -104,9 +104,15 @@ response timeout. The next navigation gets a new pause/readiness gate. There is 
 mute substitute, media URL request, direct player API call, ad skip, DOM removal,
 or background/occlusion flag. A paused video does not prove absent video network
 traffic or low resource usage. Native buttons cannot redirect the autonomous
-run; close the window to stop it. Minimized operation needs separate live proof.
+run; close the window to stop it.
 Minimization preserves the last normal controller bounds so the page keeps its
 ordinary layout. Native background throttling and occlusion behavior are unchanged.
+Autonomous mode minimizes its own native window exactly once, immediately after
+the first accepted sample is saved. It uses ordinary `SW_MINIMIZE`, records the
+monotonic `minimize_milestone_ms`, and verifies `IsIconic` in `minimized_verified`.
+Failure to verify minimization stops the run. Later receipts must follow that
+milestone to establish minimized collection. Manual mode stays visible; no
+visibility, suspension, or browser flags are changed.
 
 This route is explicit: autonomous mode never tries the chat popout and never
 falls back or retries after a denial. A normal full-channel control succeeded
@@ -139,6 +145,15 @@ request. Only then does `Network.getResponseBody` read that existing response;
 it never sends a Twitch request. Batch index and length are checked before
 parsing the selected result. Headers, cookies, security details, and unrelated
 fields are ignored by typed event deserialization and never retained.
+
+Every actual Community trigger passes a shared generation/monotonic-deadline
+check immediately before script dispatch. The script also checks an immutable
+expiry immediately before its click, using the same browser performance clock
+as the request-trigger timestamp. A preceding read-only UI result supplies that
+clock anchor in both manual and autonomous modes. Callback/queue delays shorten
+the browser budget; they never renew it or convert system wall time into browser
+time. An expired trigger records `community_trigger_deadline` without a click
+or rearming.
 
 The response event uses its reporting timestamp, while the finish event can
 carry an earlier network-stack timestamp. Chromium's own frontend handles this

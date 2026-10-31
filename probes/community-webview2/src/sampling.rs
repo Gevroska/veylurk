@@ -16,6 +16,49 @@ pub const MAX_EVENTS: usize = 2048;
 pub const MAX_CANDIDATES: usize = 4;
 pub const MAX_NAVIGATION_IDS: usize = 64;
 
+/// Fixed at round creation. The browser anchor predates its callback, so queue
+/// delay can shorten this budget but can never renew it. No wall-clock mixing.
+pub struct TriggerDeadline {
+    generation: u64,
+    host_expires_ms: u64,
+    browser_expires_unix_ms: f64,
+}
+
+impl TriggerDeadline {
+    pub fn new(
+        generation: u64,
+        now_ms: u64,
+        browser_observed_ms: f64,
+        budget_ms: u64,
+    ) -> Option<Self> {
+        if !browser_observed_ms.is_finite()
+            || browser_observed_ms <= 0.0
+            || budget_ms == 0
+            || budget_ms > RESPONSE_MS
+        {
+            return None;
+        }
+        let browser_expires_unix_ms = browser_observed_ms + budget_ms as f64;
+        if !browser_expires_unix_ms.is_finite() || browser_expires_unix_ms <= browser_observed_ms {
+            return None;
+        }
+        Some(Self {
+            generation,
+            host_expires_ms: now_ms.checked_add(budget_ms)?,
+            browser_expires_unix_ms,
+        })
+    }
+    pub fn allows_dispatch(&self, generation: u64, now_ms: u64) -> bool {
+        self.generation == generation && now_ms < self.host_expires_ms
+    }
+    pub fn browser_expires_unix_ms(&self) -> f64 {
+        self.browser_expires_unix_ms
+    }
+    pub fn allows_browser_click(&self, observed_ms: f64) -> bool {
+        observed_ms.is_finite() && observed_ms > 0.0 && observed_ms < self.browser_expires_unix_ms
+    }
+}
+
 /// Structural observations only; no account labels, chat text, or media URLs.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PlayerObservation {
@@ -829,6 +872,8 @@ pub struct RunEvidence {
     pub channels: BTreeMap<String, ChannelEvidence>,
     pub source_samples_received: usize,
     pub fresh_server_samples_proven: bool,
+    pub minimize_milestone_ms: Option<u64>,
+    pub minimized_verified: Option<bool>,
 }
 
 impl RunEvidence {
@@ -846,6 +891,8 @@ impl RunEvidence {
                 .collect(),
             source_samples_received: 0,
             fresh_server_samples_proven: false,
+            minimize_milestone_ms: None,
+            minimized_verified: None,
         }
     }
     pub fn start(&mut self, attempt: Attempt) {
@@ -915,6 +962,46 @@ impl RunEvidence {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn delayed_ready_callback_cannot_dispatch_after_the_round_deadline() {
+        let deadline = TriggerDeadline::new(7, 1_000, 50_000.0, RESPONSE_MS).unwrap();
+        assert!(deadline.allows_dispatch(7, 25_999));
+        // The readiness callback finishes before the timer gets an expiry turn.
+        assert!(!deadline.allows_dispatch(7, 26_000));
+        assert!(!deadline.allows_dispatch(7, 30_000));
+        assert!(!deadline.allows_dispatch(6, 2_000));
+        assert!(!deadline.allows_dispatch(8, 2_000));
+        assert_eq!(deadline.browser_expires_unix_ms(), 75_000.0);
+    }
+
+    #[test]
+    fn queued_click_cannot_extend_the_fixed_browser_clock_expiry() {
+        let deadline = TriggerDeadline::new(7, 1_000, 50_000.0, RESPONSE_MS).unwrap();
+        assert!(deadline.allows_dispatch(7, 1_100));
+        assert!(deadline.allows_browser_click(74_999.0));
+        // Dispatch was timely, but execution waited in the browser queue.
+        assert!(!deadline.allows_browser_click(75_000.0));
+        assert!(!deadline.allows_browser_click(90_000.0));
+        assert!(!deadline.allows_browser_click(f64::NAN));
+        assert!(!deadline.allows_browser_click(f64::INFINITY));
+        assert!(!deadline.allows_browser_click(0.0));
+        // Later read-only observations do not construct or renew this deadline.
+        assert_eq!(deadline.browser_expires_unix_ms(), 75_000.0);
+    }
+
+    #[test]
+    fn trigger_deadline_is_bounded_and_uses_the_earlier_browser_observation() {
+        let short = TriggerDeadline::new(1, 1_000, 50_000.0, 100).unwrap();
+        assert!(!short.allows_dispatch(1, 1_100));
+        assert_eq!(short.browser_expires_unix_ms(), 50_100.0);
+        assert!(!short.allows_browser_click(50_200.0)); // An already delayed callback.
+        assert!(TriggerDeadline::new(1, 0, f64::NAN, RESPONSE_MS).is_none());
+        assert!(TriggerDeadline::new(1, 0, f64::MAX, RESPONSE_MS).is_none());
+        assert!(TriggerDeadline::new(1, 0, 50_000.0, 0).is_none());
+        assert!(TriggerDeadline::new(1, 0, 50_000.0, RESPONSE_MS + 1).is_none());
+        assert!(TriggerDeadline::new(1, u64::MAX, 50_000.0, RESPONSE_MS).is_none());
+    }
 
     fn paused_channel() -> PlayerObservation {
         PlayerObservation {
