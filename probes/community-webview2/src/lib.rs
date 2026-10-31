@@ -3,10 +3,13 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
+pub mod sampling;
+
 pub const REQUEST_CAP: usize = 64 * 1024;
 pub const RESPONSE_CAP: usize = 1024 * 1024;
 pub const MAX_BATCH: usize = 32;
 pub const MAX_SAMPLES: usize = 3;
+pub const MAX_MEMBERS: usize = 4096;
 pub const CATEGORIES: [&str; 6] = [
     "broadcasters",
     "staff",
@@ -35,12 +38,19 @@ pub fn is_channel_page(uri: &str, channel: &str) -> bool {
     let Some(path) = uri.strip_prefix("https://www.twitch.tv/") else {
         return false;
     };
-    let login = path.split(['/', '?', '#']).next().unwrap_or("");
-    login.eq_ignore_ascii_case(channel)
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    (path.eq_ignore_ascii_case(channel)
+        || path.eq_ignore_ascii_case(&format!("popout/{channel}/chat")))
         && !matches!(
-            login.to_ascii_lowercase().as_str(),
+            channel.to_ascii_lowercase().as_str(),
             "login" | "signup" | "settings"
         )
+}
+
+pub fn is_popout_page(uri: &str, channel: &str) -> bool {
+    uri.split(['?', '#']).next().is_some_and(|uri| {
+        uri.eq_ignore_ascii_case(&format!("https://www.twitch.tv/popout/{channel}/chat"))
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -63,12 +73,14 @@ pub enum Failure {
     BatchMismatch,
     HttpDenied,
     HttpError,
+    RateLimited,
     IntegrityDenied,
     AuthenticationDenied,
     ChallengeDenied,
     SourceErrors,
     MissingChatters,
     InvalidShape,
+    MemberLimit,
 }
 
 impl Failure {
@@ -84,18 +96,21 @@ impl Failure {
             Self::BatchMismatch => "batch_mismatch",
             Self::HttpDenied => "http_denied",
             Self::HttpError => "http_error",
+            Self::RateLimited => "rate_limited",
             Self::IntegrityDenied => "integrity_denied",
             Self::AuthenticationDenied => "authentication_denied",
             Self::ChallengeDenied => "challenge_denied",
             Self::SourceErrors => "source_errors",
             Self::MissingChatters => "missing_chatters",
             Self::InvalidShape => "invalid_shape",
+            Self::MemberLimit => "member_limit",
         }
     }
     pub fn is_denial(self) -> bool {
         matches!(
             self,
             Self::HttpDenied
+                | Self::RateLimited
                 | Self::IntegrityDenied
                 | Self::AuthenticationDenied
                 | Self::ChallengeDenied
@@ -168,6 +183,12 @@ fn source_error(errors: &[Value]) -> Failure {
         if text.contains("integrity") {
             return Failure::IntegrityDenied;
         }
+        if text.contains("rate_limit")
+            || text.contains("too_many_requests")
+            || text.contains("too many requests")
+        {
+            return Failure::RateLimited;
+        }
         if [
             "captcha",
             "challenge",
@@ -238,11 +259,18 @@ pub fn parse_response(
         .ok_or(Failure::InvalidShape)?;
     let mut categories = BTreeMap::new();
     let mut accounts = HashSet::new();
+    let mut rows = 0usize;
     for category in CATEGORIES {
         let entries = chatters
             .get(category)
             .and_then(Value::as_array)
             .ok_or(Failure::InvalidShape)?;
+        rows = rows
+            .checked_add(entries.len())
+            .ok_or(Failure::MemberLimit)?;
+        if rows > MAX_MEMBERS {
+            return Err(Failure::MemberLimit);
+        }
         categories.insert(category.to_owned(), entries.len());
         for entry in entries {
             let login = entry
@@ -272,6 +300,7 @@ pub struct SampleEvidence {
     pub unique_accounts: usize,
     pub overlap_with_previous: Option<usize>,
     pub union_accounts: usize,
+    pub provenance: Option<sampling::Provenance>,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,6 +346,7 @@ pub struct Evidence {
     pub browser_cleanup: &'static str,
     pub samples: Vec<SampleEvidence>,
     pub browser_diagnostics: BrowserDiagnostics,
+    pub autonomous: Option<sampling::RunEvidence>,
     #[serde(skip)]
     previous: HashSet<String>,
     #[serde(skip)]
@@ -338,6 +368,7 @@ impl Default for Evidence {
             browser_cleanup: "not_started",
             samples: Vec::new(),
             browser_diagnostics: BrowserDiagnostics::default(),
+            autonomous: None,
             previous: HashSet::new(),
             union: HashSet::new(),
         }
@@ -363,6 +394,7 @@ impl Evidence {
             unique_accounts: parsed.accounts.len(),
             overlap_with_previous: overlap,
             union_accounts: self.union.len(),
+            provenance: None,
         });
         self.previous = parsed.accounts;
         self.sample_count = self.samples.len();
@@ -509,6 +541,21 @@ mod tests {
             parse_response(&serde_json::to_vec(&malformed).unwrap(), &request(), 200).unwrap_err(),
             Failure::InvalidShape
         );
+    }
+
+    #[test]
+    fn excessive_role_members_and_native_rate_limits_fail_closed() {
+        let body = response(&vec!["viewer"; MAX_MEMBERS + 1]);
+        assert_eq!(
+            parse_response(&body, &request(), 200).unwrap_err(),
+            Failure::MemberLimit
+        );
+        let body = br#"[{}, {"errors":[{"extensions":{"code":"TOO_MANY_REQUESTS"}}]}]"#;
+        assert_eq!(
+            parse_response(body, &request(), 200).unwrap_err(),
+            Failure::RateLimited
+        );
+        assert!(Failure::RateLimited.is_denial());
     }
 
     #[test]

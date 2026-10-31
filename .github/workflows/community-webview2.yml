@@ -47,10 +47,20 @@ jobs:
         run: cargo fmt --manifest-path probes/community-webview2/Cargo.toml --all -- --check
       - name: Lint the proof
         run: cargo clippy --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets -- -D warnings
-      - name: Test parsing and bounds without Twitch
+      - name: Test parsing, scheduling, native request identity and bounds without Twitch
         run: cargo test --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets
       - name: Build the Windows proof
         run: cargo build --manifest-path probes/community-webview2/Cargo.toml --locked --release
+      - name: Check offline CLI paths without creating a browser or profile
+        shell: pwsh
+        run: |
+          $binary = 'target/community-webview2/release/veylurk-community-webview2-proof.exe'
+          $help = Start-Process -FilePath $binary -ArgumentList '--help' -Wait -PassThru -WindowStyle Hidden
+          if ($help.ExitCode -ne 0) { throw 'Offline help failed' }
+          $invalid = Start-Process -FilePath $binary -ArgumentList '--autonomous --channel only_one' -Wait -PassThru -WindowStyle Hidden
+          if ($invalid.ExitCode -ne 2) { throw 'Invalid autonomous configuration was not rejected offline' }
+          if (Test-Path 'target/community-webview2/release/data/browser-profile') { throw 'Offline CLI created a profile' }
+          if (Test-Path 'target/community-webview2/release/aggregate-evidence.json') { throw 'Offline CLI created live evidence' }
       - name: Package the isolated proof without profiles or credentials
         shell: pwsh
         env:

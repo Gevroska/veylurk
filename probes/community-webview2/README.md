@@ -1,134 +1,143 @@
 # Standalone Community WebView2 source proof
 
-This small Rust Windows application tests whether Twitch's normal Community tab
-works in an app-owned WebView2 host. It is separate from the production Veylurk
-application, collector, database, credentials, and running process. A successful
-parser test or Windows build does **not** prove that Twitch accepts this host.
-The source remains unproved until the live acceptance steps below succeed.
+This isolated Rust Windows proof uses the existing WebView2 runtime and its
+executable-local `data/browser-profile`. It does not change the production
+Veylurk service, SQLite history, credentials, or IRC evidence. Manual Community
+access and profile persistence were demonstrated with an earlier revision;
+this revision still needs Windows checks and live autonomous-popout acceptance.
 
-It uses the existing Microsoft WebView2 runtime (the Edge rendering engine). It
-does not open the Edge browser or depend on Codex, Brave, Playwright, or another
-browser. It contains no installer, runtime bootstrapper, or download mechanism.
-If an existing runtime cannot be used, it shows a friendly failure and stops.
-The MSVC build links the crate's supplied WebView2 loader statically; the runtime
-itself is not bundled.
+There is no installer, runtime download, private HTTP client, token/cookie API,
+request replay, imported profile, browser identity modification, security flag,
+remote debugging port, Brave dependency, extension, or Playwright dependency.
+Normal owner login remains manual. The browser keeps its ordinary session in
+this proof's existing profile. Environment overrides for the browser, profile,
+release channel, or arguments cause startup failure instead of being changed.
 
-## Build and offline checks
+## Offline checks
 
-The crate is an independent workspace. Run these commands from the Veylurk
-repository with an existing Rust MSVC toolchain on Windows:
+The crate is an independent workspace with pinned dependencies and a committed
+lockfile. With an existing Windows MSVC toolchain:
 
 ```powershell
-cargo fmt --manifest-path probes/community-webview2/Cargo.toml --check
+cargo fmt --manifest-path probes/community-webview2/Cargo.toml --all -- --check
 cargo clippy --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets -- -D warnings
-cargo test --manifest-path probes/community-webview2/Cargo.toml --locked
+cargo test --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets
 cargo build --manifest-path probes/community-webview2/Cargo.toml --locked --release
 ```
 
-The binary is `probes/community-webview2/target/release/veylurk-community-webview2-proof.exe`
-unless CI supplies a different `CARGO_TARGET_DIR`. An explicitly selected
-`--target x86_64-pc-windows-msvc` adds that target directory below the target root.
-Package the executable and this README in a separate writable folder. Do not
-replace the production executable or copy production data into this folder.
+`--help` and invalid-argument handling return before COM, browser/profile
+creation, or network access. Synthetic tests cover exact source selection,
+role deduplication, source errors, redaction, response/member bounds, scheduler
+fairness and deadlines, stale request IDs/generations, delayed trigger callbacks,
+frame mismatch, caching, and repeated samples. They do not establish live access.
+The Windows workflow packages only the executable, documentation, manifests,
+and any required loader; it never packages a browser profile or live evidence.
 
-`veylurk-community-webview2-proof.exe --help` exits before COM initialization,
-window creation, profile creation, or network access. Parser tests are portable
-and contain only synthetic source fixtures. They exercise batch correlation,
-channel case normalization, exact operation selection, role duplicates, source
-denials, malformed data, size bounds, aggregate redaction, and three-sample bounds.
+## Manual owner login and source check
 
-If `Cargo.lock` has not yet been generated, the first CI preparation run must
-generate and upload it. Commit that exact lock and rerun all acceptance checks
-with `--locked` before accepting the executable. No local dependency download or
-tool installation is needed for this preparation workflow.
+Run without arguments in a separate writable proof folder. The native **Open
+login** button navigates to Twitch's normal login page. Sign in personally;
+the host never inspects login fields, credentials, headers, or cookie storage.
+**Check rendering** opens a built-in local page if native rendering is uncertain.
 
-## Owner-operated live proof
+Enter one channel and choose **Open channel**. When chat is ready, close an
+already-open Community panel and choose **Sample Community**. At most three
+manual attempts are allowed, with starts at least 30 seconds apart. The host
+enables passive native observation, verifies the root frame, and performs one
+ordinary Community click. It waits at most 25 seconds for that click's native
+response after setup. A denial disables sampling for the remainder of the run.
 
-If the browser area remains blank, **Check rendering** opens a built-in static
-page that needs no network access. Its visible text separates local rendering
-from Twitch page loading. **Open login** returns to Twitch. Browser diagnostics
-in the aggregate JSON record only native action/navigation counts, navigation
-IDs, success flags, WebView2 error numbers, document-loaded counts, and process
-failure kinds. They contain no page text, URLs, credentials, or cookies, and
-successful navigation never establishes account login or Community access.
+Normal closure preserves the profile. Reopen this same folder to test session
+persistence; neither successful navigation nor a saved profile proves login or
+source access. Successful later navigation clears the prior native error status.
 
-Launch of this new executable that accesses the Internet remains a separate
-owner approval gate. Nothing here launches the executable automatically.
+## Finite autonomous chat-only mode
 
-1. Start the proof in its separate folder. It opens the normal
-   `https://www.twitch.tv/login` page. Sign in manually using the owner's account.
-   The app never reads login fields or supplies credentials.
-2. Confirm that normal Twitch rendering and login work. Enter the live channel
-   login and press **Open channel**. Wait for the page and chat to finish loading.
-3. Close Twitch's Community panel if it is already open. Press the native
-   **Sample Community** button. This explicitly arms a 25-second observation
-   window and makes one ordinary Community button click in the current page.
-   If Twitch's button selector has changed, click its Community tab manually
-   during the same observation window. There is no automatic retry.
-4. Read the native status line and `aggregate-evidence.json`. An accepted sample
-   requires HTTP 200, no source errors, and the expected chatters shape for the
-   selected channel. Each later attempt requires another native app button click
-   and at least 30 seconds since the prior attempt. There are at most three
-   manual attempts per process, and at most three successful samples.
-5. Close the native window normally. Confirm the JSON records browser cleanup,
-   and independently verify that this proof's WebView2 subprocesses have exited.
-   If the event was not received within five seconds, the JSON says cleanup was
-   unconfirmed; the app never force-kills a process.
-6. Restart the same executable in the same folder and confirm the normal Twitch
-   session persists. Rendering, successful account login, a valid source sample,
-   normal restart persistence, and process cleanup are separate live gates.
+Use the same executable folder and existing app-owned profile:
 
-Do not automate CAPTCHA, challenge, or account recovery. A matching source
-integrity/authentication/challenge error, or HTTP 401/403/429, stops sampling for
-the remainder of the run. The app makes no bypass or retry attempt.
+```powershell
+.\veylurk-community-webview2-proof.exe --autonomous --channel first_channel --channel second_channel --circuits 2 --max-seconds 300
+```
 
-## Observation and evidence boundaries
+Replace the two placeholders with actual permitted channel logins. This command
+is an example, not a launch performed by the build. A new Internet-capable
+executable still needs the owner's launch approval.
 
-The native `WebResourceResponseReceived` event observes requests that Twitch's
-page already made. The app only examines POST bodies at
-`https://gql.twitch.tv/gql` while a sample is explicitly armed. It accepts the
-exact operation `CommunityTab` with `variables.login`, or the older
-`ChatViewers` with `variables.channelLogin`; the selected channel comparison is
-ASCII case insensitive. A batched response must match its originating batch
-length and index. Multiple matching operations in one batch are rejected as
-ambiguous. The current page must also match the selected channel.
+The mode accepts exactly two or three distinct channels, one to three circuits
+(default two), and a 60–600 second total limit (default 420). One controller
+visits `https://www.twitch.tv/popout/CHANNEL/chat` in channel order, with all
+attempt starts at least 30 seconds apart. It never navigates to the full video
+player. The attempt has one 15-second navigation/UI budget, then a 25-second
+native-response budget. Total runtime includes startup and waits; closing gets
+at most five additional seconds for browser-process exit confirmation.
 
-The observer reads no request or response headers. It restores the native
-request stream position, reads at most 64 KiB plus a one-byte overflow sentinel,
-and drops the request bytes before reading the response. Response reads are
-bounded at 1 MiB plus the sentinel. There are at most 64 matching endpoint events
-per attempt, one outstanding response-content callback, one Community UI
-callback, and a five-second native shutdown flush. Over-budget or malformed
-data stops that attempt. There is no request replay, private HTTP client,
-integrity generation, browser automation stealth, user-agent modification,
-security flag change, or imported browser session.
+The existing profile is required. No automatic login is attempted. A video
+DOM element invalidates the chat-only prerequisite. The host records only its
+presence flag. Native buttons cannot redirect the autonomous run; close the
+window to stop it. Minimized-window operation remains a separate live check.
 
-The normal app-owned profile is `data/browser-profile` next to the executable.
-The WebView2 engine manages its normal persistent login/session storage. The
-application never reads or exports cookies, tokens, or other browser profiles.
-It preserves this profile on close. Environment variables that override the
-runtime, profile, release channel, or browser arguments cause a safe startup
-failure; the proof does not rewrite them.
+There is one ordinary Community click per attempt. No failed attempt is retried:
+a channel that reaches a navigation/UI/response deadline is skipped in later
+circuits. Other channels may continue. HTTP 401/403/429, integrity,
+authentication, rate-limit, or challenge denial stops the whole run. Unexpected
+protocol data, identity failures, or exceeded safety bounds also stop the run.
+No CAPTCHA, challenge, account-recovery flow, or detection workaround is tried.
 
-`aggregate-evidence.json`, also next to the executable, is replaced for each
-run and after each state change. Only phase/status codes, the selected public
-channel, attempt/sample counts, HTTP status, classified source errors, reported
-chatters count, category lengths, unique-account counts, pairwise overlap, union
-counts, and cleanup state are stored. Source account sets exist only in RAM;
-raw batches, error text, page DOM, headers, credentials, and cookies are never
-written by the application. If aggregate evidence cannot be written, sampling
-is disabled. Archive a previous run's aggregate file separately if needed.
+## Native request identity and bounds
 
-The reported count and captured account sets describe the native chat-community
-source. They do not establish all video viewers, watch time, uniform sampling,
-independent rounds, exhaustive coverage, or any percentage guarantee. The older
-`ChatViewers` shape is supported by synthetic tests; only live results can
-validate whichever operation Twitch actually uses in this host.
+Only the WebView2 native DevTools observation interface is used. `Network.enable`
+finishes before the trigger; `Page.getFrameTree` identifies the source root
+frame. Observation is disabled before app navigation, and event payloads are
+never read on login or outside the exact selected source page.
 
-## Documentation checked
+`Network.requestWillBeSent` supplies the request ID, root frame, browser request
+start time, and matching `CommunityTab`/`ChatViewers` operation/channel. A
+browser-clock timestamp captured immediately before the ordinary click rejects
+pre-trigger requests, even if their events arrive late. A bounded candidate
+buffer accommodates the click callback arriving after request/response events.
+The ID, frame, page, and navigation/attempt generation must remain consistent.
 
-- [webview2-rs APIs and sample host](https://github.com/wravery/webview2-rs)
-  (`webview2-com` pinned to 0.39.1, `windows` pinned to 0.62.2).
-- [Microsoft: observing requests and responses](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/webresourcerequested#monitoring-the-requests-and-responses-via-the-webresourceresponsereceived-event).
-- [Microsoft: WebView2 user data folders](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder).
-- [Rust Windows IStream methods](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/System/Com/struct.IStream.html).
+`Network.responseReceived` and `Network.loadingFinished` identify the same
+request. Only then does `Network.getResponseBody` read that existing response;
+it never sends a Twitch request. Batch index and length are checked before
+parsing the selected result. Headers, cookies, security details, and unrelated
+fields are ignored by typed event deserialization and never retained.
+
+Limits are 192 KiB per event, 2,048 events per attempt, four pending matching
+candidates, a 64 KiB request body, a 1 MiB decoded response, and 4,096 member
+rows across all roles. Protocol response-string escaping has a separate finite
+sixfold envelope limit. Unsupported base64 responses fail closed. There is at
+most one response-body request and one UI callback pending per attempt.
+Expired or superseded callbacks cannot save a sample or clear a newer callback.
+
+## Aggregate evidence and acceptance
+
+`aggregate-evidence.json` next to the executable is replaced each run. It
+contains only public configured channels, safe phase/reason codes, attempt
+start/end times, native navigation diagnostics, category/count totals,
+per-channel overlap/union and duplicate-set flags, cache provenance, and browser
+cleanup state. Account sets exist only in memory. Raw bodies, errors, page DOM,
+headers, credentials, cookies, and individual account logins are never written.
+Evidence-write failure stops the autonomous proof.
+
+A new native response can be cached or contain the same accounts. Explicit
+cache/service-worker flags, missing cache metadata, and an observed network
+response are distinct. `server_freshness` remains `unknown`, and
+`fresh_server_samples_proven` remains false: network receipt and changing sets
+cannot establish server freshness, independence, randomness, full coverage,
+viewing time, or calibrated absence. No samples become IRC NAMES/JOIN events.
+
+Live acceptance requires positive native samples from the actual popout route
+without a video element; multiple channel circuits and profile restart;
+correct channel isolation and useful repeated-sample evidence; and measurements
+of the whole browser/app process tree. Check minimized operation separately.
+Build success and fixtures do not establish these conditions. Cache-only or
+unknown evidence must not be reported as fresh sampling.
+
+## Documentation
+
+- [webview2-rs](https://github.com/wravery/webview2-rs), pinned `webview2-com`
+  0.39.1 and `windows` 0.62.2.
+- [WebView2 DevTools protocol](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/chromium-devtools-protocol).
+- [Network protocol events](https://chromedevtools.github.io/devtools-protocol/tot/Network/).
+- [WebView2 user data folders](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder).

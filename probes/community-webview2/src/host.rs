@@ -1,9 +1,11 @@
 //! Native Windows proof host. No private HTTP client, request replay, browser
-//! flags, cookie API, remote debugging port, or automatic collection scheduler.
+//! flags, cookie API, remote debugging port, or production collection.
 use community_webview2_proof::{
-    channel_login, is_channel_page, is_source_uri, parse_response, select_request, Evidence,
-    Failure, MAX_SAMPLES, REQUEST_CAP, RESPONSE_CAP,
+    channel_login, is_channel_page, is_popout_page, parse_response,
+    sampling::{self, BodyRequest, Config, RunEvidence, Schedule, Tracker},
+    Evidence, Failure, MAX_SAMPLES,
 };
+use serde::Deserialize;
 use std::{
     cell::RefCell,
     fs,
@@ -28,22 +30,32 @@ const RENDER_ID: usize = 104;
 const ARM_TIME: Duration = Duration::from_secs(25);
 const ROUND_GAP: Duration = Duration::from_secs(30);
 const FLUSH_TIME: Duration = Duration::from_secs(5);
-const MAX_GQL_EVENTS: usize = 64;
 const TOOLBAR_HEIGHT: i32 = 92;
 
-// Only executes after an explicit native Sample button click on the selected
-// channel page. Reads no inputs, login state, account names, or login DOM.
-// If selectors drift, the owner can click Twitch's Community tab manually.
-const OPEN_COMMUNITY: &str = r#"(() => {
-  const buttons = [...document.querySelectorAll('button,[role="tab"]')];
-  const target = buttons.find(e => e.getAttribute('data-a-target') === 'chat-viewers')
+// Reads only source-page structure; never executes on login. The browser clock
+// immediately before the ordinary click fences delayed pre-arm requests.
+const COMMUNITY_UI: &str = r#"(() => {
+  const expected = __POPOUT__ ? '/popout/__CHANNEL__/chat' : '/__CHANNEL__';
+  const video_present = !!document.querySelector('video');
+  const result = code => ({code, video_present, trigger_unix_ms:null});
+  if (location.origin !== 'https://www.twitch.tv' || location.pathname.toLowerCase() !== expected)
+    return result('wrong_page');
+  if (/access denied|verify you are human|unusual traffic/i.test(document.title)
+      || document.querySelector('iframe[src*="captcha" i],iframe[src*="challenge" i],form[action*="challenge" i]'))
+    return result('challenge_denied');
+  if (__POPOUT__ && video_present) return result('video_present');
+  const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
+  const buttons = [...document.querySelectorAll('button,[role="tab"]')].filter(visible);
+  const target = buttons.find(e => e.getAttribute('data-test-selector') === 'chat-viewer-list')
+    || buttons.find(e => e.getAttribute('data-a-target') === 'chat-viewers')
     || buttons.find(e => (e.getAttribute('aria-label') || '').trim() === 'Community')
     || buttons.find(e => (e.textContent || '').trim() === 'Community');
-  if (!target) return 'manual_community_required';
+  if (!target || target.disabled) return result('waiting_ui');
+  if (!__CLICK__) return result('ready');
+  const trigger_unix_ms = performance.timeOrigin + performance.now();
   target.click();
-  return 'native_community_clicked';
+  return {code:'native_community_clicked',video_present,trigger_unix_ms};
 })()"#;
-
 thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
 }
@@ -54,7 +66,7 @@ struct Engine {
     core2: ICoreWebView2_2,
     environment: ICoreWebView2Environment,
     environment5: ICoreWebView2Environment5,
-    response_token: i64,
+    protocol_receivers: Vec<(ICoreWebView2DevToolsProtocolEventReceiver, i64)>,
     exit_token: i64,
     new_window_token: i64,
     navigation_token: i64,
@@ -70,13 +82,34 @@ struct State {
     armed_until: Option<Instant>,
     last_round: Option<Instant>,
     generation: u64,
-    gql_events: usize,
     pending: bool,
     script_pending: bool,
     denied: bool,
     closing_at: Option<Instant>,
     browser_exited: bool,
     evidence_write_failed: bool,
+    tracker: Option<Tracker>,
+    network_enabled: bool,
+    network_pending: bool,
+    navigation_ready: bool,
+    navigation_id: Option<u64>,
+    frame_id: Option<String>,
+    schedule: Option<Schedule>,
+    auto_stage: Option<AutoStage>,
+}
+
+#[derive(Clone, Copy)]
+enum AutoStage {
+    Navigating(Instant),
+    Ready(Instant),
+    Sampling,
+}
+
+#[derive(Deserialize)]
+struct UiResult {
+    code: String,
+    video_present: bool,
+    trigger_unix_ms: Option<f64>,
 }
 
 struct App {
@@ -87,6 +120,7 @@ struct App {
     state: RefCell<State>,
     evidence: RefCell<Evidence>,
     evidence_path: PathBuf,
+    started: Instant,
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -126,10 +160,10 @@ impl App {
     }
 
     fn fail(&self, code: &'static str, message: &str) {
-        {
-            let mut state = self.state.borrow_mut();
-            state.generation += 1;
-            state.armed_until = None;
+        self.cancel_round();
+        self.disable_network();
+        if self.automatic() {
+            self.end_auto_attempt(code, true);
         }
         {
             let mut evidence = self.evidence.borrow_mut();
@@ -142,11 +176,11 @@ impl App {
     }
 
     fn sample_failure(&self, failure: Failure) {
-        {
-            let mut state = self.state.borrow_mut();
-            state.generation += 1;
-            state.armed_until = None;
-            state.denied |= failure.is_denial();
+        self.cancel_round();
+        self.disable_network();
+        self.state.borrow_mut().denied |= failure.is_denial();
+        if self.automatic() {
+            self.end_auto_attempt(failure.code(), failure.is_denial());
         }
         self.evidence.borrow_mut().failure(failure);
         if self.save() {
@@ -170,32 +204,24 @@ impl App {
         }
     }
 
-    fn open_login(&self) {
-        if self.state.borrow().closing_at.is_some() {
+    fn open_login(self: &Rc<Self>) {
+        if self.state.borrow().closing_at.is_some() || self.automatic() {
             return;
         }
         self.cancel_round();
         self.record_action("twitch_login");
-        let core = self
-            .engine
-            .borrow()
-            .as_ref()
-            .map(|engine| engine.core.clone());
-        if let Some(core) = core {
-            if unsafe { core.Navigate(w!("https://www.twitch.tv/login")) }.is_err() {
-                self.fail("navigation_failed", "Could not open normal Twitch login.");
-            } else {
-                self.status(
-                    "Sign in manually in this app. Then enter a channel and choose Open channel.",
-                );
-            }
-        }
+        self.navigate("https://www.twitch.tv/login".into());
+        self.status("Sign in manually in this app. Then enter a channel and choose Open channel.");
     }
 
     fn cancel_round(&self) {
         let mut state = self.state.borrow_mut();
         state.generation += 1;
         state.armed_until = None;
+        state.pending = false;
+        state.script_pending = false;
+        state.network_pending = false;
+        state.tracker = None;
     }
 
     fn record_action(&self, target: &'static str) {
@@ -208,10 +234,11 @@ impl App {
     }
 
     fn check_rendering(&self) {
-        if self.state.borrow().closing_at.is_some() {
+        if self.state.borrow().closing_at.is_some() || self.automatic() {
             return;
         }
         self.cancel_round();
+        self.disable_network();
         self.record_action("local_render_check");
         let core = self
             .engine
@@ -237,10 +264,15 @@ impl App {
             state.closing_at.is_none()
                 && (state.armed_until.is_some() || state.pending || state.script_pending)
         };
+        self.cancel_round();
+        self.disable_network();
+        self.state.borrow_mut().navigation_ready = false;
         if !active {
             return;
         }
-        self.cancel_round();
+        if self.automatic() {
+            self.end_auto_attempt("navigation_changed", true);
+        }
         {
             let mut evidence = self.evidence.borrow_mut();
             evidence.phase = "sample_cancelled";
@@ -251,8 +283,8 @@ impl App {
         }
     }
 
-    fn open_channel(&self) {
-        if self.state.borrow().closing_at.is_some() {
+    fn open_channel(self: &Rc<Self>) {
+        if self.state.borrow().closing_at.is_some() || self.automatic() {
             return;
         }
         let mut buffer = [0u16; 64];
@@ -274,112 +306,398 @@ impl App {
         self.record_action("twitch_channel");
         self.state.borrow_mut().selected_channel = Some(channel.clone());
         self.evidence.borrow_mut().channel = Some(channel.clone());
-        let core = self
-            .engine
-            .borrow()
-            .as_ref()
-            .map(|engine| engine.core.clone());
-        if let Some(core) = core {
-            let url = wide(&format!("https://www.twitch.tv/{channel}"));
-            if unsafe { core.Navigate(PCWSTR(url.as_ptr())) }.is_err() {
+        self.navigate(format!("https://www.twitch.tv/{channel}"));
+        if self.save() {
+            self.status("Wait for chat to load. Close Community if already open, then choose Sample Community.");
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn core(&self) -> Option<ICoreWebView2> {
+        self.engine.borrow().as_ref().map(|e| e.core.clone())
+    }
+
+    fn automatic(&self) -> bool {
+        self.state.borrow().schedule.is_some()
+    }
+
+    fn disable_network(&self) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.network_enabled = false;
+            state.network_pending = false;
+            state.tracker = None;
+        }
+        if let Some(core) = self.core() {
+            let done = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(())));
+            unsafe {
+                let _ = core.CallDevToolsProtocolMethod(w!("Network.disable"), w!("{}"), &done);
+            }
+        }
+    }
+
+    // Disable finishes before navigation; no protocol observation is active on
+    // login or another origin, including queued old callbacks.
+    fn navigate(self: &Rc<Self>, url: String) {
+        self.disable_network();
+        self.state.borrow_mut().navigation_ready = false;
+        let generation = self.state.borrow().generation;
+        let weak = Rc::downgrade(self);
+        let done =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, _| {
+                if let Some(app) = weak.upgrade() {
+                    if app.state.borrow().generation != generation
+                        || app.state.borrow().closing_at.is_some()
+                    {
+                        return Ok(());
+                    }
+                    if result.is_err() {
+                        app.fail(
+                            "network_disable_failed",
+                            "Native observation could not stop safely.",
+                        );
+                        return Ok(());
+                    }
+                    if let Some(core) = app.core() {
+                        let url = wide(&url);
+                        if unsafe { core.Navigate(PCWSTR(url.as_ptr())) }.is_err() {
+                            app.fail(
+                                "navigation_failed",
+                                "Could not open the requested native page.",
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        if let Some(core) = self.core() {
+            if unsafe { core.CallDevToolsProtocolMethod(w!("Network.disable"), w!("{}"), &done) }
+                .is_err()
+            {
                 self.fail(
-                    "navigation_failed",
-                    "Could not open the selected Twitch channel.",
+                    "network_disable_failed",
+                    "Native observation could not stop safely.",
                 );
-            } else if self.save() {
-                self.status("Wait for chat to load. Close Community if already open, then choose Sample Community.");
+            }
+        }
+    }
+
+    fn enable_network(self: &Rc<Self>, manual_arm: bool) {
+        if self.state.borrow().network_pending {
+            return;
+        }
+        let channel = self
+            .state
+            .borrow()
+            .selected_channel
+            .clone()
+            .unwrap_or_default();
+        if !self
+            .current_uri()
+            .is_ok_and(|uri| is_channel_page(&uri, &channel))
+        {
+            self.sample_failure(Failure::AuthenticationDenied);
+            return;
+        }
+        self.state.borrow_mut().network_pending = true;
+        let generation = self.state.borrow().generation;
+        let weak = Rc::downgrade(self);
+        let done =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, _| {
+                if let Some(app) = weak.upgrade() {
+                    if app.state.borrow().generation != generation
+                        || app.state.borrow().closing_at.is_some()
+                    {
+                        return Ok(());
+                    }
+                    if result.is_err() {
+                        app.fail(
+                            "network_observer_enable_failed",
+                            "Native source observation could not start.",
+                        );
+                        return Ok(());
+                    }
+                    if !app
+                        .current_uri()
+                        .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                    {
+                        app.sample_failure(Failure::AuthenticationDenied);
+                        return Ok(());
+                    }
+                    app.verify_frame(generation, manual_arm);
+                }
+                Ok(())
+            }));
+        if let Some(core) = self.core() {
+            if unsafe { core.CallDevToolsProtocolMethod(w!("Network.enable"), w!("{\"maxTotalBufferSize\":4194304,\"maxResourceBufferSize\":1048577,\"maxPostDataSize\":65537}"), &done) }.is_err() {
+                self.state.borrow_mut().network_pending = false;
+                self.fail("network_observer_enable_failed", "Native source observation could not start.");
+            }
+        }
+    }
+
+    fn verify_frame(self: &Rc<Self>, generation: u64, manual_arm: bool) {
+        let channel = self
+            .state
+            .borrow()
+            .selected_channel
+            .clone()
+            .unwrap_or_default();
+        let weak = Rc::downgrade(self);
+        let done =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, json| {
+                let Some(app) = weak.upgrade() else {
+                    return Ok(());
+                };
+                if app.state.borrow().generation != generation
+                    || app.state.borrow().closing_at.is_some()
+                {
+                    return Ok(());
+                }
+                app.state.borrow_mut().network_pending = false;
+                if result.is_err() {
+                    app.fail(
+                        "native_frame_unavailable",
+                        "Cannot identify the current source frame.",
+                    );
+                    return Ok(());
+                }
+                let frame = match sampling::root_frame(&json, &channel) {
+                    Ok(frame) => frame,
+                    Err(code) => {
+                        app.fail(code, "Cannot identify the current source frame.");
+                        return Ok(());
+                    }
+                };
+                if !app
+                    .current_uri()
+                    .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                {
+                    app.sample_failure(Failure::AuthenticationDenied);
+                    return Ok(());
+                }
+                {
+                    let mut state = app.state.borrow_mut();
+                    state.frame_id = Some(frame);
+                    state.network_enabled = true;
+                }
+                if manual_arm {
+                    app.begin_sample();
+                } else {
+                    let stage = app.state.borrow().auto_stage;
+                    if let Some(AutoStage::Navigating(deadline)) = stage {
+                        app.state.borrow_mut().auto_stage = Some(AutoStage::Ready(deadline));
+                    }
+                }
+                Ok(())
+            }));
+        if let Some(core) = self.core() {
+            if unsafe { core.CallDevToolsProtocolMethod(w!("Page.getFrameTree"), w!("{}"), &done) }
+                .is_err()
+            {
+                self.fail(
+                    "native_frame_unavailable",
+                    "Cannot identify the current source frame.",
+                );
             }
         }
     }
 
     fn arm(self: &Rc<Self>) {
-        let channel;
-        {
+        if self.automatic() {
+            self.status("The finite autonomous run owns the browser. Close the window to stop.");
+            return;
+        }
+        let channel = {
             let state = self.state.borrow();
             if state.closing_at.is_some() || state.denied || state.evidence_write_failed {
                 return;
             }
-            if state.pending || state.script_pending || state.armed_until.is_some() {
-                self.status("A sample or native response callback is already pending.");
+            if state.pending
+                || state.script_pending
+                || state.network_pending
+                || state.armed_until.is_some()
+            {
                 return;
             }
             if state
                 .last_round
                 .is_some_and(|time| time.elapsed() < ROUND_GAP)
             {
-                self.status("Wait at least 30 seconds between manual sample attempts.");
+                self.status("Wait at least 30 seconds between attempts.");
                 return;
             }
-            let Some(selected) = state.selected_channel.clone() else {
-                self.status("Open a channel first.");
-                return;
-            };
-            channel = selected;
+            state.selected_channel.clone().unwrap_or_default()
+        };
+        if channel.is_empty()
+            || !self
+                .current_uri()
+                .is_ok_and(|uri| is_channel_page(&uri, &channel))
+        {
+            self.status("Open the selected Twitch channel before sampling.");
+            return;
         }
         if self.evidence.borrow().manual_attempt_count >= MAX_SAMPLES {
-            self.status("Three manual sample attempts are complete. Close this bounded proof.");
+            self.status("Three manual attempts are complete. Close this bounded proof.");
             return;
         }
-        let Ok(uri) = self.current_uri() else {
-            self.fail(
-                "source_uri_unavailable",
-                "Cannot verify the current channel page.",
-            );
-            return;
-        };
-        if !is_channel_page(&uri, &channel) {
-            self.status(
-                "Sampling requires the selected Twitch channel page. Open the channel again.",
-            );
-            return;
-        }
+        self.state.borrow_mut().last_round = Some(Instant::now());
+        self.evidence.borrow_mut().manual_attempt_count += 1;
+        // Include observer setup in a bounded manual attempt.
+        self.state.borrow_mut().armed_until = Some(Instant::now() + ARM_TIME);
+        self.enable_network(true);
+    }
+
+    fn begin_sample(self: &Rc<Self>) {
         let generation;
+        let now = self.elapsed_ms();
         {
             let mut state = self.state.borrow_mut();
             state.generation += 1;
             generation = state.generation;
             state.armed_until = Some(Instant::now() + ARM_TIME);
             state.last_round = Some(Instant::now());
-            state.gql_events = 0;
-            state.script_pending = true;
+            if let Some(schedule) = state.schedule.as_mut() {
+                schedule.note_trigger_started(now);
+            }
+            state.tracker = Some(Tracker::new(
+                generation,
+                state.selected_channel.clone().unwrap_or_default(),
+                state.frame_id.clone().unwrap_or_default(),
+            ));
+            if state.schedule.is_some() {
+                state.auto_stage = Some(AutoStage::Sampling);
+            }
         }
         {
             let mut evidence = self.evidence.borrow_mut();
             evidence.phase = "armed";
             evidence.status = "awaiting_native_community";
-            evidence.manual_attempt_count += 1;
         }
         if !self.save() {
             self.cancel_round();
             return;
         }
-        self.status("Sample armed for 25 seconds. Click Twitch's Community tab if it does not open automatically.");
+        self.status("Observing one ordinary Community click; waiting up to 25 seconds for its native response.");
+        self.ui_step(true);
+    }
+
+    fn ui_step(self: &Rc<Self>, click: bool) {
+        let (channel, generation, automatic) = {
+            let state = self.state.borrow();
+            if state.script_pending || state.closing_at.is_some() {
+                return;
+            }
+            (
+                state.selected_channel.clone().unwrap_or_default(),
+                state.generation,
+                state.schedule.is_some(),
+            )
+        };
+        let Ok(uri) = self.current_uri() else {
+            self.fail(
+                "source_uri_unavailable",
+                "Cannot verify the current source page.",
+            );
+            return;
+        };
+        if !is_channel_page(&uri, &channel) || automatic && !is_popout_page(&uri, &channel) {
+            self.sample_failure(Failure::AuthenticationDenied);
+            return;
+        }
+        let popout = is_popout_page(&uri, &channel);
+        let script = COMMUNITY_UI
+            .replace("__CHANNEL__", &channel)
+            .replace("__POPOUT__", if popout { "true" } else { "false" })
+            .replace("__CLICK__", if click { "true" } else { "false" });
+        self.state.borrow_mut().script_pending = true;
         let weak = Rc::downgrade(self);
-        let handler =
-            ExecuteScriptCompletedHandler::create(Box::new(move |result, _safe_result| {
-                if let Some(app) = weak.upgrade() {
-                    app.state.borrow_mut().script_pending = false;
-                    if app.is_active(generation) && result.is_err() {
-                        app.fail(
-                            "community_ui_action_failed",
-                            "Community UI action failed. No automatic retry.",
-                        );
+        let done = ExecuteScriptCompletedHandler::create(Box::new(move |result, json| {
+            let Some(app) = weak.upgrade() else {
+                return Ok(());
+            };
+            if app.state.borrow().generation != generation
+                || app.state.borrow().closing_at.is_some()
+            {
+                return Ok(());
+            }
+            app.state.borrow_mut().script_pending = false;
+            if result.is_err() || json.len() > 1024 {
+                app.fail(
+                    "community_ui_action_failed",
+                    "Community UI observation failed.",
+                );
+                return Ok(());
+            }
+            let Ok(ui) = serde_json::from_str::<UiResult>(&json) else {
+                app.fail(
+                    "community_ui_result_invalid",
+                    "Community UI returned no valid structural result.",
+                );
+                return Ok(());
+            };
+            if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
+                if let Some(attempt) = run.attempts.last_mut() {
+                    attempt.video_element_present = Some(ui.video_present);
+                }
+            }
+            match ui.code.as_str() {
+                "challenge_denied" => app.sample_failure(Failure::ChallengeDenied),
+                "wrong_page" => app.sample_failure(Failure::AuthenticationDenied),
+                "video_present" => app.fail(
+                    "popout_contains_video",
+                    "The chat-only prerequisite failed; no source sample is accepted.",
+                ),
+                "waiting_ui" if !click => (),
+                "waiting_ui" => app.fail(
+                    "community_control_unavailable",
+                    "The ordinary Community control is unavailable. No repeated click.",
+                ),
+                "ready" if !click => {
+                    let stage = app.state.borrow().auto_stage;
+                    if let Some(AutoStage::Ready(deadline)) = stage {
+                        if Instant::now() >= deadline {
+                            app.end_auto_attempt("navigation_ui_deadline", false);
+                        } else {
+                            app.begin_sample();
+                        }
                     }
                 }
-                Ok(())
-            }));
-        let core = self
-            .engine
-            .borrow()
-            .as_ref()
-            .map(|engine| engine.core.clone());
-        if let Some(core) = core {
-            let script = wide(OPEN_COMMUNITY);
-            if unsafe { core.ExecuteScript(PCWSTR(script.as_ptr()), &handler) }.is_err() {
+                "native_community_clicked" if click => {
+                    let outcome = app
+                        .state
+                        .borrow_mut()
+                        .tracker
+                        .as_mut()
+                        .ok_or("missing_request_tracker")
+                        .and_then(|tracker| {
+                            tracker.set_trigger(ui.trigger_unix_ms.ok_or("missing_trigger_time")?)
+                        });
+                    match outcome {
+                        Ok(()) => app.try_body(),
+                        Err(code) => {
+                            app.fail(code, "Native trigger identity could not be verified.")
+                        }
+                    }
+                }
+                _ => app.fail(
+                    "community_ui_result_invalid",
+                    "Community UI returned an unexpected structural result.",
+                ),
+            }
+            app.save();
+            Ok(())
+        }));
+        if let Some(core) = self.core() {
+            let script = wide(&script);
+            if unsafe { core.ExecuteScript(PCWSTR(script.as_ptr()), &done) }.is_err() {
                 self.state.borrow_mut().script_pending = false;
                 self.fail(
                     "community_ui_action_failed",
-                    "Community UI action failed. No automatic retry.",
+                    "Community UI observation failed.",
                 );
             }
         }
@@ -390,18 +708,25 @@ impl App {
         state.generation == generation
             && state.closing_at.is_none()
             && !state.denied
+            && !state.evidence_write_failed
+            && !state
+                .schedule
+                .as_ref()
+                .is_some_and(|s| s.expired(self.elapsed_ms()))
             && state.armed_until.is_some_and(|time| Instant::now() < time)
     }
 
-    fn observe(
+    fn protocol_event(
         self: &Rc<Self>,
-        args: ICoreWebView2WebResourceResponseReceivedEventArgs,
+        kind: &'static str,
+        args: ICoreWebView2DevToolsProtocolEventReceivedEventArgs,
     ) -> windows::core::Result<()> {
         let (generation, channel) = {
             let state = self.state.borrow();
-            if state.closing_at.is_some()
+            if !state.network_enabled
+                || state.tracker.is_none()
+                || state.closing_at.is_some()
                 || state.denied
-                || state.pending
                 || state.evidence_write_failed
                 || !state.armed_until.is_some_and(|time| Instant::now() < time)
             {
@@ -412,147 +737,289 @@ impl App {
                 state.selected_channel.clone().unwrap_or_default(),
             )
         };
+        if !self
+            .current_uri()
+            .is_ok_and(|uri| is_channel_page(&uri, &channel))
+        {
+            self.sample_failure(Failure::AuthenticationDenied);
+            return Ok(());
+        }
+        let mut value = PWSTR::null();
         unsafe {
-            let request = args.Request()?;
-            let mut uri = PWSTR::null();
-            request.Uri(&mut uri)?;
-            let uri = take_pwstr(uri);
-            if !is_source_uri(&uri) {
+            args.ParameterObjectAsJson(&mut value)?;
+        }
+        let json = match unsafe { bounded_pwstr(value, sampling::EVENT_CAP) } {
+            Ok(v) => v,
+            Err(code) => {
+                self.fail(code, "Native event exceeded its finite input bound.");
                 return Ok(());
             }
-            {
-                let mut state = self.state.borrow_mut();
-                state.gql_events += 1;
-                if state.gql_events > MAX_GQL_EVENTS {
-                    drop(state);
-                    self.fail(
-                        "gql_event_limit",
-                        "Sample stopped at its native event budget.",
-                    );
-                    return Ok(());
-                }
-            }
-            let mut method = PWSTR::null();
-            request.Method(&mut method)?;
-            if take_pwstr(method) != "POST" {
-                return Ok(());
-            }
-            // Only gql POST bodies are read. Login/password requests and all
-            // request/response headers are never inspected.
-            let Ok(content) = request.Content() else {
-                return Ok(());
-            };
-            let bytes = match read_stream(&content, REQUEST_CAP, true) {
-                Ok(bytes) => bytes,
-                Err(StreamFailure::Limit) => {
-                    self.sample_failure(Failure::RequestTooLarge);
-                    return Ok(());
-                }
-                Err(StreamFailure::Unavailable) => {
-                    self.sample_failure(Failure::RequestReadFailed);
-                    return Ok(());
-                }
-            };
-            let selection = match select_request(&bytes, &channel) {
-                Ok(Some(selected)) => selected,
-                Ok(None) => return Ok(()),
-                Err(failure) => {
-                    self.sample_failure(failure);
-                    return Ok(());
-                }
-            };
-            // Drop the raw request body before requesting any response body.
-            drop(bytes);
-            if !self
-                .current_uri()
-                .is_ok_and(|uri| is_channel_page(&uri, &channel))
-            {
-                self.fail(
-                    "channel_navigation_changed",
-                    "The page changed while sampling. No source sample was accepted.",
-                );
-                return Ok(());
-            }
-            let response = args.Response()?;
-            let mut status = 0;
-            response.StatusCode(&mut status)?;
-            let status = u16::try_from(status).unwrap_or(0);
-            if matches!(status, 401 | 403 | 429) {
-                self.sample_failure(Failure::HttpDenied);
-                return Ok(());
-            }
-            if status != 200 {
-                self.sample_failure(Failure::HttpError);
-                return Ok(());
-            }
-            self.state.borrow_mut().pending = true;
-            let weak = Rc::downgrade(self);
-            let handler = WebResourceResponseViewGetContentCompletedHandler::create(Box::new(
-                move |result, stream| {
-                    let Some(app) = weak.upgrade() else {
-                        return Ok(());
-                    };
-                    app.state.borrow_mut().pending = false;
-                    if !app.is_active(generation) {
-                        return Ok(());
-                    }
-                    if !app
-                        .current_uri()
-                        .is_ok_and(|uri| is_channel_page(&uri, &channel))
-                    {
-                        app.fail("channel_navigation_changed", "The page changed while the native response was pending. No source sample was accepted.");
-                        return Ok(());
-                    }
-                    if result.is_err() || stream.is_none() {
-                        app.fail(
-                            "response_content_unavailable",
-                            "Native response content was unavailable. No automatic retry.",
-                        );
-                        return Ok(());
-                    }
-                    let stream = stream.unwrap();
-                    let bytes = match read_stream(&stream, RESPONSE_CAP, false) {
-                        Ok(bytes) => bytes,
-                        Err(StreamFailure::Limit) => {
-                            app.sample_failure(Failure::ResponseTooLarge);
-                            return Ok(());
-                        }
-                        Err(StreamFailure::Unavailable) => {
-                            app.sample_failure(Failure::ResponseReadFailed);
-                            return Ok(());
-                        }
-                    };
-                    let parsed = parse_response(&bytes, &selection, status);
-                    drop(bytes);
-                    match parsed {
-                        Ok(parsed) => {
-                            app.cancel_round();
-                            app.evidence
-                                .borrow_mut()
-                                .add(parsed, &selection, unix_seconds());
-                            if app.save() {
-                                let evidence = app.evidence.borrow();
-                                let sample = evidence.samples.last().unwrap();
-                                app.status(&format!("Sample {}/3 saved: reported count {}, {} unique accounts. Wait 30 seconds before another manual sample.",
-                                evidence.sample_count, sample.count, sample.unique_accounts));
-                            }
-                        }
-                        Err(failure) => app.sample_failure(failure),
-                    }
+        };
+        let result = (|| {
+            let mut state = self.state.borrow_mut();
+            let tracker = state.tracker.as_mut().ok_or("missing_request_tracker")?;
+            tracker.count_event()?;
+            match kind {
+                "Network.requestWillBeSent" => tracker.request(generation, sampling::event(&json)?),
+                "Network.responseReceived" => tracker.response(generation, sampling::event(&json)?),
+                "Network.loadingFinished" => tracker.finished(generation, sampling::event(&json)?),
+                "Network.requestServedFromCache" => {
+                    let e: sampling::IdEvent = sampling::event(&json)?;
+                    tracker.cached(&e.request_id);
                     Ok(())
-                },
-            ));
-            if response.GetContent(&handler).is_err() {
-                self.state.borrow_mut().pending = false;
-                self.fail(
-                    "response_content_unavailable",
-                    "Native response content was unavailable. No automatic retry.",
-                );
+                }
+                "Network.loadingFailed" => {
+                    let e: sampling::IdEvent = sampling::event(&json)?;
+                    tracker.failed(&e.request_id);
+                    Ok(())
+                }
+                _ => Err("unsupported_native_event"),
             }
+        })();
+        drop(json);
+        if let Err(code) = result {
+            self.fail(
+                code,
+                "Native request correlation failed. No automatic retry.",
+            );
+        } else {
+            self.try_body();
         }
         Ok(())
     }
 
+    fn try_body(self: &Rc<Self>) {
+        let ready = {
+            let mut state = self.state.borrow_mut();
+            if state.pending {
+                return;
+            }
+            state.tracker.as_mut().map(Tracker::take_ready)
+        };
+        let body = match ready {
+            Some(Ok(Some(body))) => body,
+            Some(Err("http_denied")) => {
+                self.sample_failure(Failure::HttpDenied);
+                return;
+            }
+            Some(Err(code)) => {
+                self.fail(code, "Native source response could not be accepted.");
+                return;
+            }
+            _ => return,
+        };
+        let generation = self.state.borrow().generation;
+        if !self.is_active(generation) {
+            return;
+        }
+        self.state.borrow_mut().pending = true;
+        let channel = self
+            .state
+            .borrow()
+            .selected_channel
+            .clone()
+            .unwrap_or_default();
+        let parameters = wide(&serde_json::json!({"requestId":body.id}).to_string());
+        let weak = Rc::downgrade(self);
+        let done =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, json| {
+                let Some(app) = weak.upgrade() else {
+                    return Ok(());
+                };
+                if !app.is_active(generation) {
+                    return Ok(());
+                }
+                app.state.borrow_mut().pending = false;
+                if !app
+                    .current_uri()
+                    .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                {
+                    app.sample_failure(Failure::AuthenticationDenied);
+                    return Ok(());
+                }
+                if result.is_err() {
+                    app.fail(
+                        "native_body_unavailable",
+                        "The matching native response body is unavailable.",
+                    );
+                    return Ok(());
+                }
+                let bytes = match sampling::response_body(&json) {
+                    Ok(bytes) => bytes,
+                    Err(code) => {
+                        app.fail(
+                            code,
+                            "Native response exceeded its bound or used unsupported encoding.",
+                        );
+                        return Ok(());
+                    }
+                };
+                let parsed = parse_response(&bytes, &body.selection, body.status);
+                drop(bytes);
+                match parsed {
+                    Ok(parsed) => app.accept_sample(parsed, &body),
+                    Err(failure) => app.sample_failure(failure),
+                }
+                Ok(())
+            }));
+        if let Some(core) = self.core() {
+            if unsafe {
+                core.CallDevToolsProtocolMethod(
+                    w!("Network.getResponseBody"),
+                    PCWSTR(parameters.as_ptr()),
+                    &done,
+                )
+            }
+            .is_err()
+            {
+                self.state.borrow_mut().pending = false;
+                self.fail(
+                    "native_body_unavailable",
+                    "The matching native response body is unavailable.",
+                );
+            }
+        }
+    }
+
+    fn accept_sample(&self, parsed: community_webview2_proof::ParsedSample, body: &BodyRequest) {
+        if self.automatic() {
+            if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
+                run.sample(parsed, body);
+            }
+            self.evidence.borrow_mut().source_proven_in_this_run = true;
+            self.end_auto_attempt("sample_received", false);
+        } else {
+            self.cancel_round();
+            self.disable_network();
+            let mut evidence = self.evidence.borrow_mut();
+            evidence.add(parsed, &body.selection, unix_seconds());
+            if let Some(sample) = evidence.samples.last_mut() {
+                sample.provenance = Some(body.provenance.clone());
+            }
+            drop(evidence);
+            self.save();
+            self.status("Native sample saved. Fresh server state remains unproved; wait 30 seconds for another manual attempt.");
+        }
+    }
+
+    fn end_auto_attempt(&self, code: &'static str, stop: bool) {
+        let now = self.elapsed_ms();
+        self.cancel_round();
+        self.disable_network();
+        {
+            let mut state = self.state.borrow_mut();
+            state.auto_stage = None;
+            if let Some(schedule) = state.schedule.as_mut() {
+                if code == "sample_received" {
+                    schedule.finish();
+                } else {
+                    schedule.finish_failed();
+                }
+                schedule.stopped |= stop;
+            }
+        }
+        if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
+            run.finish(now, code);
+            if stop {
+                run.status = code;
+            }
+        }
+        self.save();
+        self.status(if stop {
+            "Autonomous proof stopped; no retry after denial."
+        } else {
+            "Attempt recorded. Waiting for the next channel's scheduled start."
+        });
+    }
+
+    fn auto_tick(self: &Rc<Self>) {
+        let now = self.elapsed_ms();
+        let (stop, expired, complete) = {
+            let state = self.state.borrow();
+            let Some(s) = state.schedule.as_ref() else {
+                return;
+            };
+            (s.stopped, s.expired(now), s.complete())
+        };
+        if self.state.borrow().evidence_write_failed {
+            self.end_auto_attempt("aggregate_write_failed", true);
+            self.close();
+            return;
+        }
+        if stop || expired || complete {
+            if expired
+                && self
+                    .state
+                    .borrow()
+                    .schedule
+                    .as_ref()
+                    .is_some_and(|s| s.active.is_some())
+            {
+                self.end_auto_attempt("run_deadline", true);
+            }
+            if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
+                if expired {
+                    run.status = "run_deadline";
+                } else if complete {
+                    run.status = if run.source_samples_received == run.attempts.len() {
+                        "circuits_completed_with_samples"
+                    } else {
+                        "circuits_completed_with_gaps"
+                    };
+                }
+            }
+            self.close();
+            return;
+        }
+        if self.engine.borrow().is_none() {
+            return;
+        }
+        let attempt = self
+            .state
+            .borrow_mut()
+            .schedule
+            .as_mut()
+            .and_then(|s| s.start_due(now));
+        if let Some(attempt) = attempt {
+            self.cancel_round();
+            {
+                let mut state = self.state.borrow_mut();
+                state.selected_channel = Some(attempt.channel.clone());
+                state.auto_stage = Some(AutoStage::Navigating(
+                    Instant::now() + Duration::from_millis(sampling::NAVIGATION_UI_MS),
+                ));
+            }
+            if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
+                run.start(attempt.clone());
+                run.status = "running";
+            }
+            self.record_action("twitch_chat_popout");
+            self.navigate(format!(
+                "https://www.twitch.tv/popout/{}/chat",
+                attempt.channel
+            ));
+            return;
+        }
+        let stage = self.state.borrow().auto_stage;
+        match stage {
+            Some(AutoStage::Navigating(deadline) | AutoStage::Ready(deadline))
+                if Instant::now() >= deadline =>
+            {
+                self.end_auto_attempt("navigation_ui_deadline", false)
+            }
+            Some(AutoStage::Navigating(_)) => {
+                let (ready, pending) = {
+                    let s = self.state.borrow();
+                    (s.navigation_ready, s.network_pending)
+                };
+                if ready && !pending {
+                    self.enable_network(false);
+                }
+            }
+            Some(AutoStage::Ready(_)) => self.ui_step(false),
+            _ => (),
+        }
+    }
     fn resize(&self) {
         let engine = self.engine.borrow();
         if let Some(engine) = engine.as_ref() {
@@ -582,9 +1049,9 @@ impl App {
         );
         if let Some(engine) = self.engine.borrow().as_ref() {
             unsafe {
-                let _ = engine
-                    .core2
-                    .remove_WebResourceResponseReceived(engine.response_token);
+                for (receiver, token) in &engine.protocol_receivers {
+                    let _ = receiver.remove_DevToolsProtocolEventReceived(*token);
+                }
                 let _ = engine
                     .core
                     .remove_NewWindowRequested(engine.new_window_token);
@@ -614,7 +1081,7 @@ impl App {
         }
     }
 
-    fn tick(&self) {
+    fn tick(self: &Rc<Self>) {
         let closing = self.state.borrow().closing_at;
         if let Some(started) = closing {
             let exited = self.state.borrow().browser_exited;
@@ -648,10 +1115,20 @@ impl App {
             .armed_until
             .is_some_and(|time| Instant::now() >= time)
         {
-            self.fail(
-                "native_sample_timeout",
-                "No matching native Community response within 25 seconds. No automatic retry.",
-            );
+            if self.automatic() {
+                self.end_auto_attempt("native_sample_timeout", false);
+            } else {
+                self.fail(
+                    "native_sample_timeout",
+                    "No matching native Community response within 25 seconds. No automatic retry.",
+                );
+            }
+        }
+        if self.automatic() {
+            self.auto_tick();
+        }
+        if self.state.borrow().tracker.is_some() && self.is_active(self.state.borrow().generation) {
+            self.ui_step(false);
         }
     }
 }
@@ -660,60 +1137,29 @@ thread_local! {
     static EXIT_ENV: RefCell<Option<(ICoreWebView2Environment, ICoreWebView2Environment5, i64)>> = const { RefCell::new(None) };
 }
 
-/// Read at most cap+1 bytes, restore the request stream's exact prior position,
-/// and reject streams that cannot be positioned safely. Never changes content.
-enum StreamFailure {
-    Limit,
-    Unavailable,
-}
-
-impl From<windows::core::Error> for StreamFailure {
-    fn from(_: windows::core::Error) -> Self {
-        Self::Unavailable
+/// Inspect at most the configured UTF-16 length before making an owned copy.
+/// Free the COM allocation on every path; do not retain raw event JSON.
+unsafe fn bounded_pwstr(value: PWSTR, cap: usize) -> Result<String, &'static str> {
+    if value.is_null() {
+        return Err("native_event_unavailable");
     }
-}
-
-unsafe fn read_stream(
-    stream: &IStream,
-    cap: usize,
-    preserve: bool,
-) -> std::result::Result<Vec<u8>, StreamFailure> {
-    let mut position = 0;
-    if preserve {
-        stream.Seek(0, STREAM_SEEK_CUR, Some(&mut position))?;
+    let mut length = 0;
+    while length <= cap && *value.0.add(length) != 0 {
+        length += 1;
     }
-    stream.Seek(0, STREAM_SEEK_SET, None)?;
-    let result = (|| {
-        let mut output = Vec::with_capacity((cap + 1).min(8192));
-        loop {
-            let mut chunk = [0u8; 8192];
-            let wanted = chunk.len().min(cap + 1 - output.len());
-            let mut read = 0;
-            stream
-                .Read(chunk.as_mut_ptr().cast(), wanted as u32, Some(&mut read))
-                .ok()?;
-            if read == 0 {
-                return Ok(output);
-            }
-            if read as usize > wanted {
-                return Err(StreamFailure::Unavailable);
-            }
-            output.extend_from_slice(&chunk[..read as usize]);
-            if output.len() > cap {
-                return Err(StreamFailure::Limit);
-            }
+    let result = if length > cap {
+        Err("native_event_size_limit")
+    } else {
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(value.0, length));
+        if result.len() > cap {
+            Err("native_event_size_limit")
+        } else {
+            Ok(result)
         }
-    })();
-    if preserve {
-        stream.Seek(
-            i64::try_from(position).map_err(|_| StreamFailure::Unavailable)?,
-            STREAM_SEEK_SET,
-            None,
-        )?;
-    }
+    };
+    CoTaskMemFree(Some(value.0.cast()));
     result
 }
-
 unsafe fn initialize(app: &Rc<App>, profile: PathBuf) -> windows::core::Result<()> {
     let weak = Rc::downgrade(app);
     let environment_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
@@ -788,21 +1234,33 @@ unsafe fn attach(
     let core = controller.CoreWebView2()?;
     let core2: ICoreWebView2_2 = core.cast()?;
     let environment5: ICoreWebView2Environment5 = environment.cast()?;
-    let weak = Rc::downgrade(app);
-    let response_handler =
-        WebResourceResponseReceivedEventHandler::create(Box::new(move |_, args| {
-            if let (Some(app), Some(args)) = (weak.upgrade(), args) {
-                if app.observe(args).is_err() {
-                    app.fail(
-                        "native_observer_failed",
-                        "Native response observation failed. No automatic retry.",
-                    );
+    let mut protocol_receivers = Vec::new();
+    for kind in [
+        "Network.requestWillBeSent",
+        "Network.responseReceived",
+        "Network.loadingFinished",
+        "Network.requestServedFromCache",
+        "Network.loadingFailed",
+    ] {
+        let name = wide(kind);
+        let receiver = core.GetDevToolsProtocolEventReceiver(PCWSTR(name.as_ptr()))?;
+        let weak = Rc::downgrade(app);
+        let handler =
+            DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+                if let (Some(app), Some(args)) = (weak.upgrade(), args) {
+                    if app.protocol_event(kind, args).is_err() {
+                        app.fail(
+                            "native_observer_failed",
+                            "Native source observation failed. No retry.",
+                        );
+                    }
                 }
-            }
-            Ok(())
-        }));
-    let mut response_token = 0;
-    core2.add_WebResourceResponseReceived(&response_handler, &mut response_token)?;
+                Ok(())
+            }));
+        let mut token = 0;
+        receiver.add_DevToolsProtocolEventReceived(&handler, &mut token)?;
+        protocol_receivers.push((receiver, token));
+    }
     let weak = Rc::downgrade(app);
     let exit_handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, _| {
         if let Some(app) = weak.upgrade() {
@@ -829,6 +1287,7 @@ unsafe fn attach(
             if let Some(args) = args {
                 args.NavigationId(&mut id)?;
             }
+            app.state.borrow_mut().navigation_id = Some(id);
             {
                 let mut evidence = app.evidence.borrow_mut();
                 evidence.browser_diagnostics.navigation_started_count += 1;
@@ -862,15 +1321,32 @@ unsafe fn attach(
                 args.IsSuccess(&mut success)?;
                 args.WebErrorStatus(&mut error)?;
                 args.NavigationId(&mut id)?;
+                let current = app.state.borrow().navigation_id == Some(id);
+                if current {
+                    app.state.borrow_mut().navigation_ready = success.as_bool();
+                }
                 {
                     let mut evidence = app.evidence.borrow_mut();
                     evidence.browser_diagnostics.navigation_completed_count += 1;
-                    evidence.browser_diagnostics.last_navigation_id = Some(id);
-                    evidence.browser_diagnostics.last_navigation_success = Some(success.as_bool());
-                    evidence.browser_diagnostics.last_web_error_status = Some(error.0);
+                    if current {
+                        evidence.browser_diagnostics.last_navigation_id = Some(id);
+                        evidence.browser_diagnostics.last_navigation_success =
+                            Some(success.as_bool());
+                        evidence.browser_diagnostics.last_web_error_status = if success.as_bool() {
+                            None
+                        } else {
+                            Some(error.0)
+                        };
+                    }
                 }
-                if app.save() && !success.as_bool() {
-                    app.status(&format!("Browser navigation failed (WebView2 error {}). No login or Community sample is verified.", error.0));
+                if current && app.save() {
+                    if success.as_bool() {
+                        app.status("Native page loaded. Login and Community access still require their own evidence.");
+                    } else if app.automatic() {
+                        app.end_auto_attempt("navigation_failed", false);
+                    } else {
+                        app.status(&format!("Browser navigation failed (WebView2 error {}). No login or Community sample is verified.", error.0));
+                    }
                 }
             }
             Ok(())
@@ -924,7 +1400,7 @@ unsafe fn attach(
         core2,
         environment,
         environment5,
-        response_token,
+        protocol_receivers,
         exit_token,
         new_window_token,
         navigation_token,
@@ -936,10 +1412,16 @@ unsafe fn attach(
     close_on_failure.0 = None;
     app.resize();
     app.evidence.borrow_mut().phase = "ready";
-    app.evidence.borrow_mut().status = "manual_login_required";
+    app.evidence.borrow_mut().status = if app.automatic() {
+        "autonomous_ready"
+    } else {
+        "manual_login_required"
+    };
     app.evidence.borrow_mut().browser_cleanup = "browser_running";
     app.save();
-    app.open_login();
+    if !app.automatic() {
+        app.open_login();
+    }
     Ok(())
 }
 
@@ -1003,7 +1485,10 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-unsafe fn make_window(directory: PathBuf) -> windows::core::Result<Rc<App>> {
+unsafe fn make_window(
+    directory: PathBuf,
+    config: Option<Config>,
+) -> windows::core::Result<Rc<App>> {
     let instance = HINSTANCE(GetModuleHandleW(None)?.0);
     let class = w!("VeylurkCommunityWebView2Proof");
     let wc = WNDCLASSW {
@@ -1078,14 +1563,21 @@ unsafe fn make_window(directory: PathBuf) -> windows::core::Result<Rc<App>> {
         Some(instance),
         None,
     )?;
+    let mut evidence = Evidence::default();
+    evidence.schema_version = 2;
+    evidence.autonomous = config.as_ref().map(RunEvidence::new);
     let app = Rc::new(App {
         hwnd,
         input,
         status,
         engine: RefCell::new(None),
-        state: RefCell::new(State::default()),
-        evidence: RefCell::new(Evidence::default()),
+        state: RefCell::new(State {
+            schedule: config.map(Schedule::new),
+            ..State::default()
+        }),
+        evidence: RefCell::new(evidence),
         evidence_path: directory.join("aggregate-evidence.json"),
+        started: Instant::now(),
     });
     APP.with(|slot| *slot.borrow_mut() = Some(app.clone()));
     if SetTimer(Some(hwnd), 1, 250, None) == 0 {
@@ -1098,14 +1590,14 @@ unsafe fn make_window(directory: PathBuf) -> windows::core::Result<Rc<App>> {
     Ok(app)
 }
 
-fn startup() -> windows::core::Result<()> {
+fn startup(config: Option<Config>) -> windows::core::Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let directory = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(PathBuf::from))
             .ok_or_else(|| windows::core::Error::from_hresult(E_UNEXPECTED))?;
-        let app = make_window(directory.clone())?;
+        let app = make_window(directory.clone(), config)?;
         // Do not inherit profile/browser/argument overrides that could select
         // another browser or alter default security. Never rewrite them.
         let overrides = [
@@ -1131,7 +1623,12 @@ fn startup() -> windows::core::Result<()> {
             let profile = directory.join("data").join("browser-profile");
             if !available {
                 app.fail("runtime_missing", "No usable existing WebView2 runtime was found. Nothing will be downloaded or installed.");
-            } else if fs::create_dir_all(&profile).is_err() {
+            } else if app.automatic() && !profile.is_dir() {
+                app.fail(
+                    "existing_profile_required",
+                    "First use manual mode to create the application profile and sign in normally.",
+                );
+            } else if !app.automatic() && fs::create_dir_all(&profile).is_err() {
                 app.fail(
                     "profile_directory_unavailable",
                     "Cannot create the app's browser profile next to this executable.",
@@ -1160,8 +1657,8 @@ fn startup() -> windows::core::Result<()> {
     Ok(())
 }
 
-pub fn run() {
-    if startup().is_err() {
+pub fn run(config: Option<Config>) {
+    if startup(config).is_err() {
         unsafe {
             MessageBoxW(None, w!("The standalone proof could not create its native window or initialize COM. No software was installed."),
                 w!("Community WebView2 proof"), MB_OK | MB_ICONERROR);
