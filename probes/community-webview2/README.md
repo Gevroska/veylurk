@@ -4,7 +4,14 @@ This isolated Rust Windows proof uses the existing WebView2 runtime and its
 executable-local `data/browser-profile`. It does not change the production
 Veylurk service, SQLite history, credentials, or IRC evidence. Manual Community
 access and profile persistence were demonstrated with an earlier revision;
-this revision still needs Windows checks and live autonomous paused-channel acceptance.
+the accepted finite autonomous run observed four correlated samples across two
+channels and circuits, including three after verified minimization. This shared
+host extraction still requires its own Windows checks and application acceptance.
+
+Parsing, request correlation, player/deadline gates and native behavior now live
+in `crates/community-source`; this proof is a thin aggregate-only adapter. Its
+independent lockfile also records that local path dependency. Run the shared
+crate's tests as well as the proof's CLI/build checks.
 
 There is no installer, runtime download, private HTTP client, token/cookie API,
 request replay, imported profile, browser identity modification, security flag,
@@ -69,7 +76,7 @@ is an example, not a launch performed by the build. A new Internet-capable
 executable still needs the owner's launch approval.
 
 The mode accepts exactly two or three distinct channels, one to three circuits
-(default two), and a 60–600 second total limit (default 240). One controller
+(default two), and a 60â€“600 second total limit (default 240). One controller
 visits the normal `https://www.twitch.tv/CHANNEL` page in channel order, with all
 attempt starts at least 30 seconds apart. It waits for the normal player and
 uses its ordinary Pause control at most once per navigation when needed.

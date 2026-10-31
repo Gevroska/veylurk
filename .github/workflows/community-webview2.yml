@@ -5,10 +5,12 @@ on:
     paths:
       - '.github/workflows/community-webview2.yml'
       - 'probes/community-webview2/**'
+      - 'crates/community-source/**'
   pull_request:
     paths:
       - '.github/workflows/community-webview2.yml'
       - 'probes/community-webview2/**'
+      - 'crates/community-source/**'
   workflow_dispatch:
 
 permissions:
@@ -45,6 +47,12 @@ jobs:
           if-no-files-found: error
       - name: Check formatting
         run: cargo fmt --manifest-path probes/community-webview2/Cargo.toml --all -- --check
+      - name: Check shared source formatting
+        run: cargo fmt --manifest-path crates/community-source/Cargo.toml --all -- --check
+      - name: Lint shared native source
+        run: cargo clippy --manifest-path crates/community-source/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Test shared parsing, correlation, lifecycle and bounded controls
+        run: cargo test --manifest-path crates/community-source/Cargo.toml --locked --all-targets
       - name: Lint the proof
         run: cargo clippy --manifest-path probes/community-webview2/Cargo.toml --locked --all-targets -- -D warnings
       - name: Test parsing, scheduling, native request identity and bounds without Twitch

@@ -3,13 +3,20 @@
 version = 3
 
 [[package]]
-name = "community-webview2-proof"
+name = "community-source"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "webview2-com",
  "windows",
+]
+
+[[package]]
+name = "community-webview2-proof"
+version = "0.1.0"
+dependencies = [
+ "community-source",
 ]
 
 [[package]]

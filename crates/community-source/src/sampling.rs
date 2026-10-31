@@ -149,6 +149,9 @@ pub struct NavigationGate {
 }
 
 impl NavigationGate {
+    pub fn retained_ids(&self) -> usize {
+        self.seen_ids.len()
+    }
     pub fn begin(&mut self) -> u64 {
         self.intent += 1;
         self.issued = false;
@@ -1723,6 +1726,7 @@ mod tests {
                     count: 100,
                     categories: BTreeMap::new(),
                     accounts: HashSet::from([name.into()]),
+                    roles: BTreeMap::new(),
                 },
                 &t.take_ready().unwrap().unwrap(),
             );
