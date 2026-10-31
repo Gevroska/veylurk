@@ -7,6 +7,9 @@ use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{watch, OwnedSemaphorePermit, RwLock, Semaphore};
 
+const FLUSH_TRIGGER_ROWS: usize = 512;
+const MAX_FLUSH_ROWS: usize = 1024;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectorStatus {
     pub state: String,
@@ -81,7 +84,7 @@ async fn flush_pending(
             })?;
         grouped.entry(id).or_default().push(event);
         count += 1;
-        if count == 512 {
+        if count == MAX_FLUSH_ROWS {
             store
                 .append_sessions(std::mem::take(&mut grouped).into_iter().collect())
                 .await?;
@@ -108,7 +111,72 @@ fn queue_observations(
         flush.reset();
     }
     pending.extend(events);
-    pending.len() >= 512
+    pending.len() >= FLUSH_TRIGGER_ROWS
+}
+
+fn queue_observation_event(
+    flush: &mut tokio::time::Interval,
+    pending: &mut Vec<NewObservation>,
+    permits: &mut Vec<OwnedSemaphorePermit>,
+    rooms: &mut BTreeMap<String, RoomStatus>,
+    events: Vec<NewObservation>,
+    permit: OwnedSemaphorePermit,
+) -> bool {
+    permits.push(permit);
+    for event in &events {
+        if matches!(event.kind.as_str(), "names" | "join") {
+            if let Some(room) = rooms.get_mut(&event.channel) {
+                room.last_positive_at = Some(event.received_at.clone());
+            }
+        }
+    }
+    queue_observations(flush, pending, events)
+}
+
+fn coalesce_queued_observations(
+    receiver: &mut tokio::sync::mpsc::Receiver<irc::QueuedEvent>,
+    deferred: &mut Option<irc::QueuedEvent>,
+    flush: &mut tokio::time::Interval,
+    pending: &mut Vec<NewObservation>,
+    permits: &mut Vec<OwnedSemaphorePermit>,
+    rooms: &mut BTreeMap<String, RoomStatus>,
+) {
+    // Visit only the bounded queue snapshot. Empty envelopes and concurrent
+    // producers cannot prolong this nonblocking pass or delay a ready flush.
+    let visits = receiver.len().min(MAX_FLUSH_ROWS);
+    for _ in 0..visits {
+        if pending.len() >= MAX_FLUSH_ROWS {
+            break;
+        }
+        let Ok(envelope) = receiver.try_recv() else {
+            break;
+        };
+        match envelope.observation_len() {
+            Some(count) if count <= MAX_FLUSH_ROWS - pending.len() => {
+                if let (StreamEvent::Observations(events), permit) = envelope.into_parts() {
+                    queue_observation_event(flush, pending, permits, rooms, events, permit);
+                }
+            }
+            _ => {
+                // Preserve the complete next payload, source clock and admission
+                // permit, including controls that delimit observation sessions.
+                *deferred = Some(envelope);
+                break;
+            }
+        }
+    }
+}
+
+async fn receive_event(
+    receiver: &mut tokio::sync::mpsc::Receiver<irc::QueuedEvent>,
+    deferred: &mut Option<irc::QueuedEvent>,
+) -> Option<irc::QueuedEvent> {
+    // Taking a deferred event must happen when this future is polled, rather
+    // than when select constructs a branch that another ready branch can cancel.
+    match deferred.take() {
+        Some(event) => Some(event),
+        None => receiver.recv().await,
+    }
 }
 
 async fn publish_rooms(
@@ -169,6 +237,7 @@ async fn run_endpoint(
         let mut rooms = BTreeMap::<String, RoomStatus>::new();
         let mut sessions = BTreeMap::<String, i64>::new();
         let (events_tx, mut events_rx) = irc::receipt_queue();
+        let mut deferred = None;
         status.write().await.receive_budget = Some(events_tx.budget_handle());
         let transport_end = events_tx.end_time_handle();
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -204,7 +273,7 @@ async fn run_endpoint(
                     Ok(())
                 },
                 _=shutdown.changed(),if reason.is_none()=> {reason=Some("shutdown".into());let _=stop_tx.send(true);Ok(())},
-                event=events_rx.recv()=> {
+                event=receive_event(&mut events_rx,&mut deferred)=> {
                     let Some(envelope)=event else {break;};
                     let source_at=envelope.received_at().to_owned();
                     let (event,permit)=envelope.into_parts();
@@ -259,13 +328,10 @@ async fn run_endpoint(
                             saved
                         },
                         StreamEvent::Observations(events)=> {
-                            pending_permits.push(permit);
-                            for event in &events {
-                                if matches!(event.kind.as_str(),"names"|"join") {
-                                    if let Some(room)=rooms.get_mut(&event.channel) {room.last_positive_at=Some(event.received_at.clone());}
-                                }
-                            }
-                            if queue_observations(&mut flush,&mut pending,events) {flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await} else {Ok(())}
+                            if queue_observation_event(&mut flush,&mut pending,&mut pending_permits,&mut rooms,events,permit) {
+                                coalesce_queued_observations(&mut events_rx,&mut deferred,&mut flush,&mut pending,&mut pending_permits,&mut rooms);
+                                flush_pending(&store,&sessions,&mut pending,&mut pending_permits).await
+                            } else {Ok(())}
                         },
                     }
                 },
@@ -573,3 +639,7 @@ mod buffer_tests;
 #[cfg(test)]
 #[path = "collector_flush_tests.rs"]
 mod flush_tests;
+
+#[cfg(test)]
+#[path = "collector_batching_tests.rs"]
+mod batching_tests;

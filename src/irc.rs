@@ -456,6 +456,26 @@ pub(crate) struct QueuedEvent {
 }
 
 impl QueuedEvent {
+    pub(crate) fn observation_len(&self) -> Option<usize> {
+        match &self.event {
+            StreamEvent::Observations(rows) => Some(rows.len()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        event: StreamEvent,
+        received_at: String,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            event,
+            permit,
+            received_at,
+        }
+    }
+
     pub(crate) fn received_at(&self) -> &str {
         &self.received_at
     }
