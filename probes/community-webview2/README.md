@@ -30,6 +30,9 @@ creation, or network access. Synthetic tests cover exact source selection,
 role deduplication, source errors, redaction, response/member bounds, scheduler
 fairness and deadlines, stale request IDs/generations, delayed trigger callbacks,
 frame mismatch, caching, and repeated samples. They do not establish live access.
+Timing fixtures cover a network finish preceding the response-event timestamp,
+unknown transferred bytes, numeric-only failure diagnostics, and unchanged body
+limits and freshness claims in those cases.
 The Windows workflow packages only the executable, documentation, manifests,
 and any required loader; it never packages a browser profile or live evidence.
 
@@ -103,6 +106,16 @@ it never sends a Twitch request. Batch index and length are checked before
 parsing the selected result. Headers, cookies, security details, and unrelated
 fields are ignored by typed event deserialization and never retained.
 
+The response event uses its reporting timestamp, while the finish event can
+carry an earlier network-stack timestamp. Chromium's own frontend handles this
+ordering. The proof preserves the raw matched timestamps, their difference, and
+an explicit ordering flag; it does not adjust them or use their relative order
+as an identity test. Both timestamps must still be finite and no earlier than
+the matched request start. Blink's encoded-length sentinel `-1` means unknown:
+`encoded_bytes` is then null and cannot establish a network-response provenance.
+Other negative or nonfinite lengths fail closed. Decoded-body and protocol
+envelope limits apply independently of the reported transferred length.
+
 Limits are 192 KiB per event, 2,048 events per attempt, four pending matching
 candidates, a 64 KiB request body, a 1 MiB decoded response, and 4,096 member
 rows across all roles. Protocol response-string escaping has a separate finite
@@ -119,6 +132,10 @@ per-channel overlap/union and duplicate-set flags, cache provenance, and browser
 cleanup state. Account sets exist only in memory. Raw bodies, errors, page DOM,
 headers, credentials, cookies, and individual account logins are never written.
 Evidence-write failure stops the autonomous proof.
+Matched-source timing failures retain at most one numeric diagnostic containing
+the raw finite timestamps, differences, encoded length, and a specific reason
+code. Nonfinite numbers become null. No request IDs, URLs, headers, or accounts
+are included in that diagnostic.
 
 A new native response can be cached or contain the same accounts. Explicit
 cache/service-worker flags, missing cache metadata, and an observed network
@@ -140,4 +157,11 @@ unknown evidence must not be reported as fresh sampling.
   0.39.1 and `windows` 0.62.2.
 - [WebView2 DevTools protocol](https://learn.microsoft.com/en-us/microsoft-edge/webview2/how-to/chromium-devtools-protocol).
 - [Network protocol events](https://chromedevtools.github.io/devtools-protocol/tot/Network/).
+- [Chromium network event timestamps](https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/core/inspector/inspector_network_agent.cc):
+  `DidReceiveResourceResponse` and `DidFinishLoading` use event-reporting and
+  network-finish times respectively.
+- [DevTools request end-time handling](https://github.com/ChromeDevTools/devtools-frontend/blob/main/front_end/core/sdk/NetworkRequest.ts):
+  the `endTime` setter explicitly handles finish before response-received time.
+- [Blink unknown encoded length](https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/platform/loader/fetch/url_loader/url_loader_client.h):
+  `URLLoaderClient::kUnknownEncodedDataLength` is `-1`.
 - [WebView2 user data folders](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder).

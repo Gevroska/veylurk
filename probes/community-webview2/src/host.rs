@@ -160,6 +160,18 @@ impl App {
     }
 
     fn fail(&self, code: &'static str, message: &str) {
+        let timing = self
+            .state
+            .borrow()
+            .tracker
+            .as_ref()
+            .and_then(|tracker| tracker.timing_failure(code));
+        if let Some(timing) = timing {
+            let mut evidence = self.evidence.borrow_mut();
+            if evidence.native_timing_failure.is_none() {
+                evidence.native_timing_failure = Some(timing);
+            }
+        }
         self.cancel_round();
         self.disable_network();
         if self.automatic() {

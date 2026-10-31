@@ -225,6 +225,12 @@ pub struct Provenance {
     pub from_prefetch_cache: Option<bool>,
     pub served_from_cache_event: bool,
     pub encoded_bytes: Option<u64>,
+    pub raw_encoded_data_length: f64,
+    pub request_monotonic_seconds: f64,
+    pub response_monotonic_seconds: f64,
+    pub finished_monotonic_seconds: f64,
+    pub finished_minus_response_ms: Option<f64>,
+    pub timing_order: &'static str,
     pub transport: &'static str,
     pub server_freshness: &'static str,
 }
@@ -327,6 +333,43 @@ struct Candidate {
     failed: bool,
 }
 
+/// One finite, numeric-only diagnostic for an already matched source request.
+/// Nonfinite input is represented as null with a specific reason code. No raw
+/// event, URL, request ID, channel variable, account, or header is serializable.
+#[derive(Clone, Debug, Serialize)]
+pub struct TimingFailure {
+    pub code: &'static str,
+    pub request_monotonic_seconds: Option<f64>,
+    pub response_monotonic_seconds: Option<f64>,
+    pub finished_monotonic_seconds: Option<f64>,
+    pub request_to_response_ms: Option<f64>,
+    pub request_to_finished_ms: Option<f64>,
+    pub finished_minus_response_ms: Option<f64>,
+    pub raw_encoded_data_length: Option<f64>,
+}
+
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+impl TimingFailure {
+    fn new(candidate: &Candidate, finished: &FinishedEvent, code: &'static str) -> Self {
+        let response = candidate.response.as_ref().map(|value| value.timestamp);
+        Self {
+            code,
+            request_monotonic_seconds: finite(candidate.request_time),
+            response_monotonic_seconds: response.and_then(finite),
+            finished_monotonic_seconds: finite(finished.timestamp),
+            request_to_response_ms: response
+                .and_then(|value| finite((value - candidate.request_time) * 1000.0)),
+            request_to_finished_ms: finite((finished.timestamp - candidate.request_time) * 1000.0),
+            finished_minus_response_ms: response
+                .and_then(|value| finite((finished.timestamp - value) * 1000.0)),
+            raw_encoded_data_length: finite(finished.encoded_data_length),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BodyRequest {
     pub id: String,
@@ -346,6 +389,7 @@ pub struct Tracker {
     candidates: Vec<Candidate>,
     events: usize,
     body_taken: bool,
+    timing_failure: Option<TimingFailure>,
 }
 
 impl Tracker {
@@ -358,6 +402,7 @@ impl Tracker {
             candidates: Vec::new(),
             events: 0,
             body_taken: false,
+            timing_failure: None,
         }
     }
     pub fn count_event(&mut self) -> Result<(), &'static str> {
@@ -476,15 +521,26 @@ impl Tracker {
         else {
             return Ok(());
         };
-        if !value.timestamp.is_finite()
-            || value.timestamp < candidate.request_time
-            || !value.encoded_data_length.is_finite()
-            || value.encoded_data_length < 0.0
-        {
-            return Err("invalid_native_finished_time");
-        }
-        if value.encoded_data_length > (RESPONSE_CAP + REQUEST_CAP) as f64 {
-            return Err("response_size_limit");
+        // Blink's URLLoaderClient uses -1 for unknown encoded data length.
+        // The decoded body and protocol envelope retain independent caps.
+        let failure = if !value.timestamp.is_finite() {
+            Some("native_finished_timestamp_nonfinite")
+        } else if value.timestamp < candidate.request_time {
+            Some("native_finished_before_request")
+        } else if !value.encoded_data_length.is_finite() {
+            Some("native_encoded_length_nonfinite")
+        } else if value.encoded_data_length < 0.0 && value.encoded_data_length != -1.0 {
+            Some("native_encoded_length_invalid_negative")
+        } else if value.encoded_data_length > (RESPONSE_CAP + REQUEST_CAP) as f64 {
+            Some("response_size_limit")
+        } else {
+            None
+        };
+        if let Some(code) = failure {
+            if self.timing_failure.is_none() {
+                self.timing_failure = Some(TimingFailure::new(candidate, &value, code));
+            }
+            return Err(code);
         }
         candidate.finished = Some(value);
         Ok(())
@@ -500,6 +556,9 @@ impl Tracker {
         }
     }
     fn ready(&self) -> Result<Option<BodyRequest>, &'static str> {
+        if let Some(failure) = &self.timing_failure {
+            return Err(failure.code);
+        }
         let Some(trigger) = self.trigger else {
             return Ok(None);
         };
@@ -535,9 +594,10 @@ impl Tracker {
         let Some(finished) = &candidate.finished else {
             return Ok(None);
         };
-        if finished.timestamp < response.timestamp {
-            return Err("invalid_native_finished_time");
-        }
+        // Chromium records responseReceived at event reporting time but uses
+        // the network-stack finish time for loadingFinished. The frontend
+        // explicitly handles finish < response-event time. Keep raw values;
+        // that cross-event ordering is not request identity evidence.
         let r = &response.response;
         let cached = candidate.cached
             || r.from_disk_cache == Some(true)
@@ -560,18 +620,31 @@ impl Tracker {
             status: r.status,
             provenance: Provenance {
                 request_after_trigger_verified: true,
-                request_after_trigger_ms: Some((candidate.wall_time - trigger) * 1000.0),
-                request_to_response_ms: Some(
+                request_after_trigger_ms: finite((candidate.wall_time - trigger) * 1000.0),
+                request_to_response_ms: finite(
                     (response.timestamp - candidate.request_time) * 1000.0,
                 ),
-                request_to_finished_ms: Some(
+                request_to_finished_ms: finite(
                     (finished.timestamp - candidate.request_time) * 1000.0,
                 ),
                 from_disk_cache: r.from_disk_cache,
                 from_service_worker: r.from_service_worker,
                 from_prefetch_cache: r.from_prefetch_cache,
                 served_from_cache_event: candidate.cached,
-                encoded_bytes: Some(finished.encoded_data_length as u64),
+                encoded_bytes: (finished.encoded_data_length >= 0.0)
+                    .then_some(finished.encoded_data_length as u64),
+                raw_encoded_data_length: finished.encoded_data_length,
+                request_monotonic_seconds: candidate.request_time,
+                response_monotonic_seconds: response.timestamp,
+                finished_monotonic_seconds: finished.timestamp,
+                finished_minus_response_ms: finite(
+                    (finished.timestamp - response.timestamp) * 1000.0,
+                ),
+                timing_order: if finished.timestamp < response.timestamp {
+                    "finish_before_response_event"
+                } else {
+                    "finish_at_or_after_response_event"
+                },
                 transport,
                 server_freshness: "unknown",
             },
@@ -599,6 +672,13 @@ impl Tracker {
             return Err("native_body_identity_mismatch");
         }
         Ok(ready)
+    }
+
+    pub fn timing_failure(&self, code: &'static str) -> Option<TimingFailure> {
+        self.timing_failure
+            .as_ref()
+            .filter(|value| value.code == code)
+            .cloned()
     }
 }
 
@@ -983,6 +1063,147 @@ mod tests {
             assert_eq!(b.provenance.server_freshness, "unknown");
         }
     }
+    #[test]
+    fn network_finish_before_response_event_preserves_raw_times_and_identity() {
+        for finish_callback_first in [false, true] {
+            let mut tracker = Tracker::new(2, "test".into(), "top".into());
+            tracker.request(2, req("matched", 100.1)).unwrap();
+            let mut finished = finish("matched");
+            finished.timestamp = 20.05;
+            if finish_callback_first {
+                tracker.finished(2, finished).unwrap();
+                tracker.response(2, resp("matched", Some(false))).unwrap();
+            } else {
+                tracker.response(2, resp("matched", Some(false))).unwrap();
+                tracker.finished(2, finished).unwrap();
+            }
+            tracker.set_trigger(100_000.0).unwrap();
+            let pending = tracker.take_ready().unwrap().unwrap();
+            let accepted = tracker.complete_body(2, &pending.id).unwrap();
+            let provenance = accepted.provenance;
+            assert!(provenance.request_after_trigger_verified);
+            assert_eq!(provenance.request_monotonic_seconds, 20.0);
+            assert_eq!(provenance.response_monotonic_seconds, 20.1);
+            assert_eq!(provenance.finished_monotonic_seconds, 20.05);
+            assert!((provenance.finished_minus_response_ms.unwrap() + 50.0).abs() < 0.0001);
+            assert_eq!(provenance.timing_order, "finish_before_response_event");
+            assert_eq!(provenance.server_freshness, "unknown");
+            assert_eq!(
+                tracker.complete_body(1, &pending.id).unwrap_err(),
+                "stale_native_body_callback"
+            );
+            assert_eq!(
+                tracker.complete_body(2, "unrelated").unwrap_err(),
+                "native_body_identity_mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_wire_length_accepts_bounded_body_without_freshness_claim() {
+        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        tracker.set_trigger(100_000.0).unwrap();
+        tracker.request(2, req("matched", 100.1)).unwrap();
+        tracker.response(2, resp("matched", Some(false))).unwrap();
+        let mut finished = finish("matched");
+        finished.encoded_data_length = -1.0;
+        tracker.finished(2, finished).unwrap();
+        let pending = tracker.take_ready().unwrap().unwrap();
+        let accepted = tracker.complete_body(2, &pending.id).unwrap();
+        assert_eq!(accepted.provenance.encoded_bytes, None);
+        assert_eq!(accepted.provenance.raw_encoded_data_length, -1.0);
+        assert_eq!(accepted.provenance.transport, "unknown");
+        assert_eq!(accepted.provenance.server_freshness, "unknown");
+        let body = json!({"data":{"channel":{"chatters":{
+            "count":1,"broadcasters":[],"staff":[],"moderators":[],"vips":[],
+            "chatbots":[],"viewers":[{"login":"private_viewer"}]
+        }}}})
+        .to_string();
+        let bytes = response_body(&json!({"body":body,"base64Encoded":false}).to_string()).unwrap();
+        let sample = crate::parse_response(&bytes, &accepted.selection, accepted.status).unwrap();
+        let config = Config::new(vec!["test".into(), "other".into()], 1, 60).unwrap();
+        let mut evidence = RunEvidence::new(&config);
+        evidence.start(Schedule::new(config).start_due(0).unwrap());
+        evidence.sample(sample, &accepted);
+        assert_eq!(evidence.source_samples_received, 1);
+        assert!(!evidence.fresh_server_samples_proven);
+        let saved = serde_json::to_string(&evidence).unwrap();
+        assert!(!saved.contains("private_viewer"));
+        assert!(!saved.contains("network_response"));
+        assert_eq!(
+            response_body(
+                &json!({"body":"x".repeat(RESPONSE_CAP + 1),"base64Encoded":false}).to_string()
+            )
+            .unwrap_err(),
+            "response_size_limit"
+        );
+        assert_eq!(
+            response_body(&" ".repeat(BODY_ENVELOPE_CAP + 1)).unwrap_err(),
+            "response_size_limit"
+        );
+    }
+
+    #[test]
+    fn invalid_finished_values_have_distinct_numeric_only_diagnostics() {
+        for (timestamp, encoded, expected) in [
+            (f64::NAN, 1000.0, "native_finished_timestamp_nonfinite"),
+            (f64::INFINITY, 1000.0, "native_finished_timestamp_nonfinite"),
+            (19.9, 1000.0, "native_finished_before_request"),
+            (20.2, f64::NAN, "native_encoded_length_nonfinite"),
+            (20.2, f64::INFINITY, "native_encoded_length_nonfinite"),
+            (20.2, -2.0, "native_encoded_length_invalid_negative"),
+            (20.2, -0.5, "native_encoded_length_invalid_negative"),
+            (
+                20.2,
+                (RESPONSE_CAP + REQUEST_CAP + 1) as f64,
+                "response_size_limit",
+            ),
+        ] {
+            let mut tracker = Tracker::new(2, "test".into(), "top".into());
+            tracker.set_trigger(100_000.0).unwrap();
+            tracker
+                .request(2, req("private_request_id", 100.1))
+                .unwrap();
+            tracker
+                .response(2, resp("private_request_id", Some(false)))
+                .unwrap();
+            tracker.finished(2, finish("private_request_id")).unwrap();
+            let pending = tracker.take_ready().unwrap().unwrap();
+            let mut finished = finish("private_request_id");
+            finished.timestamp = timestamp;
+            finished.encoded_data_length = encoded;
+            assert_eq!(tracker.finished(2, finished).unwrap_err(), expected);
+            assert_eq!(tracker.take_ready().unwrap_err(), expected);
+            assert_eq!(tracker.complete_body(2, &pending.id).unwrap_err(), expected);
+            let diagnostic = tracker.timing_failure(expected).unwrap();
+            assert_eq!(diagnostic.request_monotonic_seconds, Some(20.0));
+            assert_eq!(diagnostic.response_monotonic_seconds, Some(20.1));
+            assert_eq!(diagnostic.finished_monotonic_seconds, finite(timestamp));
+            assert_eq!(diagnostic.raw_encoded_data_length, finite(encoded));
+            let saved = serde_json::to_value(diagnostic).unwrap();
+            assert_eq!(saved.as_object().unwrap().len(), 8);
+            for (key, value) in saved.as_object().unwrap() {
+                assert!(key == "code" || value.is_null() || value.is_number());
+            }
+            assert!(!saved.to_string().contains("private_request_id"));
+            assert!(tracker.timing_failure("unrelated_reason").is_none());
+        }
+    }
+
+    #[test]
+    fn unrelated_or_stale_finish_events_cannot_create_timing_diagnostics() {
+        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        tracker.set_trigger(100_000.0).unwrap();
+        tracker.request(2, req("matched", 100.1)).unwrap();
+        for (generation, id) in [(1, "matched"), (2, "unrelated")] {
+            let mut finished = finish(id);
+            finished.timestamp = f64::NAN;
+            tracker.finished(generation, finished).unwrap();
+        }
+        assert!(tracker.timing_failure.is_none());
+        assert!(tracker.take_ready().unwrap().is_none());
+    }
+
     #[test]
     fn caps_and_denials_fail_closed() {
         let mut t = Tracker::new(2, "test".into(), "top".into());

@@ -347,6 +347,7 @@ pub struct Evidence {
     pub samples: Vec<SampleEvidence>,
     pub browser_diagnostics: BrowserDiagnostics,
     pub autonomous: Option<sampling::RunEvidence>,
+    pub native_timing_failure: Option<sampling::TimingFailure>,
     #[serde(skip)]
     previous: HashSet<String>,
     #[serde(skip)]
@@ -369,6 +370,7 @@ impl Default for Evidence {
             samples: Vec::new(),
             browser_diagnostics: BrowserDiagnostics::default(),
             autonomous: None,
+            native_timing_failure: None,
             previous: HashSet::new(),
             union: HashSet::new(),
         }
