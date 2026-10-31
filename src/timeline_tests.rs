@@ -37,6 +37,29 @@ fn query() -> TimelineQuery {
     }
 }
 
+#[tokio::test]
+async fn channel_only_range_resolution_has_no_synthetic_account_or_irc_visits() {
+    let (_dir, store, _session) = fixture().await;
+    let page = timeline(
+        &store,
+        TimelineQuery {
+            channel: Some("example".into()),
+            account: None,
+            from: Some(at("00:00:00")),
+            to: Some(at("01:00:00")),
+            ..TimelineQuery::default()
+        },
+    )
+    .await;
+    assert_eq!(page.account, "");
+    assert_eq!(page.channel.as_deref(), Some("example"));
+    assert_eq!(page.effective_range.from, at("00:00:00"));
+    assert_eq!(page.effective_range.to, at("01:00:00"));
+    assert!(page.intervals.is_empty());
+    assert!(!page.has_more);
+    assert_eq!(page.confidence, None);
+}
+
 async fn timeline(store: &Store, query: TimelineQuery) -> Timeline {
     store.timeline_at(query, at("01:00:00")).await.unwrap()
 }

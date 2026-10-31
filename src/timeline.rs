@@ -249,7 +249,15 @@ impl Store {
         query: TimelineQuery,
         generated_at: String,
     ) -> Result<Timeline, StoreError> {
-        let account = normalize(query.account.as_deref().ok_or(StoreError::Invalid)?)?;
+        let account = query.account.as_deref().map(normalize).transpose()?;
+        if account.is_none()
+            && (query.channel.is_none() && query.broadcast_id.is_none() || query.before.is_some())
+        {
+            return Err(StoreError::Invalid);
+        }
+        // A channel-only request resolves the exact same axis for Community ticks.
+        // It does not synthesize account visits or scan IRC history.
+        let account = account.unwrap_or_default();
         let mut channel = query.channel.as_deref().map(normalize).transpose()?;
         let limit = query.limit.unwrap_or(25);
         if !(1..=100).contains(&limit)
@@ -300,7 +308,7 @@ impl Store {
                 as_of:range.to.clone(),generated_at,empty,intervals:Vec::new(),has_more:false,next_before:None,
                 limit,model_version:MODEL_VERSION,confidence:None,confidence_status:"not_calibrated",page_scope:PAGE_SCOPE,explanation:EXPLANATION,
             };
-            if empty { return Ok(response); }
+            if empty || account.is_empty() { return Ok(response); }
 
             // The union's keys are globally unique source observation IDs: a visit starts on a
             // positive receipt, while an unattached departure has its own PART receipt ID.

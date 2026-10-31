@@ -456,7 +456,7 @@ async fn timeline(
     match state.store.timeline(query).await {
         Ok(timeline) => Ok(Json(timeline)),
         Err(StoreError::NotFound) => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "Broadcast not found.")),
-        Err(StoreError::Invalid) => Err(ApiError(StatusCode::BAD_REQUEST, "invalid_input", "Supply an exact account, valid logins and RFC3339 bounds spanning at most 31 days, a limit from 1 to 100, and positive broadcast/cursor IDs.")),
+        Err(StoreError::Invalid) => Err(ApiError(StatusCode::BAD_REQUEST, "invalid_input", "Supply an exact account or channel, or a broadcast, with valid logins and RFC3339 bounds spanning at most 31 days, a limit from 1 to 100, and positive broadcast/cursor IDs.")),
         Err(error) => Err(error.into()),
     }
 }

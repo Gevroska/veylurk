@@ -228,6 +228,13 @@ td.actions { min-width: 260px; }
 .timeline-legend li { display: flex; align-items: center; gap: .4rem; }
 .timeline-key { display: inline-block; width: 24px; height: 14px; flex-shrink: 0; }
 .timeline-key.positive { background: var(--accent-strong); border-radius: 50%; width: 9px; height: 9px; margin: 0 7px; }
+.timeline-key.community { width: 3px; height: 18px; margin: 0 10px; background: var(--link); }
+.timeline-community { fill: var(--link); stroke: var(--panel); stroke-width: .6; }
+.timeline-community[tabindex]:focus { outline: 2px solid var(--focus); outline-offset: 3px; }
+.community-controls { margin-top: 1rem; }
+.community-controls .collection-settings { margin-bottom: 1rem; }
+.community-controls input { max-width: 20rem; }
+.community-timeline-status { margin: .6rem 0; }
 .timeline-key.inferred { border: 1px dashed var(--warning-text); background: repeating-linear-gradient(135deg, var(--warning) 0 4px, var(--warning-text) 4px 5px); }
 .timeline-key.departure { width: 14px; height: 14px; margin: 0 5px; border: 2px solid var(--text); transform: rotate(45deg); }
 .timeline-key.unknown { background: var(--table-heading); border: 1px solid var(--border); }

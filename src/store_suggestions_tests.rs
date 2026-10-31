@@ -165,6 +165,11 @@ async fn suggestions_seek_existing_covering_indexes_without_sorting_history() {
             for (sql, expected_index) in [
                 (ACCOUNT_SQL, "relationships_account"),
                 (CHANNEL_SQL, "sqlite_autoindex_channels_1"),
+                (
+                    COMMUNITY_ACCOUNT_SQL,
+                    "community_members_account_member_sample",
+                ),
+                (COMMUNITY_CHANNEL_SQL, "community_samples_channel_receipt"),
             ] {
                 let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
                 let plan = statement
@@ -181,6 +186,78 @@ async fn suggestions_seek_existing_covering_indexes_without_sorting_history() {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn community_only_names_merge_after_bounded_source_candidates_without_duplicates() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path().join("community-suggestions.sqlite3"))
+        .await
+        .unwrap();
+    store
+        .track(vec!["room_a".into(), "room_c".into()], true)
+        .await
+        .unwrap();
+    store.call_write(crate::diagnostics::Operation::CommunityAppend, |conn| {
+        let tx = conn.transaction()?;
+        tx.execute_batch("INSERT INTO community_runs(id,started_at_utc,build_identity) VALUES(1,'2020-01-01T00:00:00.000Z','fixture');
+            INSERT INTO community_samples(id,run_id,job_id,channel,started_at_utc,outcome) VALUES(1,1,1,'room_b','2020-01-01T00:00:00.000Z','success'),(2,1,2,'room_c','2020-01-01T00:00:00.000Z','success');")?;
+        for number in 0..40 {
+            let account = format!("ac{number:02}");
+            if number%2==0 {
+                tx.execute("INSERT INTO relationships(channel,account,first_observed_at,last_observed_at,observation_count) VALUES('room_a',?1,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z',1)", [&account])?;
+            }
+            if number<30 {
+                tx.execute("INSERT INTO community_members(sample_id,channel,account,roles) VALUES(1,'room_b',?1,32),(2,'room_c',?1,32)", [&account])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }).await.unwrap();
+    for limit in [1, 3, 10] {
+        assert_eq!(
+            store
+                .suggestions(SuggestionKind::Account, " AC ".into(), limit)
+                .await
+                .unwrap(),
+            (0..limit)
+                .map(|number| format!("ac{number:02}"))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        store
+            .suggestions(SuggestionKind::Account, "ac01".into(), 10)
+            .await
+            .unwrap(),
+        ["ac01"]
+    );
+    assert_eq!(
+        store
+            .suggestions(SuggestionKind::Account, "ac38".into(), 10)
+            .await
+            .unwrap(),
+        ["ac38"]
+    );
+    assert_eq!(
+        store
+            .suggestions(SuggestionKind::Channel, "room_".into(), 10)
+            .await
+            .unwrap(),
+        ["room_a", "room_b", "room_c"]
+    );
+    assert_eq!(
+        store
+            .suggestions(SuggestionKind::Channel, "room_".into(), 2)
+            .await
+            .unwrap(),
+        ["room_a", "room_b"]
+    );
+    assert!(store
+        .suggestions(SuggestionKind::Account, "missing".into(), 10)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

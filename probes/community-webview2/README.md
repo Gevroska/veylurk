@@ -76,7 +76,7 @@ is an example, not a launch performed by the build. A new Internet-capable
 executable still needs the owner's launch approval.
 
 The mode accepts exactly two or three distinct channels, one to three circuits
-(default two), and a 60â€“600 second total limit (default 240). One controller
+(default two), and a 60–600 second total limit (default 240). One controller
 visits the normal `https://www.twitch.tv/CHANNEL` page in channel order, with all
 attempt starts at least 30 seconds apart. It waits for the normal player and
 uses its ordinary Pause control at most once per navigation when needed.

@@ -6,6 +6,7 @@ pub mod app;
 pub mod benchmark;
 pub mod browser;
 pub mod collector;
+pub mod community;
 pub mod diagnostics;
 pub mod history;
 pub mod irc;

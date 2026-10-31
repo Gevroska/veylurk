@@ -2,11 +2,11 @@
 
 Veylurk is a Rust application for Windows that collects observable Twitch chat membership into a local SQLite database. Its embedded English interface searches accounts, channels, connection history, and optional broadcast metadata at `http://127.0.0.1:8794`.
 
-The application runs continuously while its process is open. Collection needs no browser, extension, Twitch login, or user token. You can open the local interface in an ordinary browser and close that page without stopping collection. Windows launchers support foreground collection, hidden background operation and optional per-user login startup through Task Scheduler. See [Windows operation and recovery](docs/windows-operation.md) for installation, graceful stop, backup and restore.
+The application runs continuously while its process is open. IRC collection needs no Twitch login or browser runtime. Optional Community sampling uses the existing Windows WebView2 runtime with a dedicated Twitch sign-in; it needs no Brave installation or extension. You can open the local interface in an ordinary browser and close that page without stopping collection. Windows launchers support foreground collection, hidden background operation and optional per-user login startup through Task Scheduler. See [Windows operation and recovery](docs/windows-operation.md) for installation, graceful stop, backup and restore.
 
 ## Run the application
 
-Download the `veylurk-windows-x64` artifact from a successful Windows workflow run and extract it into a stable folder. Keep the launcher scripts beside `veylurk.exe`. It contains the interface and needs no Node.js or browser runtime for collection.
+Download the `veylurk-windows-x64` artifact from a successful Windows workflow run and extract it into a stable folder. Keep the launcher scripts beside `veylurk.exe`. It contains the interface and needs no Node.js. IRC works without a browser runtime; optional Community sampling uses the existing Windows WebView2 runtime.
 
 ```powershell
 powershell.exe -NoProfile -File .\Start-Veylurk.ps1
@@ -34,7 +34,13 @@ In **Broadcasts**, filter by channel, account and time, then choose **View summa
 
 The channel overview shows current live/offline/unknown reports separately from chat collection quality. **Chat collection policy** defaults to all enabled channels. **Live channels only** pauses observation only after a fresh successful offline report; unknown, failed or stale metadata keeps observation enabled. Without optional metadata credentials every live state stays unknown, so this policy cannot reliably restrict collection to live broadcasts. Policy and channel settings are retained in SQLite.
 
-The original Community-list sampler, calibrated statistical absence and complete viewer discovery remain unsupported by the current source. See the [requirements and remaining acceptance](docs/remaining-work.md) for the explicit gaps.
+Optional **Community collection** is controlled from **Health**. It is disabled by default. Open Twitch sign-in, enter credentials only in the application-owned Twitch window, then enable collection and explicitly resume. Website sign-in is separate from the optional metadata API credentials. The profile is stored beside the database in `community-browser-profile`; `--community-profile` is a developer override for an existing application-owned profile. Browser sessions are never imported.
+
+Community uses one minimized embedded browser and serial jobs. The per-channel target defaults to 300 seconds; a conservative gap of at least 30 seconds separates jobs, with additional time for page loading, persistence and failures. This is an engineering limit, not a published Twitch allowance. Health reports selected/delayed channels and achieved cadence. Authentication, integrity, challenge and rate-limit failures pause this source; IRC health remains separate. Missing names are never classified as departure or absence.
+
+Choose **All sources**, **IRC** or **Community** in history and broadcast search. Community responses have separate receipt pages and cursor IDs. Timeline receipt ticks use the displayed, broadcast-clipped range, support existing title tooltips/drag zoom, and can load further bounded pages. Community-only accounts appear in local suggestions and broadcast search. A receipt means that an account was returned in one response at a locally recorded time; it does not prove video viewing, duration, complete membership, independent sampling or 99% absence.
+
+The shared-host/storage/UI integration is undergoing exact Windows application validation. The finite autonomous source proof passed two channels/two circuits, including three receipts after verified minimization and normal cleanup. These source checks are separate from application release acceptance. See [requirements and remaining acceptance](docs/remaining-work.md).
 
 ## What the history means
 
@@ -110,6 +116,6 @@ It keeps account names only in memory and prints per-channel aggregate JSON afte
 
 Registration sends CAP, PASS, and NICK as separate WebSocket text messages. Twitch rejected the combined registration form in a controlled check; incoming server messages may still contain several IRC lines. Offline fixtures assert this framing, acknowledgement ordering, keepalives, identity checks, reordering, limits, failures, and teardown.
 
-`veylurk-probe` and `veylurk-browser-probe` preserve earlier HTTP and browser experiments. Their CommunityTab route encountered `IntegrityCheckFailed`; the current application does not use that route or obtain integrity tokens. The historical browser bundle can be built explicitly with the Windows workflow's `legacy_browser` manual option. Its Node.js, Playwright, and Chromium downloads are excluded from the normal application workflow. No browser companion or extension is required by Veylurk.
+`veylurk-probe` and `veylurk-browser-probe` preserve earlier HTTP and browser experiments. Their CommunityTab route encountered `IntegrityCheckFailed`; the application does not replay their private requests or obtain integrity tokens. Its optional Community source observes only the normal signed-in embedded page transaction. The historical browser bundle can be built explicitly with the Windows workflow's `legacy_browser` manual option. Its Node.js, Playwright, and Chromium downloads are excluded from the normal application workflow. No browser companion or extension is required by Veylurk.
 
 Veylurk's own source is released under the [Unlicense](LICENSE). Third-party dependencies retain their respective licenses.

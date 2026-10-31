@@ -1,15 +1,19 @@
 # Community collector integration plan
 
-Status: planned, not implemented. Updated 2026-10-31 (Europe/Paris).
+Status: integration in progress, not a qualified application release. Updated 2026-10-31 (Europe/Paris).
 
-Production integration begins only after the isolated finite autonomous popout
-proof passes. Manual WebView2 source access and sign-in persistence have passed;
-the first autonomous attempt stopped on a native timing-contract assumption.
-The timing correction passed 26 Windows tests. Its subsequent popout attempt
-received an integrity denial and stopped without accepting members. A normal
-full-channel control with paused playback and the same observer then accepted
-134 accounts over a correlated network response. Finite automatic rotation
-using that normal route and autonomous live acceptance remain pending.
+The finite autonomous full-channel source gate passed at revision d947fc6c.
+Two circuits over kamet0 and otplol_ returned four accepted HTTP200 samples
+(135,128,136,128 accounts). The last three arrived after the application
+verified its own minimization. The process closed normally, browser-process
+exit was recorded, and the proof process/profile processes were independently
+absent. Exact Windows proof checks passed in run41243918757.
+
+This establishes finite autonomous signed-in source operation. It does not
+establish independent samples, server freshness, complete video-viewer coverage,
+watch time, indefinite authentication or production application acceptance.
+The denied popout route is not used as a fallback. Normal full-channel pages
+with verified paused playback are the accepted route.
 
 ## Backend and lifecycle
 

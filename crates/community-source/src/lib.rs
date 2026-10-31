@@ -606,7 +606,7 @@ mod tests {
         assert!(channel_login(" KaMeT0 ").is_some());
         for invalid in [
             "",
-            "Ã©vil",
+            "évil",
             "../login",
             "name?token=secret",
             "a b",

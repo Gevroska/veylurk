@@ -8,15 +8,28 @@ The owner has authorized implementation of the remaining features. The earlier r
 
 The application collects received public Twitch IRC membership evidence autonomously, with optional official broadcast metadata. It records chat-connected accounts, including some accounts that never post. Chat membership is a different population from video viewers. A connected socket, a NAMES terminator or a viewer-count total does not establish complete membership.
 
-The original Community-panel sampling requirement remains unmet. Historical direct HTTP and autonomous browser experiments did not produce a maintainable working source; the recorded CommunityTab request failed an integrity check. These probes are not a production collector. No integrity or authorization control is bypassed by this implementation.
+Repeated Community sampling is now source-verified in an isolated native Rust
+WebView2 proof; its production application integration remains in progress.
+The owner approved the existing WebView2 runtime and signed in normally using
+a dedicated application-owned profile. No software was installed and no cookies
+were imported. Twitch website sign-in is separate from metadata API credentials.
 
-On 2026-10-31, the owner superseded the anonymous-only requirement and authorized using a dedicated Twitch account. The Chrome for Testing sign-in attempt displayed Twitch's unsupported-browser error; this message does not identify its cause. No replacement browser was installed. The owner then signed in through the in-app Browser. Two native CommunityTab responses on a verified live channel returned 149 and 153 distinct accounts, including 100 viewers each, with 254 accounts in their union and no source errors. These are observations from that browser session; they establish neither autonomous operation nor statistically independent samples.
+Revision d947fc6c passed41 native Windows tests, formatting, strict lint, release
+build and offline CLI checks in run41243918757. Its finite live test completed
+two circuits over kamet0 and otplol_, accepting135,128,136,128 accounts. The last
+three receipts followed verified automatic minimization. Normal browser exit
+and absence of the proof/profile processes were checked independently. A prior
+normal restart also retained sign-in. The denied chat-popout route is excluded.
+These results do not establish sample independence, server freshness, complete
+coverage, absence probabilities, watch time or indefinite authentication.
 
-The owner explicitly approved the existing WebView2 runtime after its Edge engine was explained. An isolated native Rust source proof is under `probes/community-webview2/`; it has its own profile, normal owner-operated sign-in, manually armed bounded samples, and aggregate-only evidence. Its Windows build and live rendering, login, session persistence, Community access, and cleanup are separate acceptance gates. Passwords and verification codes are entered directly into Twitch, never into chat or Veylurk's database. No cookies or other browser sessions are imported. The production collector, credentials, and history remain untouched; periodic Community sampling is not integrated into the application.
-
-The standalone WebView2 source gates passed on 2026-10-31. After normal owner sign-in, revision `e7c1d82f` observed two native CommunityTab responses on live `kamet0`, 31 seconds apart: HTTP 200, no source errors, 134 distinct accounts per response including 100 viewers, 34 shared accounts and a union of 234. Normal shutdown recorded browser-process exit, independently confirmed. Revision `866ce91b` then reused the same application-owned profile and obtained another valid 134-account response without another sign-in. These finite checks establish source access and session persistence across that restart. They do not establish automatic scheduling, indefinite authentication, sample independence, absence probabilities or production acceptance. The next source increment must verify chat-only pages, bounded automatic repeats and multi-channel operation before production integration.
-
-The finite autonomous proof implements bounded circuits and runtime, request-ID/root-frame/generation/trigger correlation, explicit cache uncertainty, and normal cleanup. Revision `d48180c0` passed 26 Windows tests, lint, formatting, release build and offline CLI checks. Its live popout attempt received an integrity denial and stopped after one attempt without accepting members. A separate normal full-channel control with playback visibly paused then accepted 134 accounts, including 100 viewers: HTTP 200, no source errors, a request initiated after the trigger and no reported browser-cache use. This establishes a viable normal route with the current observer, without identifying the cause of the popout denial. Finite automatic rotation using paused full-channel pages remains the next gate; autonomous collection is not yet verified. See [the integration plan](community-integration-plan.md) for the gated storage, lifecycle and UI work. No Community source has been integrated into production.
+The current integration adds a shared native host, separately versioned durable
+Community samples/members, serial scheduling, explicit sign-in/resume controls,
+and source-aware history/broadcast/timeline UI. It defaults to disabled and
+preserves IRC records and metadata credentials. Independent review and exact
+Windows application checks/live tests are still required before this work can
+be described as an accepted application release. Production remains untouched.
+See [the integration plan](community-integration-plan.md).
 
 Official documentation checked on 2026-10-25 states that IRC JOIN/PART delivery is unavailable above 1,000 chat-room users. Get Chatters requires authorized broadcaster/moderator access and the relevant scope; app client credentials alone do not authorize arbitrary third-party channels. See [IRC membership limits](https://dev.twitch.tv/docs/chat/irc/#part-command) and [Get Chatters](https://dev.twitch.tv/docs/api/reference/#get-chatters).
 
@@ -31,16 +44,16 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Rust application on Windows | Implemented; standalone executable and embedded assets, packaged by Windows CI. |
 | Simple English localhost interface | Implemented; listener on 127.0.0.1 with Host/Origin/JSON checks. |
 | Enter a channel list | Implemented; bulk normalization, deduplication, pause/resume/removal, up to 50 tracked channels. History survives removal. |
-| Autonomous operation without Brave or extensions | Implemented with one IRC WebSocket. No browser runtime is needed for collection. |
-| Repeated Community-list samples | Signed-in standalone WebView2 responses and session persistence across a normal restart verified. Chat-only automatic repeats, multi-channel resource bounds and production scheduling remain pending. |
+| Autonomous operation without Brave or extensions | IRC is implemented with one WebSocket. Optional Community integration uses the existing embedded WebView2 runtime; application acceptance is pending. |
+| Repeated Community-list samples | Finite autonomous full-channel rotation, sampling after minimization, normal cleanup and sign-in persistence verified. Shared-host/storage/UI integration and application acceptance are in progress. |
 | Observe silent accounts | Partial source support: NAMES/JOIN/PART can expose nonposting chat-connected accounts; delivery and completeness are unknown. |
 | Discover 100% of video viewers | Unsupported by the available evidence and access rights. |
-| Population-adaptive request cadence | Source-blocked. Current IRC collection is event-driven; joins, retries, network backoff and metadata requests are paced. |
+| Population-adaptive request cadence | Pending validation of source population and independence. Community integration uses a configurable per-channel target, a conservative global30-second start gap, fair scheduling and failure backoff; this is not a Twitch rate allowance. |
 | Detect live state and retain titles/details | Implemented using optional Helix credentials; retains stream identity, start, titles/category/language, viewer-count checks and observed offline checks. Failures and stale checks remain Unknown. |
 | Collect during live broadcasts | Implemented selectable All enabled channels / Live channels only policy, persisted in SQLite. Live-only pauses only after a fresh successful offline check. Unknown or stale metadata keeps observation enabled. |
 | First/last positive observations | Implemented per account/channel evidence visit and broadcast summaries; PART never extends the last positive receipt. |
 | Departure and later return | Evidence-supported visits split at PART and collection boundaries. Post-PART delayed NAMES become ambiguous observation-only segments until a JOIN supports a new visit. All boundaries remain uncertain. |
-| Statistical absence estimates | Source-blocked. Silence alone does not close a visit or prove absence. |
+| Statistical absence estimates | Uncalibrated. Silence alone does not close a visit or prove absence. |
 | Search account to channels/broadcasts and reverse | Implemented exact-login filters, range queries and bounded pagination. Broadcast summaries distinguish positive receipts inside the window from uncertain earlier-connected candidates. |
 | Suggest known account and channel logins while typing | Implemented at `b93c8078`, with bounded local prefix suggestions and mouse/keyboard selection. Windows checks and an owner-approved test rollout passed; existing production was preserved. Suggestions never query Twitch or change collection settings. |
 | Date/time searches | Implemented inclusive From / exclusive Until filters, normalized to UTC with validation. Broadcast intersections cannot leak disjoint time ranges. |

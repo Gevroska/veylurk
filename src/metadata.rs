@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::sync::{watch, RwLock};
 
-const ASSOCIATION: &str = "Positive chat receipts between the reported broadcast start and last confirmed live check are observed evidence. Earlier positive receipts in the same session without a recorded departure or gap are separately labelled uncertain prior-connected inferences. Receipt time is not event occurrence time; no result proves video watching or continuous presence. Collection gaps remain unknown.";
+const ASSOCIATION: &str = "Positive IRC or Community receipts between the reported broadcast start and last confirmed live check are observed evidence. Community receipt counts and timestamps are separate from IRC observations and visits. Earlier IRC receipts in the same session without a recorded departure or gap are separately labelled uncertain prior-connected inferences. Receipt time is not event occurrence time; no result proves video watching or continuous presence. Collection gaps remain unknown.";
 const MAX_STREAM_PAGES: usize = 4;
 const MAX_CURSOR_BYTES: usize = 4096;
 #[path = "metadata_point.rs"]
@@ -130,6 +130,27 @@ struct Search {
     offset: Option<usize>,
     from: Option<String>,
     to: Option<String>,
+    #[serde(default)]
+    source: EvidenceSource,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum EvidenceSource {
+    #[default]
+    All,
+    Irc,
+    Community,
+}
+
+impl EvidenceSource {
+    fn code(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Irc => "irc",
+            Self::Community => "community",
+        }
+    }
 }
 impl Search {
     fn normalized(mut self) -> Result<Self, (StatusCode, Json<Value>)> {
@@ -315,11 +336,14 @@ async fn status(State(service): State<Metadata>) -> ApiResult {
 
 async fn broadcasts(State(service): State<Metadata>, Query(query): Query<Search>) -> ApiResult {
     let query = query.normalized()?;
+    let source = query.source;
     let limit = query.limit.unwrap_or(100) as usize;
+    // Both stored timestamp projections have millisecond precision: <= last_live_at
+    // is exactly the half-open bound < last_live_at + 1 ms, including the last check.
     let mut rows = service.store.call_read(Operation::Query, move |conn| {
-        let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE (?1 IS NULL OR b.channel=?1) AND (?2 IS NULL OR b.id<?2) AND (?3 IS NULL OR EXISTS(SELECT 1 FROM observations o WHERE o.channel=b.channel AND o.account=?3 AND o.kind IN ('names','join') AND o.received_at_utc>=b.started_at AND o.received_at_utc<=b.last_live_at AND (?5 IS NULL OR o.received_at_utc>=?5) AND (?6 IS NULL OR o.received_at_utc<?6)) OR EXISTS(SELECT 1 FROM history_visits v JOIN sessions s ON s.id=v.session_id WHERE v.channel=b.channel AND v.account=?3 AND v.first_observed_at<MAX(b.started_at,COALESCE(?5,b.started_at)) AND v.start_basis<>'uncertain_names' AND v.out_of_order=0 AND COALESCE(v.end_basis,'open')<>'out_of_order' AND (v.closed_at IS NULL OR v.closed_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (s.ended_at IS NULL OR s.ended_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (?6 IS NULL OR MAX(b.started_at,COALESCE(?5,b.started_at))<?6))) AND (?5 IS NULL OR b.last_live_at>=?5) AND (?6 IS NULL OR b.started_at<?6) ORDER BY b.id DESC LIMIT ?4");
+        let sql = format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE (?1 IS NULL OR b.channel=?1) AND (?2 IS NULL OR b.id<?2) AND ((?7<>'community' AND (?3 IS NULL OR EXISTS(SELECT 1 FROM observations o WHERE o.channel=b.channel AND o.account=?3 AND o.kind IN ('names','join') AND o.received_at_utc>=b.started_at AND o.received_at_utc<=b.last_live_at AND (?5 IS NULL OR o.received_at_utc>=?5) AND (?6 IS NULL OR o.received_at_utc<?6)) OR EXISTS(SELECT 1 FROM history_visits v JOIN sessions s ON s.id=v.session_id WHERE v.channel=b.channel AND v.account=?3 AND v.first_observed_at<MAX(b.started_at,COALESCE(?5,b.started_at)) AND v.start_basis<>'uncertain_names' AND v.out_of_order=0 AND COALESCE(v.end_basis,'open')<>'out_of_order' AND (v.closed_at IS NULL OR v.closed_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (s.ended_at IS NULL OR s.ended_at>MAX(b.started_at,COALESCE(?5,b.started_at))) AND (?6 IS NULL OR MAX(b.started_at,COALESCE(?5,b.started_at))<?6)))) OR (?7<>'irc' AND EXISTS(SELECT 1 FROM community_samples cs INDEXED BY community_samples_channel_receipt CROSS JOIN community_members cm ON cm.sample_id=cs.id WHERE cs.channel=b.channel AND cs.outcome='success' AND (?3 IS NULL OR cm.account=?3) AND cs.received_at_utc>=MAX(b.started_at,COALESCE(?5,b.started_at)) AND cs.received_at_utc<=b.last_live_at AND (?6 IS NULL OR cs.received_at_utc<?6)))) AND (?5 IS NULL OR b.last_live_at>=?5) AND (?6 IS NULL OR b.started_at<?6) ORDER BY b.id DESC LIMIT ?4");
         let mut statement = conn.prepare(&sql)?;
-        let rows = statement.query_map(params![query.channel,query.before,query.account,limit+1,query.from,query.to], broadcast_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = statement.query_map(params![query.channel,query.before,query.account,limit+1,query.from,query.to,source.code()], broadcast_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }).await.map_err(database_error)?;
     let more = rows.len() > limit;
@@ -330,7 +354,7 @@ async fn broadcasts(State(service): State<Metadata>, Query(query): Query<Search>
         None
     };
     Ok(Json(
-        json!({"broadcasts":rows,"next_before":next_before,"association_scope":ASSOCIATION}),
+        json!({"broadcasts":rows,"next_before":next_before,"source":source,"association_scope":ASSOCIATION}),
     ))
 }
 
@@ -394,6 +418,24 @@ async fn metadata_history(
 // separately labelled pre-window candidates whose session has no recorded boundary.
 const ACCOUNT_CTE:&str="WITH bounds AS (SELECT *,MAX(started_at,COALESCE(?3,started_at)) AS window_start FROM metadata_broadcasts WHERE id=?1 AND (?3 IS NULL OR last_live_at>=?3) AND (?4 IS NULL OR started_at<?4)), eligible AS (SELECT v.*,b.started_at AS broadcast_start,b.last_live_at AS broadcast_last,b.window_start FROM history_visits v JOIN bounds b ON b.channel=v.channel JOIN sessions s ON s.id=v.session_id WHERE (?2 IS NULL OR v.account=?2) AND v.first_observed_at<=b.last_live_at AND (?4 IS NULL OR v.first_observed_at<?4) AND (EXISTS(SELECT 1 FROM observations o WHERE o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.kind IN ('names','join') AND o.received_at_utc>=b.window_start AND o.received_at_utc<=b.last_live_at AND (?4 IS NULL OR o.received_at_utc<?4)) OR (v.first_observed_at<b.window_start AND (v.closed_at IS NULL OR v.closed_at>b.window_start) AND COALESCE(v.end_basis,'open')<>'out_of_order' AND v.start_basis<>'uncertain_names' AND v.out_of_order=0 AND (s.ended_at IS NULL OR s.ended_at>b.window_start)))), grouped AS (SELECT v.account,MIN(o.received_at_utc) AS first_observed_at,MAX(o.received_at_utc) AS last_observed_at,COUNT(o.id) AS positive_observation_count,COUNT(DISTINCT CASE WHEN v.start_basis<>'uncertain_names' THEN v.id END) AS visit_count,MAX(CASE WHEN v.first_observed_at<v.window_start THEN (SELECT MAX(p.received_at_utc) FROM observations p WHERE p.account=v.account AND p.channel=v.channel AND p.session_id=v.session_id AND p.id>=v.first_observation_id AND p.id<=v.last_observation_id AND p.kind IN ('names','join') AND p.received_at_utc<v.window_start) END) AS prior_observed_at FROM eligible v LEFT JOIN observations o ON o.session_id=v.session_id AND o.channel=v.channel AND o.account=v.account AND o.id>=v.first_observation_id AND o.id<=v.last_observation_id AND o.kind IN ('names','join') AND o.received_at_utc>=v.window_start AND o.received_at_utc<=v.broadcast_last AND (?4 IS NULL OR o.received_at_utc<?4) GROUP BY v.account) ";
 
+// Keep the IRC derivation unchanged. Community contributes receipt aggregates only,
+// never visit counts or inferred intervals; union account names before pagination.
+fn broadcast_account_cte(source: EvidenceSource) -> String {
+    let irc = !matches!(source, EvidenceSource::Community);
+    let community = !matches!(source, EvidenceSource::Irc);
+    format!("{ACCOUNT_CTE}, community_grouped AS (
+        SELECT m.account,COUNT(*) AS community_receipt_count,MIN(s.received_at_utc) AS community_first_received_at,MAX(s.received_at_utc) AS community_last_received_at
+        FROM bounds b CROSS JOIN community_samples s INDEXED BY community_samples_channel_receipt ON s.channel=b.channel
+        CROSS JOIN community_members m ON m.sample_id=s.id
+        WHERE {community} AND s.outcome='success' AND (?2 IS NULL OR m.account=?2)
+        AND s.received_at_utc>=b.window_start AND s.received_at_utc<=b.last_live_at AND (?4 IS NULL OR s.received_at_utc<?4)
+        GROUP BY m.account), account_names AS (
+        SELECT account FROM grouped WHERE {irc} UNION SELECT account FROM community_grouped), combined AS (
+        SELECT n.account,g.first_observed_at,g.last_observed_at,COALESCE(g.positive_observation_count,0) AS positive_observation_count,COALESCE(g.visit_count,0) AS visit_count,g.prior_observed_at,
+        COALESCE(c.community_receipt_count,0) AS community_receipt_count,c.community_first_received_at,c.community_last_received_at,g.account IS NOT NULL AS irc_evidence
+        FROM account_names n LEFT JOIN grouped g ON g.account=n.account AND {irc} LEFT JOIN community_grouped c ON c.account=n.account) ")
+}
+
 async fn broadcast_accounts(
     State(service): State<Metadata>,
     Path(id): Path<i64>,
@@ -408,14 +450,19 @@ async fn broadcast_accounts(
     let result=service.store.call_read(Operation::Query, move|conn| {
         let broadcast=conn.query_row(&format!("SELECT {BROADCAST_COLUMNS} FROM metadata_broadcasts b WHERE b.id=?1"),[id],broadcast_row).optional()?;
         let Some(broadcast)=broadcast else{return Ok(None);};
-        let mut stmt=conn.prepare(&format!("{ACCOUNT_CTE} SELECT account,first_observed_at,last_observed_at,positive_observation_count,visit_count,prior_observed_at FROM grouped ORDER BY account LIMIT ?5 OFFSET ?6"))?;
+        let cte = broadcast_account_cte(query.source);
+        let mut stmt=conn.prepare(&format!("{cte} SELECT account,first_observed_at,last_observed_at,positive_observation_count,visit_count,prior_observed_at,community_receipt_count,community_first_received_at,community_last_received_at,irc_evidence FROM combined ORDER BY account LIMIT ?5 OFFSET ?6"))?;
         let mut rows=stmt.query_map(params![id,query.account,query.from,query.to,limit+1,offset as i64],|r| {
             let positives:i64=r.get(3)?;
-            Ok(json!({"account":r.get::<_,String>(0)?,"first_observed_at":r.get::<_,Option<String>>(1)?,"last_observed_at":r.get::<_,Option<String>>(2)?,"positive_observation_count":positives,"visit_count":r.get::<_,i64>(4)?,"prior_observed_at":r.get::<_,Option<String>>(5)?,"association_basis":if positives>0{"positive_receipts"}else{"prior_connected_inference"},"state":if positives>0{"observed"}else{"inferred"},"uncertain":true,"explanation":ASSOCIATION}))
+            let community:i64=r.get(6)?;
+            let mut sources=Vec::new();
+            if r.get::<_,bool>(9)? { sources.push("irc"); }
+            if community>0 { sources.push("community"); }
+            Ok(json!({"account":r.get::<_,String>(0)?,"first_observed_at":r.get::<_,Option<String>>(1)?,"last_observed_at":r.get::<_,Option<String>>(2)?,"positive_observation_count":positives,"visit_count":r.get::<_,i64>(4)?,"prior_observed_at":r.get::<_,Option<String>>(5)?,"community_receipt_count":community,"community_first_received_at":r.get::<_,Option<String>>(7)?,"community_last_received_at":r.get::<_,Option<String>>(8)?,"sources":sources,"association_basis":if positives>0{"positive_receipts"}else if community>0{"community_receipts"}else{"prior_connected_inference"},"state":if positives>0||community>0{"observed"}else{"inferred"},"uncertain":true,"explanation":ASSOCIATION}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let summary=conn.query_row(&format!("{ACCOUNT_CTE} SELECT COUNT(*),COALESCE(SUM(positive_observation_count>0),0),COALESCE(SUM(positive_observation_count=0),0),COALESCE(SUM(positive_observation_count),0),COALESCE(SUM(visit_count),0) FROM grouped"),params![id,query.account,query.from,query.to],|r|Ok(json!({"account_count":r.get::<_,i64>(0)?,"observed_account_count":r.get::<_,i64>(1)?,"inferred_only_account_count":r.get::<_,i64>(2)?,"positive_observation_count":r.get::<_,i64>(3)?,"visit_count":r.get::<_,i64>(4)?})))?;
+        let summary=conn.query_row(&format!("{cte} SELECT COUNT(*),COALESCE(SUM(positive_observation_count>0 OR community_receipt_count>0),0),COALESCE(SUM(positive_observation_count=0 AND community_receipt_count=0),0),COALESCE(SUM(positive_observation_count),0),COALESCE(SUM(visit_count),0),COALESCE(SUM(community_receipt_count>0),0),COALESCE(SUM(community_receipt_count),0) FROM combined"),params![id,query.account,query.from,query.to],|r|Ok(json!({"account_count":r.get::<_,i64>(0)?,"observed_account_count":r.get::<_,i64>(1)?,"inferred_only_account_count":r.get::<_,i64>(2)?,"positive_observation_count":r.get::<_,i64>(3)?,"visit_count":r.get::<_,i64>(4)?,"community_account_count":r.get::<_,i64>(5)?,"community_receipt_count":r.get::<_,i64>(6)?})))?;
         let more=rows.len()>limit;rows.truncate(limit);
-        Ok(Some(json!({"broadcast":broadcast,"accounts":rows,"summary":summary,"has_more":more,"next_offset":if more{Some(offset+limit)}else{None},"model_version":MODEL_VERSION,"explanation":ASSOCIATION})))
+        Ok(Some(json!({"broadcast":broadcast,"accounts":rows,"summary":summary,"has_more":more,"next_offset":if more{Some(offset+limit)}else{None},"source":query.source,"model_version":MODEL_VERSION,"explanation":ASSOCIATION})))
     }).await.map_err(database_error)?;
     result.map(Json).ok_or_else(|| {
         (
@@ -859,6 +906,10 @@ fn record_check(
 #[cfg(test)]
 #[path = "metadata_http_tests.rs"]
 mod http_tests;
+
+#[cfg(test)]
+#[path = "metadata_community_tests.rs"]
+mod community_tests;
 
 #[cfg(test)]
 mod tests {

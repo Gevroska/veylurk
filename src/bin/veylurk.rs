@@ -4,6 +4,7 @@ use tokio::sync::watch;
 use veylurk_probe::{
     app::{self, AppState},
     collector,
+    community::Community,
     diagnostics::Diagnostics,
     metadata,
     runtime::Runtime,
@@ -28,6 +29,9 @@ struct Args {
     /// Stop gracefully after this duration; omitted for continuous operation.
     #[arg(long,value_parser=clap::value_parser!(u64).range(1..=3600))]
     run_for_seconds: Option<u64>,
+    /// Existing application-owned Community profile; defaults beside the database.
+    #[arg(long)]
+    community_profile: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -71,6 +75,22 @@ async fn run(args: Args, diagnostics: Diagnostics) -> Result<(), String> {
     let runtime = Runtime::initialize(store.clone(), shutdown_tx.clone(), args.port)
         .await
         .map_err(|e| e.to_string())?;
+    let community_profile = args.community_profile.unwrap_or_else(|| {
+        args.database
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("community-browser-profile")
+    });
+    let community_profile = if community_profile.is_absolute() {
+        community_profile
+    } else {
+        std::env::current_dir()
+            .map_err(|_| "working directory is unavailable")?
+            .join(community_profile)
+    };
+    let (community, community_runner) = Community::initialize(store.clone(), community_profile)
+        .await
+        .map_err(|e| e.to_string())?;
     let router = app::router(
         AppState {
             store: store.clone(),
@@ -79,8 +99,23 @@ async fn run(args: Args, diagnostics: Diagnostics) -> Result<(), String> {
             port: args.port,
             configuration: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         },
-        metadata.router().merge(runtime.router()),
+        metadata
+            .router()
+            .merge(runtime.router())
+            .merge(community.router()),
     );
+    let community_selected = selected_rx.clone();
+    let community_shutdown = shutdown_rx.clone();
+    let community_stop = shutdown_tx.clone();
+    let community_task = tokio::spawn(async move {
+        let result = community_runner
+            .run(community_selected, community_shutdown)
+            .await;
+        if result.is_err() {
+            community_stop.send_replace(true);
+        }
+        result
+    });
     let collector_store = store.clone();
     let collector_shutdown = shutdown_rx.clone();
     let collector_stop = shutdown_tx.clone();
@@ -140,6 +175,10 @@ async fn run(args: Args, diagnostics: Diagnostics) -> Result<(), String> {
     policy_task
         .await
         .map_err(|_| "collection policy task failed")?;
+    community_task
+        .await
+        .map_err(|_| "Community coordinator task failed")?
+        .map_err(|_| "Community storage failed")?;
     store.checkpoint().await.map_err(|e| e.to_string())?;
     collector_result?;
     server.map_err(|_| "local HTTP server failed".to_owned())

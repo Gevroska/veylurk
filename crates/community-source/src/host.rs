@@ -115,6 +115,7 @@ struct Admission {
     accepting: bool,
     terminated: bool,
     next_ticket: u64,
+    committed_login: Option<(u64, u64)>,
     accepted: Option<AcceptedJob>,
     completion: Option<HostEvent>,
     terminal: Option<HostEvent>,
@@ -129,6 +130,7 @@ impl Default for Control {
                 accepting: true,
                 terminated: false,
                 next_ticket: 0,
+                committed_login: None,
                 accepted: None,
                 completion: None,
                 terminal: None,
@@ -192,6 +194,24 @@ impl Admission {
 }
 
 impl Control {
+    pub fn login_cancel_version(&self, publication: u64) -> Option<u64> {
+        // A receiver may dequeue before show_login returns, but this lock
+        // fences it until that publication has committed its exact version.
+        let admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !admission.accepting || self.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        admission
+            .committed_login
+            .filter(|(ticket, version)| {
+                *ticket == publication && *version == self.cancel_version.load(Ordering::Acquire)
+            })
+            .map(|(_, version)| version)
+    }
+
     pub fn pending_job(&self) -> Option<AcceptedJob> {
         let admission = self
             .admission
@@ -276,7 +296,7 @@ impl Drop for ServiceExitGuard {
 
 pub(crate) enum QueuedCommand {
     Sample { job: AcceptedJob },
-    ShowLogin { cancel_version: u64 },
+    ShowLogin { publication: u64 },
 }
 
 pub(crate) enum Status {
@@ -381,7 +401,7 @@ impl HostHandle {
     }
 
     pub fn show_login(&self) -> Result<(), CommandError> {
-        let admission = self
+        let mut admission = self
             .control
             .admission
             .lock()
@@ -389,15 +409,23 @@ impl HostHandle {
         if !admission.accepting || self.control.shutdown.load(Ordering::Acquire) {
             return Err(CommandError::Closed);
         }
-        // Publish cancellation before the command can be received. The command
-        // carries that exact version, so a stale timer snapshot cannot undo it.
-        let cancel_version = self.control.cancel_version.fetch_add(1, Ordering::AcqRel) + 1;
+        let publication = admission
+            .next_ticket
+            .checked_add(1)
+            .ok_or(CommandError::Closed)?;
+        // Commit cancellation only after a successful enqueue. Native adoption
+        // resolves the publication under this same lock, so it cannot run
+        // before commit and a rejected enqueue cannot stale an accepted login.
         self.commands
-            .try_send(QueuedCommand::ShowLogin { cancel_version })
+            .try_send(QueuedCommand::ShowLogin { publication })
             .map_err(|error| match error {
                 TrySendError::Full(_) => CommandError::Busy,
                 TrySendError::Disconnected(_) => CommandError::Closed,
-            })
+            })?;
+        let cancel_version = self.control.cancel_version.fetch_add(1, Ordering::AcqRel) + 1;
+        admission.next_ticket = publication;
+        admission.committed_login = Some((publication, cancel_version));
+        Ok(())
     }
 
     /// Independent of command/event queue capacity. The 250ms native timer
@@ -619,27 +647,54 @@ mod tests {
     }
 
     #[test]
-    fn login_version_is_visible_before_the_command_and_later_cancellation_supersedes_it() {
+    fn login_publication_commits_its_version_and_later_cancellation_supersedes_it() {
         let (handle, bridge) = HostHandle::channel();
         let timer_snapshot = bridge.control.cancel_version.load(Ordering::Acquire);
         handle.show_login().unwrap();
-        let QueuedCommand::ShowLogin { cancel_version } = bridge
+        let QueuedCommand::ShowLogin { publication } = bridge
             .commands
             .try_recv()
             .unwrap_or_else(|_| panic!("missing login"))
         else {
             panic!("expected login");
         };
-        assert!(cancel_version > timer_snapshot);
+        let committed = bridge.control.login_cancel_version(publication).unwrap();
+        assert!(committed > timer_snapshot);
         assert_eq!(
             bridge.control.cancel_version.load(Ordering::Acquire),
-            cancel_version
+            committed
         );
         handle.cancel();
-        assert_ne!(
+        assert_eq!(bridge.control.login_cancel_version(publication), None);
+    }
+
+    #[test]
+    fn busy_login_does_not_invalidate_the_earlier_accepted_login_in_a_full_queue() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(30, "room").unwrap();
+        handle.show_login().unwrap();
+        let committed = bridge.control.cancel_version.load(Ordering::Acquire);
+        assert_eq!(handle.show_login(), Err(CommandError::Busy));
+        assert_eq!(
             bridge.control.cancel_version.load(Ordering::Acquire),
-            cancel_version
+            committed
         );
+        let sample = take_job(&bridge);
+        let QueuedCommand::ShowLogin { publication } = bridge
+            .commands
+            .try_recv()
+            .unwrap_or_else(|_| panic!("missing accepted login"))
+        else {
+            panic!("expected login");
+        };
+        assert_eq!(
+            bridge.control.login_cancel_version(publication),
+            Some(committed)
+        );
+        assert_ne!(sample.cancel_version, committed);
+        // A later real Cancel still supersedes the accepted publication.
+        handle.cancel();
+        assert_eq!(bridge.control.login_cancel_version(publication), None);
     }
 
     #[test]

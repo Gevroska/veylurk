@@ -17,6 +17,10 @@ use tokio::sync::{mpsc, oneshot};
 mod suggestions;
 pub use suggestions::SuggestionKind;
 
+#[path = "store_community.rs"]
+mod community;
+pub use community::*;
+
 // Checkpoint less often than SQLite's default 1000 frames: the 50-room retained-history
 // workload measured durable database-file flushes dominating commit time on Windows.
 // At the normal 4096-byte page size this targets about 32 MiB of active WAL. FULL sync
@@ -314,6 +318,7 @@ impl Store {
         let worker_diagnostics = diagnostics.clone();
         let initializing = std::time::Instant::now();
         std::thread::Builder::new().name("veylurk-storage".into()).spawn(move || {
+            let initializing_operation = std::cell::Cell::new(Operation::Initialize);
             let init = || -> Result<(Connection,std::fs::File), StoreError> {
                 if let Some(parent) = worker_path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent).map_err(|_| StoreError::Initialize)?;
@@ -328,6 +333,9 @@ impl Store {
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
                 initialize_schema(&mut conn)?;
                 crate::history::initialize(&mut conn)?;
+                initializing_operation.set(Operation::CommunityInitialize);
+                community::initialize(&mut conn)?;
+                initializing_operation.set(Operation::Initialize);
                 // A process restart closes any session that could not record its own end.
                 conn.execute("UPDATE sessions SET ended_at=COALESCE((SELECT MAX(received_at_utc) FROM observations WHERE session_id=sessions.id),started_at),end_reason='process_interrupted',end_uncertain=1,closed_recorded_at=?1 WHERE ended_at IS NULL", [now()])?;
                 conn.execute("UPDATE history_visits SET end_basis='session_end',end_reason='process_interrupted',closed_at=(SELECT ended_at FROM sessions WHERE id=history_visits.session_id) WHERE end_basis IS NULL AND EXISTS(SELECT 1 FROM sessions WHERE id=history_visits.session_id AND ended_at IS NOT NULL)",[])?;
@@ -344,7 +352,7 @@ impl Store {
                     }
                 }
                 Err(error) => {
-                    worker_diagnostics.storage_failure(Operation::Initialize, JobClass::DurableMutation, &error, initializing.elapsed(), false, None);
+                    worker_diagnostics.storage_failure(initializing_operation.get(), JobClass::DurableMutation, &error, initializing.elapsed(), false, None);
                     let _ = ready_tx.send(Err(error));
                 }
             }

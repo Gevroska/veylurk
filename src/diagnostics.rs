@@ -24,6 +24,8 @@ pub enum Operation {
     MetadataWrite,
     SettingsInitialize,
     SettingsWrite,
+    CommunityInitialize,
+    CommunityAppend,
     Append,
     SessionBegin,
     SessionEnd,
@@ -261,6 +263,7 @@ impl Diagnostics {
                 Operation::Initialize
                     | Operation::MetadataInitialize
                     | Operation::SettingsInitialize
+                    | Operation::CommunityInitialize
             ) {
                 Phase::Initialization
             } else {

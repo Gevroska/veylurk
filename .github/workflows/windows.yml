@@ -90,6 +90,10 @@ jobs:
               Start-Sleep -Milliseconds 100
             }
             if (-not $ready -or $ready.state -ne 'idle' -or $ready.enabled_channels -ne 0 -or $ready.session_count -ne 0 -or $ready.observation_count -ne 0 -or $ready.storage_health -ne 'available') { throw 'Empty application startup status was invalid' }
+            $community = Invoke-RestMethod -Uri "$baseUrl/api/community/status" -TimeoutSec 2
+            if ($community.settings.enabled -or $community.state -ne 'disabled' -or $community.active_channel -or (Test-Path (Join-Path $smokeDirectory 'community-browser-profile'))) { throw 'Disabled Community startup unexpectedly created a browser or job' }
+            $communityReceipts = Invoke-RestMethod -Uri "$baseUrl/api/community/receipts?account=fixture" -TimeoutSec 2
+            if ($communityReceipts.rows.Count -ne 0 -or $null -ne $communityReceipts.next_before_member_id) { throw 'Empty Community history contract was invalid' }
             $metadata = Invoke-RestMethod -Uri "$baseUrl/api/metadata/status" -TimeoutSec 2
             if ($metadata.configured -or $metadata.channels.Count -ne 0) { throw 'Offline smoke unexpectedly enabled metadata' }
             foreach ($kind in @('account', 'channel')) {

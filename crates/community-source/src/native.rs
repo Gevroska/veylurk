@@ -148,7 +148,7 @@ struct State {
     initializing_at: Option<Instant>,
 }
 
-type PendingCompletion = (u64, Result<SourceSample, SourceFailure>);
+type PendingCompletion = (u64, std::result::Result<SourceSample, SourceFailure>);
 
 struct Service {
     bridge: Bridge,
@@ -161,10 +161,10 @@ struct Service {
 }
 
 impl Service {
-    fn accept_login_version(&self, cancel_version: u64) -> bool {
-        if self.bridge.control.cancel_version.load(Ordering::Acquire) != cancel_version {
+    fn accept_login_publication(&self, publication: u64) -> bool {
+        let Some(cancel_version) = self.bridge.control.login_cancel_version(publication) else {
             return false;
-        }
+        };
         *self.last_cancel.borrow_mut() = cancel_version;
         true
     }
@@ -507,11 +507,11 @@ impl App {
                     return;
                 }
                 match command {
-                    QueuedCommand::ShowLogin { cancel_version } => {
+                    QueuedCommand::ShowLogin { publication } => {
                         // The timer may have read the previous version before
                         // this command was published. Adopt the command's
-                        // already-published version before issuing navigation.
-                        if !service.accept_login_version(cancel_version) {
+                        // committed cancellation version before navigation.
+                        if !service.accept_login_publication(publication) {
                             return;
                         }
                         self.cancel_round();
@@ -2608,7 +2608,7 @@ mod lifecycle_tests {
         let service = app.service.as_ref().unwrap();
         assert_eq!(*service.last_cancel.borrow(), 0);
         handle.show_login().unwrap();
-        let QueuedCommand::ShowLogin { cancel_version } = service
+        let QueuedCommand::ShowLogin { publication } = service
             .bridge
             .commands
             .try_recv()
@@ -2617,10 +2617,10 @@ mod lifecycle_tests {
             panic!("expected login");
         };
         assert!(!app.callbacks_allowed());
-        assert!(service.accept_login_version(cancel_version));
+        assert!(service.accept_login_publication(publication));
         assert!(app.callback_current(3, 7));
         handle.cancel();
-        assert!(!service.accept_login_version(cancel_version));
+        assert!(!service.accept_login_publication(publication));
         assert!(!app.callback_current(3, 7));
     }
 

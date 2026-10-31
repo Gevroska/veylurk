@@ -108,6 +108,8 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     if (target.pathname === "/api/channels") return { channels: [{ login: "sample_channel", tracked: true, enabled: true, active_session_id: 1, last_observed_at: received }] };
     if (target.pathname === "/api/metadata/status") return { configured: false, state: "unavailable", channels: [] };
     if (target.pathname === "/api/settings") return { collection_mode: "all", unknown_policy: "collect" };
+    if (target.pathname === "/api/community/status") return communityState();
+    if (target.pathname === "/api/community/receipts") return { rows: [], next_before_member_id: null };
     if (target.pathname === "/api/suggestions") return { kind: target.searchParams.get("kind"), suggestions: [] };
     if (target.pathname === "/api/timeline") return timeline();
     if (target.pathname === "/api/history") return { visits: [], has_more: false, next_offset: null };
@@ -559,6 +561,306 @@ function metadataAt(extra = {}) {
     title: { title: "Stored broadcast title", seen_at: "2026-10-23T11:50:00Z", game_name: "Stored category", language: "en" }, ...extra };
 }
 
+function communityState(extra = {}) {
+  return { settings: { enabled: false, target_interval_seconds: 300 }, state: "disabled", paused: false, last_error: null, active_channel: null, next_channel: null, next_due_at_utc: null, last_received_at_utc: null, selected_channels: 1, delayed_channels: 0, global_start_gap_seconds: 30, achieved_interval_seconds: null, last_returned_accounts: null, cleanup_confirmed: null, ...extra };
+}
+function communityReceipt(memberId, extra = {}) {
+  return { member_id: memberId, sample_id: 700, run_id: 3, job_id: 8, source: "community", channel: "sample_channel", account: "community_account", roles: 36, started_at_utc: "2026-10-23T11:59:59Z", received_at_utc: received, reported_chatters: 200, returned_accounts: 100, categories: { broadcasters: 1, staff: 0, moderators: 4, vips: 5, chatbots: 0, viewers: 90 }, provenance: { transport: "network_response", server_freshness: "unknown", request_after_trigger_verified: true, from_disk_cache: false, from_service_worker: false, from_prefetch_cache: null, served_from_cache_event: false }, ...extra };
+}
+
+test("Community starts disabled without browser actions and reports scheduling limits and safe error codes", async () => {
+  const app = createApp((target) => target.pathname === "/api/community/status" ? communityState({ selected_channels: 50, delayed_channels: 49, achieved_interval_seconds: 1600, last_error: '<img src=x onerror="injected()">', cleanup_confirmed: false }) : undefined);
+  await settle();
+  assert.equal(app.get("community-enabled").value, "false");
+  assert.equal(app.get("community-interval").value, "300");
+  assert.equal(app.get("community-resume").disabled, true);
+  assert.equal(app.calls.some((call) => call.options.method !== "GET"), false);
+  assert.match(app.get("community-status").textContent, /Selected channels50Delayed channels49/);
+  assert.ok(app.get("community-status").textContent.includes(new Intl.NumberFormat().format(1600) + " seconds"));
+  assert.match(app.get("community-status").textContent, /30 seconds minimum between job starts/);
+  assert.match(app.get("community-status").textContent, /Browser shutdown confirmationNot confirmed/);
+  assert.match(app.get("community-status").textContent, /Latest safe error codeunknown/);
+  assert.doesNotMatch(app.get("community-status").textContent, /<img/);
+  assert.match(html, /50 selected channels therefore need at least 25 minutes/);
+  assert.equal(/type="password"/.test(html), false);
+});
+
+test("Community settings validate full writes and preserve unsaved values across refreshes", async () => {
+  let saved = { enabled: false, target_interval_seconds: 300 };
+  const app = createApp((target, options) => {
+    if (target.pathname === "/api/community/status") return communityState({ settings: saved });
+    if (target.pathname === "/api/community/settings") { saved = JSON.parse(options.body); return saved; }
+  });
+  await settle();
+  app.get("community-enabled").value = "true";
+  app.get("community-interval").value = "29";
+  await app.get("community-settings-form").dispatch("submit"); await settle();
+  assert.match(app.get("community-settings-message").textContent, /30 to 86400/);
+  assert.equal(app.calls.some((call) => call.options.method === "PATCH"), false);
+  app.get("community-interval").value = "30";
+  await app.get("community-settings-form").dispatch("submit"); await settle();
+  const patch = app.calls.find((call) => call.target.pathname === "/api/community/settings");
+  assert.equal(patch.options.method, "PATCH");
+  assert.deepEqual(JSON.parse(patch.options.body), { enabled: true, target_interval_seconds: 30 });
+  app.get("community-interval").value = "87";
+  await app.get("community-interval").dispatch("input");
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.equal(app.get("community-interval").value, "87");
+  assert.match(app.get("community-settings-message").textContent, /Save to apply/);
+});
+
+test("a Community write supersedes an older status refresh and triggers a current follow-up", async () => {
+  const old = deferred();
+  let requests = 0, settings = { enabled: false, target_interval_seconds: 300 };
+  const app = createApp((target, options) => {
+    if (target.pathname === "/api/community/status") { requests += 1; return requests === 2 ? old.promise : communityState({ settings }); }
+    if (target.pathname === "/api/community/settings") { settings = JSON.parse(options.body); return { accepted: true }; }
+  });
+  await settle();
+  const refreshing = app.get("refresh-status").dispatch("click"); await settle();
+  app.get("community-enabled").value = "true"; app.get("community-interval").value = "45";
+  await app.get("community-settings-form").dispatch("submit"); await settle();
+  old.resolve(communityState()); await refreshing; await settle();
+  assert.equal(requests, 3);
+  assert.equal(app.get("community-enabled").value, "true");
+  assert.equal(app.get("community-interval").value, "45");
+});
+
+test("Community login and resume are separate explicit actions and duplicate clicks are ignored", async () => {
+  const pending = deferred();
+  let paused = false;
+  const app = createApp((target) => {
+    if (target.pathname === "/api/community/status") return communityState({ settings: { enabled: true, target_interval_seconds: 300 }, paused, state: paused ? "paused_for_login" : "idle" });
+    if (target.pathname === "/api/community/login") { paused = true; return pending.promise; }
+    if (target.pathname === "/api/community/resume") { paused = false; return { accepted: true }; }
+  });
+  await settle();
+  const first = app.get("community-login").dispatch("click");
+  await app.get("community-login").dispatch("click");
+  assert.equal(app.calls.filter((call) => call.target.pathname === "/api/community/login").length, 1);
+  pending.resolve({ accepted: true }); await first; await settle();
+  assert.match(app.get("community-state").textContent, /Paused/);
+  assert.equal(app.get("community-resume").disabled, false);
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/community/resume"), false);
+  await app.get("community-resume").dispatch("click"); await settle();
+  const mutations = app.calls.filter((call) => call.options.method === "POST");
+  assert.deepEqual(mutations.map((call) => [call.target.pathname, JSON.parse(call.options.body)]), [["/api/community/login", {}], ["/api/community/resume", {}]]);
+  assert.equal(app.get("community-state").textContent, "Idle");
+});
+
+test("Community actions require acknowledgement and invalid receipt cursors remain incomplete", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/community/login") return {};
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900)], next_before_member_id: "irc:900" };
+  });
+  await settle();
+  await app.get("community-login").dispatch("click"); await settle();
+  assert.match(app.get("community-settings-message").textContent, /did not acknowledge/);
+  assert.doesNotMatch(app.get("community-settings-message").textContent, /Sign-in requested/);
+  app.get("search-account").value = "community_account"; app.get("search-source").value = "community";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("community-message").textContent, /invalid Community receipt cursor/);
+  assert.match(app.get("timeline-results").textContent, /Community evidence is incomplete/);
+  assert.doesNotMatch(app.get("timeline-results").textContent, /All returned pages/);
+});
+
+test("Community-only accounts render receipt ticks without IRC intervals and use the resolved timeline bounds", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([], { account: "community_account", has_more: true, next_before: 9 });
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900)], next_before_member_id: null };
+  });
+  await settle(); app.get("search-account").value = "community_account"; app.get("search-source").value = "community";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(app.get("irc-history").hidden, true);
+  assert.equal(app.get("community-history").hidden, false);
+  assert.equal(app.calls.some((call) => ["/api/search", "/api/relationships", "/api/history"].includes(call.target.pathname)), false);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-community")).length, 1);
+  assert.equal(descendants(timelineChart(app)).some((item) => item.classList.contains("timeline-inference")), false);
+  assert.equal(app.get("timeline-next").disabled, true);
+  const requests = app.calls.filter((call) => call.target.pathname === "/api/community/receipts");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].target.searchParams.has("from_utc"), false);
+  assert.equal(requests[0].target.searchParams.has("to_utc"), false);
+  assert.equal(requests[1].target.searchParams.get("from_utc"), timelineFrom);
+  assert.equal(requests[1].target.searchParams.get("to_utc"), timelineTo);
+  assert.equal(requests[1].target.searchParams.get("limit"), "100");
+  assert.match(app.get("community-results").textContent, /Moderator, Viewer/);
+  assert.match(app.get("community-results").textContent, /Sample 700 · member 900/);
+  assert.match(app.get("community-results").textContent, /Returned category · Moderators4/);
+  assert.match(app.get("community-results").textContent, /Server freshnessUnknown/);
+});
+
+test("Community ticks use actual receipt times in the half-open axis and never invent boundary receipts", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(901, { received_at_utc: timelineFrom }), communityReceipt(900), communityReceipt(899, { received_at_utc: timelineTo }), communityReceipt(898, { received_at_utc: "2026-10-23T09:59:59Z" })], next_before_member_id: null };
+  });
+  await settle(); app.get("search-account").value = "community_account"; app.get("search-source").value = "community";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const ticks = descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-community"));
+  assert.equal(ticks.length, 2);
+  assert.equal(Number(ticks[0].attributes.x), 178.2);
+  assert.equal(Number(ticks[1].attributes.x), 573.2);
+  assert.equal(descendants(timelineChart(app)).some((item) => item.classList.contains("timeline-inference")), false);
+});
+
+test("Community and IRC page cursors stay independent and IRC source performs no receipt requests", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/search") return { observations: [event(8)], next_before: 8 };
+    if (target.pathname === "/api/community/receipts") return target.searchParams.has("from_utc") ? { rows: [], next_before_member_id: null } : { rows: [communityReceipt(900)], next_before_member_id: target.searchParams.has("before_member_id") ? null : 900 };
+  });
+  await settle(); app.get("search-account").value = "sample_account"; app.get("search-limit").value = "250";
+  await app.get("search-form").dispatch("submit"); await settle();
+  await app.get("community-next").dispatch("click"); await settle();
+  const page = app.calls.find((call) => call.target.searchParams.has("before_member_id"));
+  assert.equal(page.target.searchParams.get("before_member_id"), "900");
+  assert.equal(page.target.searchParams.has("before"), false);
+  assert.equal(page.target.searchParams.get("limit"), "100");
+  assert.equal(app.get("search-page").textContent, "Page 1");
+  await app.get("search-next").dispatch("click"); await settle();
+  assert.equal(app.calls.filter((call) => call.target.pathname === "/api/search").at(-1).target.searchParams.get("before"), "8");
+  const receipts = app.calls.filter((call) => call.target.pathname === "/api/community/receipts").length;
+  app.get("search-source").value = "irc";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(app.calls.filter((call) => call.target.pathname === "/api/community/receipts").length, receipts);
+  assert.equal(app.get("community-history").hidden, true);
+  assert.equal(app.get("irc-history").hidden, false);
+});
+
+test("Community receipt pages reject late searches and keep edited filters visibly stale", async () => {
+  const old = deferred(), current = deferred();
+  const app = createApp((target) => {
+    if (target.pathname === "/api/community/receipts" && !target.searchParams.has("from_utc")) return target.searchParams.get("account") === "old_account" ? old.promise : current.promise;
+  });
+  await settle(); app.get("search-source").value = "community";
+  app.get("search-account").value = "old_account"; await app.get("search-form").dispatch("submit");
+  app.get("search-account").value = "new_account"; await app.get("search-form").dispatch("submit");
+  current.resolve({ rows: [communityReceipt(900, { account: "new_account" })], next_before_member_id: 900 }); await settle();
+  old.resolve({ rows: [communityReceipt(800, { account: "old_account" })], next_before_member_id: null }); await settle();
+  assert.match(app.get("community-results").textContent, /new_account/);
+  assert.doesNotMatch(app.get("community-results").textContent, /old_account/);
+  app.get("search-channel").value = "other_channel"; await app.get("search-channel").dispatch("input");
+  assert.equal(app.get("community-next").disabled, true);
+  assert.equal(app.get("community-results").classList.contains("stale"), true);
+  assert.match(app.get("community-message").textContent, /Filters changed/);
+});
+
+test("Community timeline load-more keeps the fixed axis, adds channels, and preserves zoom", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([], { account: "community_account" });
+    if (target.pathname === "/api/community/receipts") {
+      if (!target.searchParams.has("from_utc")) return { rows: [], next_before_member_id: null };
+      return target.searchParams.has("before_member_id") ? { rows: [communityReceipt(800, { channel: "second_channel", received_at_utc: "2026-10-23T12:01:00Z" })], next_before_member_id: null } : { rows: [communityReceipt(900)], next_before_member_id: 900 };
+    }
+  });
+  await settle(); app.get("search-account").value = "community_account"; app.get("search-source").value = "community";
+  await app.get("search-form").dispatch("submit"); await settle();
+  assert.match(app.get("timeline-results").textContent, /chart is incomplete/);
+  await timelineButton(app, "Zoom in").dispatch("click");
+  const viewport = descendants(app.get("timeline-results")).find((element) => element.id === "timeline-viewport").textContent;
+  await timelineButton(app, "Load more Community ticks").dispatch("click"); await settle();
+  const page = app.calls.find((call) => call.target.searchParams.has("before_member_id"));
+  assert.equal(page.target.searchParams.get("from_utc"), timelineFrom);
+  assert.equal(page.target.searchParams.get("to_utc"), timelineTo);
+  assert.equal(page.target.searchParams.get("before_member_id"), "900");
+  assert.equal(descendants(app.get("timeline-results")).find((element) => element.id === "timeline-viewport").textContent, viewport);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-community")).length, 2);
+  assert.match(app.get("timeline-results").textContent, /second_channel/);
+  assert.match(app.get("timeline-results").textContent, /All returned pages for this query are loaded/);
+});
+
+test("failed Community timeline loading keeps IRC evidence and offers an explicit bounded retry", async () => {
+  let failed = true;
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()]);
+    if (target.pathname === "/api/community/receipts" && target.searchParams.has("from_utc")) return failed ? { httpStatus: 500, error: { message: "Community storage unavailable" } } : { rows: [communityReceipt(900)], next_before_member_id: null };
+  });
+  await searchTimeline(app);
+  assert.match(app.get("timeline-results").textContent, /Community timeline receipts unavailable.*Community evidence is incomplete/);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "CIRCLE").length, 2);
+  failed = false;
+  await timelineButton(app, "Retry Community ticks").dispatch("click"); await settle();
+  const retry = app.calls.filter((call) => call.target.pathname === "/api/community/receipts").at(-1);
+  assert.equal(retry.target.searchParams.get("from_utc"), timelineFrom);
+  assert.equal(retry.target.searchParams.get("to_utc"), timelineTo);
+  assert.equal(retry.target.searchParams.get("limit"), "100");
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-community")).length, 1);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.tagName === "CIRCLE").length, 2);
+});
+
+test("Community tick metadata tooltip keeps exact receipt and sample provenance alongside historical titles", async () => {
+  const hostile = '<img src=x onerror="injected()">';
+  const app = createApp((target) => {
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900, { account: hostile })], next_before_member_id: null };
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt();
+  });
+  await searchTimeline(app); app.navigate("history");
+  const tick = timelineElement(app, "timeline-community");
+  await tick.dispatch("focus"); await app.advance(180);
+  const hover = timelineElement(app, "timeline-hover");
+  assert.match(hover.textContent, /Community source/);
+  assert.match(hover.textContent, /sample 700 · member receipt 900 · job 8/);
+  assert.match(hover.textContent, /2026-10-23T12:00:00.000Z/);
+  assert.match(hover.textContent, /Server freshness unknown/);
+  assert.match(hover.textContent, /Last reported title: Stored broadcast title/);
+  assert.match(hover.textContent, /<img src=x/);
+  assert.equal(descendants(app.get("timeline-results")).some((item) => item.tagName === "IMG"), false);
+});
+
+test("timeline zoom preserves IRC and Community evidence disclosure state independently", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()]);
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900)], next_before_member_id: null };
+  });
+  await searchTimeline(app);
+  let disclosures = descendants(app.get("timeline-results")).filter((element) => element.tagName === "DETAILS" && element.classList.contains("timeline-details"));
+  disclosures[0].open = true; disclosures[1].open = false;
+  await timelineButton(app, "Zoom in").dispatch("click");
+  disclosures = descendants(app.get("timeline-results")).filter((element) => element.tagName === "DETAILS" && element.classList.contains("timeline-details"));
+  assert.equal(disclosures[0].open, true); assert.equal(disclosures[1].open, false);
+  disclosures[0].open = false; disclosures[1].open = true;
+  await timelineButton(app, "Reset zoom").dispatch("click");
+  disclosures = descendants(app.get("timeline-results")).filter((element) => element.tagName === "DETAILS" && element.classList.contains("timeline-details"));
+  assert.equal(disclosures[0].open, false); assert.equal(disclosures[1].open, true);
+});
+
+test("channel-only Community timelines resolve an axis without creating account intervals", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([], { account: "", channel: "sample_channel" });
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900)], next_before_member_id: null };
+  });
+  await settle(); app.get("search-channel").value = "sample_channel"; app.get("search-source").value = "community";
+  await app.get("search-form").dispatch("submit"); await settle();
+  const request = app.calls.find((call) => call.target.pathname === "/api/timeline");
+  assert.equal(request.target.searchParams.has("account"), false);
+  assert.equal(request.target.searchParams.get("channel"), "sample_channel");
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-community")).length, 1);
+  assert.equal(descendants(timelineChart(app)).some((item) => item.classList.contains("timeline-inference")), false);
+  assert.match(app.get("timeline-results").textContent, /community_account/);
+});
+
+test("Community-only broadcast lookup and timeline receipts use the selected source and clipped range", async () => {
+  const clippedFrom = "2026-10-23T11:30:00.000Z", clippedTo = "2026-10-23T12:30:00.001Z";
+  const app = createApp((target) => {
+    if (target.pathname === "/api/broadcasts") return { broadcasts: [{ id: 9, channel: "sample_channel", title: "Stored broadcast", started_at: clippedFrom, last_live_at: "2026-10-23T12:30:00Z" }], next_before: null };
+    if (target.pathname === "/api/timeline") return timeline([], { account: "community_account", effective_range: { from: clippedFrom, to: clippedTo }, broadcast: { id: 9, channel: "sample_channel", started_at: clippedFrom, last_live_at: "2026-10-23T12:30:00Z" } });
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900)], next_before_member_id: null };
+  });
+  await settle(); app.get("broadcasts-account").value = "community_account"; app.get("broadcasts-source").value = "community";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  assert.equal(app.calls.find((call) => call.target.pathname === "/api/broadcasts").target.searchParams.get("source"), "community");
+  const open = descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events");
+  await open.dispatch("click"); await settle();
+  const requests = app.calls.filter((call) => call.target.pathname === "/api/community/receipts");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].target.searchParams.get("broadcast_id"), "9");
+  assert.equal(requests[1].target.searchParams.get("from_utc"), clippedFrom);
+  assert.equal(requests[1].target.searchParams.get("to_utc"), clippedTo);
+  assert.equal(app.get("broadcast-community").hidden, false);
+  assert.equal(app.get("broadcast-irc-evidence").hidden, true);
+  assert.equal(descendants(timelineChart(app, "broadcast-timeline")).filter((item) => item.classList.contains("timeline-community")).length, 1);
+});
+
 test("timeline receipt hover debounces exact positive times and keeps historical titles and metadata times distinct", async () => {
   const hostile = '<img src=x onerror="injected()">';
   const app = createApp((target) => {
@@ -966,8 +1268,9 @@ test("separate sessions, ambiguous segments, out-of-order evidence and PART-only
   assert.match(app.get("timeline-results").textContent, /PART only/);
 });
 
-test("timeline empty evidence remains unknown and channel-only searches require an account", async () => {
+test("IRC timeline empty evidence remains unknown and IRC channel-only searches require an account", async () => {
   const app = createApp(); await settle();
+  app.get("search-source").value = "irc";
   app.get("search-channel").value = "sample_channel";
   await app.get("search-form").dispatch("submit"); await settle();
   assert.equal(app.calls.some((item) => item.target.pathname === "/api/timeline"), false);
@@ -981,12 +1284,13 @@ test("timeline empty evidence remains unknown and channel-only searches require 
   assert.equal(descendants(app.get("timeline-results")).filter((item) => item.classList.contains("timeline-unknown")).length, 1);
 });
 
-test("broadcast timeline requires an exact account and requests only the selected broadcast and time bounds", async () => {
+test("IRC broadcast timeline requires an exact account and requests only the selected broadcast and time bounds", async () => {
   const app = createApp((target) => {
     if (target.pathname === "/api/broadcasts") return { broadcasts: [{ id: 9, channel: "sample_channel", title: "A title", started_at: timelineFrom, last_live_at: timelineTo }], next_before: null };
     if (target.pathname === "/api/timeline") return timeline([timelineVisit()], { broadcast: { id: 9, channel: "sample_channel", started_at: timelineFrom, last_live_at: timelineTo } });
   });
   await settle();
+  app.get("broadcasts-source").value = "irc";
   await app.get("broadcasts-form").dispatch("submit"); await settle();
   let open = descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events");
   await open.dispatch("click"); await settle();
@@ -1103,6 +1407,7 @@ test("a channel-only search clears an in-flight account timeline without a late 
   const pending = deferred();
   const app = createApp((target) => target.pathname === "/api/timeline" ? pending.promise : undefined);
   await settle(); app.get("search-account").value = "sample_account";
+  app.get("search-source").value = "irc";
   await app.get("search-form").dispatch("submit");
   app.get("search-account").value = ""; app.get("search-channel").value = "sample_channel";
   await app.get("search-form").dispatch("submit");
