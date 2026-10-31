@@ -13,9 +13,9 @@ use std::{
 };
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
-    core::{w, Interface, PCWSTR, PWSTR},
+    core::{w, Interface, BOOL, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{BOOL, E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{E_UNEXPECTED, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::{Com::*, LibraryLoader::GetModuleHandleW},
         UI::WindowsAndMessaging::*,
     },
