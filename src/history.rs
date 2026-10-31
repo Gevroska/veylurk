@@ -859,12 +859,29 @@ mod tests {
             metadata_querying.elapsed()
         );
         let closing = std::time::Instant::now();
-        for session in sessions {
-            store
-                .end_session(session, "fixture_shutdown".into())
-                .await
-                .unwrap();
-        }
+        // Match terminal collector cleanup: preserve each explicit cutoff and reason
+        // while closing the bounded room set in one durable transaction.
+        let session_ends = sessions
+            .into_iter()
+            .map(|session_id| crate::store::SessionEnd {
+                session_id,
+                reason: "fixture_shutdown".into(),
+                source_at: Some(crate::store::now()),
+            })
+            .collect::<Vec<_>>();
+        let expected_sessions = session_ends
+            .iter()
+            .map(|end| {
+                (
+                    end.session_id,
+                    end.source_at.clone().unwrap(),
+                    end.reason.clone(),
+                    false,
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        store.end_sessions(session_ends).await.unwrap();
         store.checkpoint().await.unwrap();
         assert_eq!(
             std::fs::metadata(format!("{}-wal", path.display()))
@@ -892,6 +909,25 @@ mod tests {
             reopened.stats().await.unwrap().observation_count,
             channels as i64 * 2200
         );
+        let persisted_sessions = reopened
+            .call(|conn| {
+                let mut statement = conn.prepare("SELECT id,ended_at,end_reason,end_uncertain,closed_recorded_at IS NOT NULL FROM sessions ORDER BY id")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, bool>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(persisted_sessions, expected_sessions);
         assert_eq!(
             reopened
                 .visits(VisitQuery {
