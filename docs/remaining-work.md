@@ -9,7 +9,7 @@ The owner has authorized implementation of the remaining features. The earlier r
 The application collects received public Twitch IRC membership evidence autonomously, with optional official broadcast metadata. It records chat-connected accounts, including some accounts that never post. Chat membership is a different population from video viewers. A connected socket, a NAMES terminator or a viewer-count total does not establish complete membership.
 
 Repeated Community sampling is now source-verified in an isolated native Rust
-WebView2 proof; its production application integration remains in progress.
+WebView2 proof; its application integration is now implemented and verified on isolated Windows data.
 The owner approved the existing WebView2 runtime and signed in normally using
 a dedicated application-owned profile. No software was installed and no cookies
 were imported. Twitch website sign-in is separate from metadata API credentials.
@@ -23,12 +23,14 @@ normal restart also retained sign-in. The denied chat-popout route is excluded.
 These results do not establish sample independence, server freshness, complete
 coverage, absence probabilities, watch time or indefinite authentication.
 
-The current integration adds a shared native host, separately versioned durable
+The application now includes a shared native host, separately versioned durable
 Community samples/members, serial scheduling, explicit sign-in/resume controls,
 and source-aware history/broadcast/timeline UI. It defaults to disabled and
 preserves IRC records and metadata credentials. Independent review and exact
-Windows application checks/live tests are still required before this work can
-be described as an accepted application release. Production remains untouched.
+Windows checks passed at revision `43831ae`. A four-minute isolated test accepted
+seven samples across two live channels and 737 member receipts, then confirmed
+normal browser cleanup. Restart reused the website session and API credentials.
+The original history/credentials and production installation remained untouched.
 See [the integration plan](community-integration-plan.md).
 
 Official documentation checked on 2026-10-25 states that IRC JOIN/PART delivery is unavailable above 1,000 chat-room users. Get Chatters requires authorized broadcaster/moderator access and the relevant scope; app client credentials alone do not authorize arbitrary third-party channels. See [IRC membership limits](https://dev.twitch.tv/docs/chat/irc/#part-command) and [Get Chatters](https://dev.twitch.tv/docs/api/reference/#get-chatters).
@@ -44,8 +46,8 @@ For independent uniform samples of size k from a fixed population N, the conditi
 | Rust application on Windows | Implemented; standalone executable and embedded assets, packaged by Windows CI. |
 | Simple English localhost interface | Implemented; listener on 127.0.0.1 with Host/Origin/JSON checks. |
 | Enter a channel list | Implemented; bulk normalization, deduplication, pause/resume/removal, up to 50 tracked channels. History survives removal. |
-| Autonomous operation without Brave or extensions | IRC is implemented with one WebSocket. Optional Community integration uses the existing embedded WebView2 runtime; application acceptance is pending. |
-| Repeated Community-list samples | Finite autonomous full-channel rotation, sampling after minimization, normal cleanup and sign-in persistence verified. Shared-host/storage/UI integration and application acceptance are in progress. |
+| Autonomous operation without Brave or extensions | IRC is implemented with one WebSocket. Optional Community integration uses the existing embedded WebView2 runtime; isolated application acceptance passed at `43831ae`. |
+| Repeated Community-list samples | Finite autonomous full-channel rotation, sampling after minimization, normal cleanup and sign-in persistence verified. Shared-host/storage/UI integration is implemented; isolated application acceptance passed at `43831ae`. |
 | Observe silent accounts | Partial source support: NAMES/JOIN/PART can expose nonposting chat-connected accounts; delivery and completeness are unknown. |
 | Discover 100% of video viewers | Unsupported by the available evidence and access rights. |
 | Population-adaptive request cadence | Pending validation of source population and independence. Community integration uses a configurable per-channel target, a conservative global30-second start gap, fair scheduling and failure backoff; this is not a Twitch rate allowance. |

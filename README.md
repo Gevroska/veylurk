@@ -40,7 +40,7 @@ Community uses one minimized embedded browser and serial jobs. The per-channel t
 
 Choose **All sources**, **IRC** or **Community** in history and broadcast search. Community responses have separate receipt pages and cursor IDs. Timeline receipt ticks use the displayed, broadcast-clipped range, support existing title tooltips/drag zoom, and can load further bounded pages. Community-only accounts appear in local suggestions and broadcast search. A receipt means that an account was returned in one response at a locally recorded time; it does not prove video viewing, duration, complete membership, independent sampling or 99% absence.
 
-The shared-host/storage/UI integration is undergoing exact Windows application validation. The finite autonomous source proof passed two channels/two circuits, including three receipts after verified minimization and normal cleanup. These source checks are separate from application release acceptance. See [requirements and remaining acceptance](docs/remaining-work.md).
+The integration passed Windows checks and a four-minute isolated application test at revision `43831ae`: seven successful samples across two live channels, 737 member receipts, working source-aware search and clean browser shutdown. A normal restart reused the website session and saved metadata credentials. This is finite acceptance, not an endurance or completeness guarantee. Production installations are upgraded separately by their owner. See [requirements and remaining acceptance](docs/remaining-work.md).
 
 ## What the history means
 

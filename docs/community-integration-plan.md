@@ -1,6 +1,6 @@
 # Community collector integration plan
 
-Status: integration in progress, not a qualified application release. Updated 2026-10-31 (Europe/Paris).
+Status: implemented and accepted in an isolated Windows application test. Updated 2026-10-31 (Europe/Paris).
 
 The finite autonomous full-channel source gate passed at revision d947fc6c.
 Two circuits over kamet0 and otplol_ returned four accepted HTTP200 samples
@@ -14,6 +14,29 @@ establish independent samples, server freshness, complete video-viewer coverage,
 watch time, indefinite authentication or production application acceptance.
 The denied popout route is not used as a fallback. Normal full-channel pages
 with verified paused playback are the accepted route.
+
+## Application acceptance
+
+Revision `43831ae26982df0c3a9e719a5909e2463a5571d3` passed Windows workflow
+[41248512390](https://github.com/Gevroska/veylurk/actions/runs/41248512390), including
+strict lint, 179 library tests, binary tests, isolated buffered-storage recovery,
+10/25/50-channel synthetic workloads, packaging and startup/backup checks.
+The unchanged shared source passed 53 tests in workflow 41247581479; the UI passed 73.
+
+A 240-second isolated application run on port 8796 reused saved metadata credentials
+and the signed-in application-owned profile. It retained the copied legacy history,
+accepted seven samples over normanajari and strano, saved 737 member receipts,
+and passed account/channel search, independent pagination, broadcast association,
+resolved timeline-range and historical-title checks. It exited normally with no
+pending attempts, SQLite integrity `ok`, and zero profile processes remaining.
+A normal restart obtained another sample without another sign-in or API entry.
+Original test history/credentials and the production instance on 8795 were unchanged.
+
+A separate short, offline release workload retained 110,000 synthetic IRC records
+across 50 channels in 51.92 seconds with all correctness checks passing. This is
+storage evidence, not live browser throughput. One 15.24-second waiting-state
+resource point observed nine stable processes, 1022 MiB private memory and 2.94%
+of 16 logical CPUs for the app and its descendants; it is not sustained usage.
 
 ## Backend and lifecycle
 
