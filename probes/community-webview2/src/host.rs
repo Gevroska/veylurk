@@ -92,7 +92,7 @@ struct State {
     network_enabled: bool,
     network_pending: bool,
     navigation_ready: bool,
-    navigation_id: Option<u64>,
+    navigation_gate: sampling::NavigationGate,
     frame_id: Option<String>,
     schedule: Option<Schedule>,
     auto_stage: Option<AutoStage>,
@@ -240,6 +240,12 @@ impl App {
         self.cancel_round();
         self.disable_network();
         self.record_action("local_render_check");
+        {
+            let mut state = self.state.borrow_mut();
+            let intent = state.navigation_gate.begin();
+            state.navigation_gate.issue(intent);
+            state.navigation_ready = false;
+        }
         let core = self
             .engine
             .borrow()
@@ -343,7 +349,11 @@ impl App {
     // login or another origin, including queued old callbacks.
     fn navigate(self: &Rc<Self>, url: String) {
         self.disable_network();
-        self.state.borrow_mut().navigation_ready = false;
+        let intent = {
+            let mut state = self.state.borrow_mut();
+            state.navigation_ready = false;
+            state.navigation_gate.begin()
+        };
         let generation = self.state.borrow().generation;
         let weak = Rc::downgrade(self);
         let done =
@@ -362,6 +372,9 @@ impl App {
                         return Ok(());
                     }
                     if let Some(core) = app.core() {
+                        if !app.state.borrow_mut().navigation_gate.issue(intent) {
+                            return Ok(());
+                        }
                         let url = wide(&url);
                         if unsafe { core.Navigate(PCWSTR(url.as_ptr())) }.is_err() {
                             app.fail(
@@ -844,6 +857,28 @@ impl App {
                     );
                     return Ok(());
                 }
+                let verified = {
+                    let state = app.state.borrow();
+                    state
+                        .tracker
+                        .as_ref()
+                        .ok_or("missing_request_tracker")
+                        .and_then(|tracker| tracker.complete_body(generation, &body.id))
+                };
+                let verified = match verified {
+                    Ok(verified) => verified,
+                    Err("http_denied") => {
+                        app.sample_failure(Failure::HttpDenied);
+                        return Ok(());
+                    }
+                    Err(code) => {
+                        app.fail(
+                            code,
+                            "Native response identity changed before body acceptance.",
+                        );
+                        return Ok(());
+                    }
+                };
                 let bytes = match sampling::response_body(&json) {
                     Ok(bytes) => bytes,
                     Err(code) => {
@@ -854,10 +889,10 @@ impl App {
                         return Ok(());
                     }
                 };
-                let parsed = parse_response(&bytes, &body.selection, body.status);
+                let parsed = parse_response(&bytes, &verified.selection, verified.status);
                 drop(bytes);
                 match parsed {
-                    Ok(parsed) => app.accept_sample(parsed, &body),
+                    Ok(parsed) => app.accept_sample(parsed, &verified),
                     Err(failure) => app.sample_failure(failure),
                 }
                 Ok(())
@@ -947,7 +982,8 @@ impl App {
             return;
         }
         if stop || expired || complete {
-            if expired
+            if !stop
+                && expired
                 && self
                     .state
                     .borrow()
@@ -958,14 +994,15 @@ impl App {
                 self.end_auto_attempt("run_deadline", true);
             }
             if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
-                if expired {
-                    run.status = "run_deadline";
-                } else if complete {
-                    run.status = if run.source_samples_received == run.attempts.len() {
+                if !stop && expired {
+                    run.finalize(now, "run_deadline");
+                } else if !stop && complete {
+                    let reason = if run.source_samples_received == run.attempts.len() {
                         "circuits_completed_with_samples"
                     } else {
                         "circuits_completed_with_gaps"
                     };
+                    run.finalize(now, reason);
                 }
             }
             self.close();
@@ -1038,6 +1075,9 @@ impl App {
     fn close(&self) {
         if self.state.borrow().closing_at.is_some() {
             return;
+        }
+        if let Some(run) = self.evidence.borrow_mut().autonomous.as_mut() {
+            run.finalize(self.elapsed_ms(), "operator_cancelled");
         }
         self.cancel_round();
         self.state.borrow_mut().closing_at = Some(Instant::now());
@@ -1139,7 +1179,7 @@ thread_local! {
 
 /// Inspect at most the configured UTF-16 length before making an owned copy.
 /// Free the COM allocation on every path; do not retain raw event JSON.
-unsafe fn bounded_pwstr(value: PWSTR, cap: usize) -> Result<String, &'static str> {
+unsafe fn bounded_pwstr(value: PWSTR, cap: usize) -> std::result::Result<String, &'static str> {
     if value.is_null() {
         return Err("native_event_unavailable");
     }
@@ -1282,12 +1322,15 @@ unsafe fn attach(
     let weak = Rc::downgrade(app);
     let navigation_handler = NavigationStartingEventHandler::create(Box::new(move |_, args| {
         if let Some(app) = weak.upgrade() {
-            app.navigation_changed();
+            let Some(args) = args else {
+                return Ok(());
+            };
             let mut id = 0;
-            if let Some(args) = args {
-                args.NavigationId(&mut id)?;
+            args.NavigationId(&mut id)?;
+            if !app.state.borrow_mut().navigation_gate.started(id) {
+                return Ok(());
             }
-            app.state.borrow_mut().navigation_id = Some(id);
+            app.navigation_changed();
             {
                 let mut evidence = app.evidence.borrow_mut();
                 evidence.browser_diagnostics.navigation_started_count += 1;
@@ -1302,7 +1345,9 @@ unsafe fn attach(
     let weak = Rc::downgrade(app);
     let source_handler = SourceChangedEventHandler::create(Box::new(move |_, _| {
         if let Some(app) = weak.upgrade() {
-            app.navigation_changed();
+            if app.state.borrow().navigation_gate.has_started() {
+                app.navigation_changed();
+            }
         }
         Ok(())
     }));
@@ -1321,7 +1366,7 @@ unsafe fn attach(
                 args.IsSuccess(&mut success)?;
                 args.WebErrorStatus(&mut error)?;
                 args.NavigationId(&mut id)?;
-                let current = app.state.borrow().navigation_id == Some(id);
+                let current = app.state.borrow().navigation_gate.completed(id);
                 if current {
                     app.state.borrow_mut().navigation_ready = success.as_bool();
                 }

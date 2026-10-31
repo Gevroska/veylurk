@@ -14,6 +14,44 @@ pub const BODY_ENVELOPE_CAP: usize = RESPONSE_CAP * 6 + 1024;
 pub const MAX_EVENTS: usize = 2048;
 pub const MAX_CANDIDATES: usize = 4;
 
+/// A navigation intent invalidates the previous ID before asynchronous observer
+/// shutdown. Only an issued current intent can acquire a NavigationStarting ID.
+#[derive(Default)]
+pub struct NavigationGate {
+    intent: u64,
+    issued: bool,
+    started_id: Option<u64>,
+}
+
+impl NavigationGate {
+    pub fn begin(&mut self) -> u64 {
+        self.intent += 1;
+        self.issued = false;
+        self.started_id = None;
+        self.intent
+    }
+    pub fn issue(&mut self, intent: u64) -> bool {
+        if intent != self.intent {
+            return false;
+        }
+        self.issued = true;
+        true
+    }
+    pub fn started(&mut self, id: u64) -> bool {
+        if !self.issued {
+            return false;
+        }
+        self.started_id = Some(id);
+        true
+    }
+    pub fn has_started(&self) -> bool {
+        self.issued && self.started_id.is_some()
+    }
+    pub fn completed(&self, id: u64) -> bool {
+        self.issued && self.started_id == Some(id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub channels: Vec<String>,
@@ -328,7 +366,6 @@ impl Tracker {
     }
     pub fn request(&mut self, generation: u64, value: RequestEvent) -> Result<(), &'static str> {
         if generation != self.generation
-            || self.body_taken
             || !is_source_uri(&value.request.url)
             || value.request.method != "POST"
             || !is_channel_page(&value.document_url, &self.channel)
@@ -386,6 +423,9 @@ impl Tracker {
             cached: false,
             failed: false,
         });
+        if self.body_taken {
+            return Err("ambiguous_native_source");
+        }
         Ok(())
     }
     pub fn response(&mut self, generation: u64, value: ResponseEvent) -> Result<(), &'static str> {
@@ -446,10 +486,7 @@ impl Tracker {
             candidate.failed = true;
         }
     }
-    pub fn take_ready(&mut self) -> Result<Option<BodyRequest>, &'static str> {
-        if self.body_taken {
-            return Ok(None);
-        }
+    fn ready(&self) -> Result<Option<BodyRequest>, &'static str> {
         let Some(trigger) = self.trigger else {
             return Ok(None);
         };
@@ -526,8 +563,29 @@ impl Tracker {
                 server_freshness: "unknown",
             },
         };
-        self.body_taken = true;
         Ok(Some(result))
+    }
+
+    pub fn take_ready(&mut self) -> Result<Option<BodyRequest>, &'static str> {
+        let ready = self.ready()?;
+        if self.body_taken {
+            return Ok(None);
+        }
+        self.body_taken = ready.is_some();
+        Ok(ready)
+    }
+
+    /// Recheck all events received while the asynchronous body read was pending.
+    /// This also refreshes late cache evidence before aggregate acceptance.
+    pub fn complete_body(&self, generation: u64, id: &str) -> Result<BodyRequest, &'static str> {
+        if generation != self.generation || !self.body_taken {
+            return Err("stale_native_body_callback");
+        }
+        let ready = self.ready()?.ok_or("native_body_identity_unavailable")?;
+        if ready.id != id {
+            return Err("native_body_identity_mismatch");
+        }
+        Ok(ready)
     }
 }
 
@@ -629,8 +687,16 @@ impl RunEvidence {
     }
     pub fn finish(&mut self, now: u64, status: &'static str) {
         if let Some(a) = self.attempts.last_mut() {
-            a.ended_ms = Some(now);
-            a.status = status;
+            if a.ended_ms.is_none() {
+                a.ended_ms = Some(now);
+                a.status = status;
+            }
+        }
+    }
+    pub fn finalize(&mut self, now: u64, reason: &'static str) {
+        if matches!(self.status, "starting" | "running") {
+            self.finish(now, reason);
+            self.status = reason;
         }
     }
     pub fn sample(&mut self, parsed: ParsedSample, body: &BodyRequest) {
@@ -662,6 +728,101 @@ impl RunEvidence {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn new_navigation_intent_rejects_old_completion_before_and_after_issue() {
+        let mut gate = NavigationGate::default();
+        let a = gate.begin();
+        assert!(gate.issue(a));
+        assert!(gate.started(100));
+        assert!(gate.completed(100));
+        let b = gate.begin();
+        assert!(!gate.completed(100));
+        assert!(!gate.started(100));
+        assert!(!gate.issue(a));
+        assert!(gate.issue(b));
+        assert!(!gate.completed(100));
+        assert!(gate.started(200));
+        assert!(!gate.completed(100));
+        assert!(gate.completed(200));
+    }
+
+    #[test]
+    fn late_second_source_request_invalidates_pending_body_completion() {
+        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        tracker.set_trigger(100_000.0).unwrap();
+        tracker.request(2, req("first", 101.0)).unwrap();
+        tracker.response(2, resp("first", Some(false))).unwrap();
+        tracker.finished(2, finish("first")).unwrap();
+        let pending = tracker.take_ready().unwrap().unwrap();
+        assert_eq!(
+            tracker.request(2, req("second", 102.0)).unwrap_err(),
+            "ambiguous_native_source"
+        );
+        let mut denial = resp("second", Some(false));
+        denial.response.status = 403;
+        tracker.response(2, denial).unwrap();
+        assert_eq!(
+            tracker.complete_body(2, &pending.id).unwrap_err(),
+            "ambiguous_native_source"
+        );
+        assert_eq!(
+            tracker.complete_body(1, &pending.id).unwrap_err(),
+            "stale_native_body_callback"
+        );
+    }
+
+    #[test]
+    fn pending_body_rechecks_late_cache_or_failure_events() {
+        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        tracker.set_trigger(100_000.0).unwrap();
+        tracker.request(2, req("first", 101.0)).unwrap();
+        tracker.response(2, resp("first", Some(false))).unwrap();
+        tracker.finished(2, finish("first")).unwrap();
+        let pending = tracker.take_ready().unwrap().unwrap();
+        tracker.cached("first");
+        assert_eq!(
+            tracker
+                .complete_body(2, &pending.id)
+                .unwrap()
+                .provenance
+                .transport,
+            "cache_or_service_worker"
+        );
+        tracker.failed("first");
+        assert_eq!(
+            tracker.complete_body(2, &pending.id).unwrap_err(),
+            "native_loading_failed"
+        );
+    }
+
+    #[test]
+    fn closing_finalizes_active_attempt_and_preserves_terminal_failure() {
+        let config = Config::new(vec!["a".into(), "b".into()], 1, 60).unwrap();
+        let attempt = Attempt {
+            sequence: 2,
+            circuit: 1,
+            channel: "b".into(),
+            started_ms: 30_000,
+        };
+        let mut cancelled = RunEvidence::new(&config);
+        cancelled.start(attempt.clone());
+        cancelled.status = "running";
+        cancelled.finalize(31_000, "operator_cancelled");
+        assert_eq!(cancelled.status, "operator_cancelled");
+        assert_eq!(cancelled.attempts[0].ended_ms, Some(31_000));
+        assert_eq!(cancelled.attempts[0].status, "operator_cancelled");
+        let mut denied = RunEvidence::new(&config);
+        denied.start(attempt);
+        denied.finish(31_000, "integrity_denied");
+        denied.status = "integrity_denied";
+        denied.finalize(32_000, "circuits_completed_with_gaps");
+        denied.finalize(33_000, "operator_cancelled");
+        denied.finish(34_000, "run_deadline");
+        assert_eq!(denied.status, "integrity_denied");
+        assert_eq!(denied.attempts[0].ended_ms, Some(31_000));
+        assert_eq!(denied.attempts[0].status, "integrity_denied");
+    }
     fn req(id: &str, wall: f64) -> RequestEvent {
         event(&json!({"requestId":id,"frameId":"top","documentURL":"https://www.twitch.tv/popout/test/chat","timestamp":20.0,"wallTime":wall,"request":{"url":"https://gql.twitch.tv/gql","method":"POST","postData":"{\"operationName\":\"CommunityTab\",\"variables\":{\"login\":\"test\"}}","headers":{"Authorization":"secret"}}}).to_string()).unwrap()
     }
