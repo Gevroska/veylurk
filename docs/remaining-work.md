@@ -1,6 +1,6 @@
 # Requirements and remaining work
 
-Updated: 2026-11-01 (Europe/Paris).
+Updated: 2026-11-02 (Europe/Paris).
 
 The owner has authorized implementation of the remaining features. The earlier review-only restriction and Astra-only allocation are superseded. Current AGENTS.md governs coordination: Sol High/XHigh handles implementation, testing, integration and delivery; Astra XHigh receives bounded complex scoping or critical analysis when justified.
 
@@ -381,11 +381,12 @@ at source `3a685ed14897bc5e7247f0651a8f5147d5d95334`. The
 browser-free private memory and a 467 MiB observed peak in the separate C:
 database trial. The browser is released between samples.
 
-Full 24-channel resource qualification remains partial: the R: run stopped after
-12 accepted receipts on probe stalls, and the C: run stopped after 21 when
+At that revision, full 24-channel resource qualification remained partial: the
+R: run stopped after 12 accepted receipts on probe stalls, and the C: run stopped after 21 when
 process metrics became unavailable. All recorded receipts were independently
 verified; neither interrupted run was reclassified as passing. R: responsiveness
-and the transient measurement failure remain open findings. These changes do not
+remained unresolved. The corrected C: circuit is recorded in the next section;
+R: load responsiveness remains unqualified. These changes do not
 establish empirical 99% presence calibration.
 
 Both retained-history prefixes matched, the complete latest test database was
@@ -401,24 +402,37 @@ the correction uses a hidden native host while retaining WebView2 rendering.
 Native visibility transitions have independent source review and exact Windows
 CI: 99 native tests and the complete application workflow passed at source
 `881ccdd8fd3c6b5d5280df308ede5dc643ab889a`. A fresh anonymous profile loaded
-chat/Community while hidden and accepted no sample. Authenticated collection and
-the visible sign-in workflow remain unqualified: the restored profile received
-an integrity-related selected GraphQL error, and subsequent sign-in navigation
-reported WebView2 `ConnectionAborted`. The source pause remains retained; owner
-desktop observation is pending because the computer tool could not activate the
-requested sign-in window.
+chat/Community while hidden and accepted no sample. After an initial retained
+integrity denial and sign-in navigation abort, the owner confirmed the normal
+Twitch window appeared and closed it. One deliberate normal Resume then cleared
+the pause. Three hidden signed-in samples and a full 24-channel C: circuit passed
+independent durable receipt/member/provenance checks. The circuit completed in
+969.736 seconds with no collection errors and a 500.809 MiB observed combined
+private-memory peak. These were 24 configured channels, not 24 confirmed live
+channels. Explicit sign-in remains the only integrated flow that shows the window.
 
 The measurement repair uses identity-bound process handles, bounded lifecycle
 reconciliation, explicit missingness and conservative CPU/continuity rules.
 Deterministic lifecycle and native fake-child exit tests, independent review and
-five real-process measurements of the app plus seven WebViews passed. Existing
-resource, source and timeout guards remain in force; the next bounded collection
-run waits for normal sign-in validation. Historical measurement exceptions were
-not recorded, so their exact cause cannot be retroactively established.
+five real-process measurements of the app plus seven WebViews passed. The full
+circuit recorded 953 valid and five isolated unavailable process captures; one
+valid reconciled capture retained a continuity break. Missing readings remained
+unknown. Existing resource, source and timeout guards remained in force.
+Historical measurement exceptions were not recorded, so their exact cause cannot
+be retroactively established.
+
+Strict eight-table recovery/schema checks, 44 deterministic verifier fixtures and
+both immutable history prefixes passed. The complete latest database was returned
+to its original R: test path after normal exit, with the original crash triplet
+preserved separately and all hashes verified. The restarted test on 8796 retained
+all 28 channel flags, policy/cadence, profile and saved API credentials. Both
+original channels produced fresh durable samples; metadata and storage were
+healthy with no current collection error. Production on 8795 remained unchanged.
 
 The previously running build also exited with a native WebView2 access violation
 before the new executable was installed. Its committed history and WAL are
 preserved; recovery correctly marked its unfinished sample interrupted. No
-source-supported explanation or repair of that older crash is claimed. See the
+source-supported explanation or repair of that older crash is claimed. R: storage
+responsiveness under a 24-channel load also remains unqualified. See the
 [current results](measurement-visibility-results-2026-11-01.md). Production remains
 excluded.

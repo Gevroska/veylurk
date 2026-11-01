@@ -51,6 +51,28 @@ interruption and the measurement limits. R: storage responsiveness and the cause
 of the transient process-measurement failure remain unresolved. C: results do not
 qualify the R: deployment's responsiveness.
 
+### November 2 completion of measurement and visibility follow-up
+
+Source `881ccdd8fd3c6b5d5280df308ede5dc643ab889a` adds a hidden integrated
+window, shown only for explicit sign-in. Its exact native/application workflows
+passed, including 99 native tests. The separately corrected benchmark sampler
+retains unknown readings and breaks continuity across process churn.
+
+After the normal owner window flow, three hidden signed-in samples and a new
+24/24-channel C: circuit passed durable receipt/provenance checks. The circuit
+completed in 969.736 seconds with a 500.809 MiB observed private-memory peak,
+953 valid and five isolated unavailable captures. There were 708 root-only
+captures, with a 12.129 MiB median application private allocation, and 24 observed
+browser-free spans of at least 20 seconds. These are sampled measurements, not
+whole-cycle CPU or long-duration reliability results.
+
+Strict recovery and history-prefix checks passed before the complete latest
+database returned to its original R: test path. The restarted test retained all
+settings, channel flags and saved credentials, and produced fresh durable samples
+from both original channels. Production remained untouched. The earlier partial
+runs remain historical failures; R: load responsiveness and the old native crash
+are not claimed fixed. See the [completed follow-up results](measurement-visibility-results-2026-11-01.md).
+
 
 ### Diagnostic build policy
 
