@@ -285,11 +285,51 @@ An allowlisted origin and numeric HRESULT or WebView2 error status accompany the
 fault. Explicit reopening and Resume retain their existing cleanup boundaries.
 Focused native and coordinator regressions cover stale callbacks, failure
 latching, event saturation, denial preservation and recovery. Independent source
-review accepted the correction and all 110 Node tests passed; Windows CI and
-interactive acceptance of this candidate remain pending.
+review accepted the correction. Revision `fb48e0e8` passed Windows application
+workflow [41310526731](https://github.com/Gevroska/veylurk/actions/runs/41310526731):
+110 Node tests, 233 ordinary library tests, the isolated storage-recovery check,
+three synthetic scale workloads, and packaged startup, shutdown and backup
+checks. Shared native workflow
+[41310526730](https://github.com/Gevroska/veylurk/actions/runs/41310526730) passed
+70 tests.
 
 One explicit Resume restored collection, with fresh durable samples at
 13:11:23.380 UTC for NormanAjari and 13:11:58.872 UTC for strano. Adaptive/300 was
 restored, encrypted API credentials compared identically, and production port
 8795 retained its original process identity. The original historical Close sender
 is still unrecorded and cannot be identified retrospectively from the evidence.
+
+The corrected build's native sign-in Close again minimized its window and kept
+the owner pause. Explicit reopening produced a visible, rendered, signed-in
+Twitch homepage without desktop activation. This run also captured a current
+`NavigationCompleted` failure with numeric WebView2 status 9, `ConnectionAborted`.
+The helper retained its browser and showed the transient error instead of
+recycling into a blank window. This is successful reopening with an observed
+navigation interruption, not error-free navigation or proof of why Twitch
+interrupted loading. No automatic retry, error suppression or collection-gate
+relaxation was introduced. Explicit Resume then saved fresh NormanAjari and
+strano receipts at 13:34:25.416 and 13:35:03.954 UTC; Adaptive/300 was restored.
+
+Final verification encountered a separate storage-access delay: cached status
+remained available while durable work and independent report writes stalled.
+Only the two identified read-only inspection helpers were cancelled. Storage
+access and collection later advanced without restarting Veylurk; no app was
+force-killed and no database sidecar was removed. An offline history read also
+ran slowly, and a later disk measurement reported 20 queued operations on R:.
+These observations do not establish the precise cause or a code fix for that
+delay. After a verified clean application exit, the offline comparison passed
+with integrity `ok`: all 25,792 pre-update observations, 59 sessions, 246 Community
+attempts and 17,669 member receipts remained identical. The test was restarted
+with its original settings and saved credentials. Production was not modified
+or restarted throughout these checks.
+
+That restart restored a persisted `source_denied` pause. Shutdown cleanup
+uncertainty can currently produce this classification even without a Twitch
+rejection: a terminal with unconfirmed cleanup passes `cleanup_unconfirmed`
+through the generic persisted-pause fallback. The latest run ended as shutdown
+and its last attempts succeeded, making this the leading explanation here; the
+exact earlier cleanup result was not retained. After confirming the old test
+process had exited and no process used its dedicated browser profile, one
+explicit API Resume restored collection. No SQL edit or automatic retry was used.
+A remaining classification improvement is to distinguish cleanup uncertainty
+from source rejection while preserving the persisted restart barrier.
