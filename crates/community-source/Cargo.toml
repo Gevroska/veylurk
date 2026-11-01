@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.82"
 publish = false
 
+[[example]]
+name = "community-worker-fixture"
+path = "tests/worker_fixture.rs"
+test = false
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

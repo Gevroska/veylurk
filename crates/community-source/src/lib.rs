@@ -7,6 +7,13 @@ pub mod host;
 #[cfg(windows)]
 mod native;
 pub mod sampling;
+mod worker;
+
+/// Private same-executable worker dispatch. Call synchronously before creating
+/// an async runtime, opening the database or reading application credentials.
+pub fn dispatch_private_worker() -> Option<std::process::ExitCode> {
+    worker::dispatch()
+}
 
 /// Finite aggregate-only proof adapter, sharing the production parser and host.
 #[cfg(windows)]

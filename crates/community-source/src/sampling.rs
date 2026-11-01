@@ -362,7 +362,7 @@ impl Schedule {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Provenance {
     pub request_after_trigger_verified: bool,
     pub request_after_trigger_ms: Option<f64>,
@@ -378,8 +378,11 @@ pub struct Provenance {
     pub response_monotonic_seconds: f64,
     pub finished_monotonic_seconds: f64,
     pub finished_minus_response_ms: Option<f64>,
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
     pub timing_order: &'static str,
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
     pub transport: &'static str,
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
     pub server_freshness: &'static str,
 }
 

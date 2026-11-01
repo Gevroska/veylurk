@@ -1,7 +1,7 @@
 //! Bounded typed interface. No COM object, URL, script, or credential crosses it.
 #![cfg_attr(not(windows), allow(dead_code))]
 use crate::{channel_login, is_channel_page, sampling::Provenance, ParsedSample, CATEGORIES};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
@@ -91,9 +91,11 @@ pub struct SourceFailure {
 }
 
 /// Allowlisted structural state only. Never a page string, URL, account or token.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PrimaryFailure {
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
     pub code: &'static str,
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
     pub stage: &'static str,
     pub observed_at_unix_ms: i64,
     pub controller_epoch: u64,
@@ -108,20 +110,21 @@ pub struct PrimaryFailure {
 }
 
 /// Fixed origin and native numbers only; never a URL or runtime error string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "origin", rename_all = "snake_case")]
 pub enum NavigationFailure {
     Navigate { hresult: i32 },
     NavigationCompleted { web_error_status: i32 },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NativeOperationFailure {
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
     pub operation: &'static str,
     pub hresult: i32,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CleanupDiagnostics {
     /// True only when no browser/controller creation remains outstanding.
     pub no_browser_cleanup_required: bool,
@@ -137,15 +140,37 @@ pub struct CleanupDiagnostics {
     pub confirmed: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct FaultReport {
     pub primary_failure: Option<PrimaryFailure>,
     pub cleanup_diagnostics: Option<CleanupDiagnostics>,
     pub host_termination: Option<HostTermination>,
     pub window_dismissal: Option<WindowDismissal>,
+    pub worker: Option<WorkerDiagnostics>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// Process containment is independent of normal WebView2 cleanup evidence.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct WorkerDiagnostics {
+    pub process_id: Option<u32>,
+    pub started_at_unix_ms: Option<i64>,
+    pub exit_code: Option<u32>,
+    pub worker_tree_exited: bool,
+    pub containment_confirmed: bool,
+    pub failure: Option<WorkerFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerFailure {
+    Start,
+    UnexpectedExit,
+    Protocol,
+    Stalled,
+    ShutdownTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostTerminationReason {
     ShutdownRequested,
@@ -157,10 +182,11 @@ pub enum HostTerminationReason {
     MessagePumpError,
     NativeHostInterrupted,
     ProofWindowClose,
+    WorkerFailed,
 }
 
 /// The first observed stop trigger, before cancellation, cleanup or epoch changes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HostTermination {
     pub reason: HostTerminationReason,
     pub observed_at_unix_ms: i64,
@@ -169,13 +195,13 @@ pub struct HostTermination {
 }
 
 /// Presentation-only dismissal of the service window; never a stop trigger.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct WindowDismissal {
     pub count: u64,
     pub last_observed_at_unix_ms: i64,
 }
 
-fn unix_milliseconds() -> i64 {
+pub(crate) fn unix_milliseconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -278,6 +304,7 @@ pub enum HostEvent {
 pub(crate) struct Control {
     pub shutdown: AtomicBool,
     pub cancel_version: AtomicU64,
+    pub native_progress: AtomicU64,
     controller_epoch: AtomicU64,
     admission: Mutex<Admission>,
 }
@@ -299,6 +326,7 @@ impl Default for Control {
         Self {
             shutdown: AtomicBool::new(false),
             cancel_version: AtomicU64::new(0),
+            native_progress: AtomicU64::new(0),
             controller_epoch: AtomicU64::new(0),
             admission: Mutex::new(Admission {
                 accepting: true,
@@ -370,6 +398,55 @@ impl Admission {
 }
 
 impl Control {
+    /// The coordinator remains the admission authority across the pipe. Never
+    /// issue another ticket, cancellation generation or queue clock here.
+    pub(crate) fn adopt_sample(
+        &self,
+        commands: &SyncSender<QueuedCommand>,
+        job: AcceptedJob,
+    ) -> Result<(), ()> {
+        let mut admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if !admission.accepting
+            || admission.accepted.is_some()
+            || job.ticket <= admission.next_ticket
+        {
+            return Err(());
+        }
+        admission.next_ticket = job.ticket;
+        admission.accepted = Some(job.clone());
+        commands
+            .try_send(QueuedCommand::Sample { job })
+            .map_err(|_| ())
+    }
+
+    pub(crate) fn adopt_login(
+        &self,
+        commands: &SyncSender<QueuedCommand>,
+        publication: u64,
+        cancel_version: u64,
+    ) -> Result<(), ()> {
+        let mut admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if !admission.accepting || publication <= admission.next_ticket {
+            return Err(());
+        }
+        admission.next_ticket = publication;
+        admission.committed_login = Some((publication, cancel_version));
+        // A later Cancel may have overtaken this queued publication.
+        self.cancel_version
+            .fetch_max(cancel_version, Ordering::AcqRel);
+        commands
+            .try_send(QueuedCommand::ShowLogin { publication })
+            .map_err(|_| ())
+    }
+
+    pub(crate) fn fault_report(&self) -> FaultReport {
+        self.admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diagnostics
+            .clone()
+    }
+
     pub fn record_fault(&self, mut report: FaultReport) {
         let mut admission = self
             .admission
@@ -381,6 +458,9 @@ impl Control {
         }
         if report.window_dismissal.is_none() {
             report.window_dismissal = admission.diagnostics.window_dismissal.clone();
+        }
+        if report.worker.is_none() {
+            report.worker = admission.diagnostics.worker.clone();
         }
         admission.diagnostics = report;
     }
@@ -560,6 +640,9 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    pub(crate) fn command_sender(&self) -> SyncSender<QueuedCommand> {
+        self.commands.clone()
+    }
     pub fn fault_report(&self) -> FaultReport {
         self.control
             .admission
@@ -580,12 +663,7 @@ impl HostHandle {
         #[cfg(windows)]
         {
             let (handle, bridge) = Self::channel();
-            std::thread::Builder::new()
-                .name("community-webview2-sta".into())
-                .spawn(move || {
-                    crate::native::run_service(options, bridge);
-                })
-                .map_err(|_| HostError::ThreadStartFailed)?;
+            crate::worker::spawn(options, bridge)?;
             Ok(handle)
         }
     }
@@ -675,22 +753,33 @@ impl HostHandle {
     }
 
     pub fn try_event(&self) -> Result<HostEvent, TryRecvError> {
+        self.try_ticketed_event().map(|(_, event)| event)
+    }
+
+    /// The wire ticket is captured under the same lock that consumes the
+    /// completion. A command reader may admit a job between any other locks.
+    pub(crate) fn try_ticketed_event(&self) -> Result<(Option<u64>, HostEvent), TryRecvError> {
         let mut admission = self
             .control
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(event) = admission.completion.take() {
+            let ticket = admission.accepted.as_ref().map(|job| job.ticket);
             admission.accepted = None;
-            return Ok(event);
+            return Ok((ticket, event));
         }
         match self.events.try_recv() {
-            Ok(event) => Ok(event),
+            Ok(event) => Ok((None, event)),
             Err(_) if admission.login_failed => {
                 admission.login_failed = false;
-                Ok(HostEvent::LoginFailed)
+                Ok((None, HostEvent::LoginFailed))
             }
-            Err(error) => admission.terminal.take().ok_or(error),
+            Err(error) => admission
+                .terminal
+                .take()
+                .map(|event| (None, event))
+                .ok_or(error),
         }
     }
 }
@@ -705,6 +794,51 @@ impl Drop for HostHandle {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn worker_completion_consumes_its_ticket_atomically_after_late_adoption() {
+        let (handle, bridge) = HostHandle::channel();
+        assert!(handle.try_ticketed_event().is_err());
+        let queued_at = Instant::now() - Duration::from_secs(2);
+        bridge
+            .control
+            .adopt_sample(
+                &handle.command_sender(),
+                AcceptedJob {
+                    ticket: 29,
+                    job_id: 4,
+                    channel: "room".into(),
+                    cancel_version: 7,
+                    queued_at,
+                },
+            )
+            .unwrap();
+        let job = take_job(&bridge);
+        assert_eq!(job.ticket, 29);
+        assert_eq!(job.cancel_version, 7);
+        assert_eq!(job.queued_at, queued_at);
+        assert!(bridge.control.complete(29, failure()));
+        let Ok((Some(ticket), HostEvent::SampleCompleted { job_id: 4, .. })) =
+            handle.try_ticketed_event()
+        else {
+            panic!("missing ticketed completion");
+        };
+        assert_eq!(ticket, 29);
+        assert!(!bridge.control.complete(29, failure()));
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn remote_login_never_rolls_back_a_later_cancellation() {
+        let (handle, bridge) = HostHandle::channel();
+        bridge.control.cancel_version.store(9, Ordering::Release);
+        bridge
+            .control
+            .adopt_login(&handle.command_sender(), 3, 8)
+            .unwrap();
+        assert_eq!(bridge.control.cancel_version.load(Ordering::Acquire), 9);
+        assert_eq!(bridge.control.login_cancel_version(3), None);
+    }
 
     #[test]
     fn login_failure_has_one_reserved_slot_after_older_login_status() {

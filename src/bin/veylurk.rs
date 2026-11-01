@@ -34,8 +34,20 @@ struct Args {
     community_profile: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    if let Some(exit) = community_source::dispatch_private_worker() {
+        return exit;
+    }
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(application_main()),
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+async fn application_main() -> ExitCode {
     let args = Args::parse();
     let diagnostics = Diagnostics::new(&args.database);
     let result = run(args, diagnostics.clone()).await;

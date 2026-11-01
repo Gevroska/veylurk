@@ -436,3 +436,14 @@ source-supported explanation or repair of that older crash is claimed. R: storag
 responsiveness under a 24-channel load also remains unqualified. See the
 [current results](measurement-visibility-results-2026-11-01.md). Production remains
 excluded.
+
+## Native browser crash correction
+
+The owner requested correction of the earlier WebView2 access violation on
+November 2. Independent scoping found no source-supported causal repair from the
+retained event metadata. A same-executable isolated native worker is being
+implemented to prevent a browser DLL fault from terminating the server, IRC and
+database process. Bounded transport, Job containment and explicit failure barriers
+are required; no normal-cleanup evidence may be fabricated. Implementation,
+independent review, exact Windows CI and isolated fault-injection/live acceptance
+are pending. See the [written plan](native-worker-crash.md). Production is excluded.

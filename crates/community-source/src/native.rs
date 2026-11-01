@@ -878,6 +878,11 @@ impl App {
         let Some(service) = &self.service else {
             return;
         };
+        service
+            .bridge
+            .control
+            .native_progress
+            .fetch_add(1, Ordering::Release);
         if service.bridge.control.shutdown.load(Ordering::Acquire) {
             service.bridge.control.stop_accepting();
             self.observe_termination(HostTerminationReason::ShutdownRequested);

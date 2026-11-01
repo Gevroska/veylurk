@@ -9,7 +9,7 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use community_source::host::{
     CleanupDiagnostics, FaultReport, HostEvent, HostHandle, HostOptions, HostTermination,
-    PrimaryFailure, SourceSample, WindowDismissal,
+    PrimaryFailure, SourceSample, WindowDismissal, WorkerDiagnostics,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,6 +45,7 @@ pub struct Status {
     pub cleanup_diagnostics: Option<CleanupDiagnostics>,
     pub host_termination: Option<HostTermination>,
     pub window_dismissal: Option<WindowDismissal>,
+    pub worker: Option<WorkerDiagnostics>,
     pub channels: Vec<ChannelCadenceStatus>,
 }
 
@@ -286,6 +287,7 @@ impl Community {
             cleanup_diagnostics: None,
             host_termination: None,
             window_dismissal: None,
+            worker: None,
             channels: Vec::new(),
         }));
         let (commands, receiver) = mpsc::channel(8);
@@ -541,6 +543,7 @@ impl Coordinator {
                 status.cleanup_confirmed = None;
                 status.host_termination = None;
                 status.window_dismissal = None;
+                status.worker = None;
                 true
             }
             Err(_) => {
@@ -753,6 +756,9 @@ impl Coordinator {
         }
         if report.window_dismissal.is_some() {
             status.window_dismissal = report.window_dismissal;
+        }
+        if report.worker.is_some() {
+            status.worker = report.worker;
         }
     }
 
