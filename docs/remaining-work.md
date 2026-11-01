@@ -334,7 +334,7 @@ explicit API Resume restored collection. No SQL edit or automatic retry was used
 A remaining classification improvement is to distinguish cleanup uncertainty
 from source rejection while preserving the persisted restart barrier.
 
-## Current four-item completion increment
+## Earlier four-item completion increment
 
 The [Astra plan](completion-plan-2026-11-01.md) has a final evidence ledger; the
 [completion report](completion-results-2026-11-01.md) records the four separate
@@ -374,8 +374,21 @@ dataset question is pending.
 The owner authorized Popout Chat and on-demand browser creation on 2026-11-01.
 Astra's [source/lifecycle plan](community-ram-optimization.md) defines strict
 route-specific readiness, preserved source/authentication guards, dormant command
-handling and a bounded isolated qualification. Implementation is in progress.
-Fresh signed-out and signed-in checks, exact Windows artifacts, measured gains
-and history/configuration preservation remain separate acceptance gates. The
-prior denied-popout result remains historical; this authorization does not
-reclassify it as successful. Production on 8795 remains excluded.
+handling and a bounded isolated qualification. Implementation, independent review,
+exact Windows CI, signed-out rejection and repeated signed-in collection passed
+at source `3a685ed14897bc5e7247f0651a8f5147d5d95334`. The
+[qualification report](community-ram-results-2026-11-01.md) records about 12 MiB
+browser-free private memory and a 467 MiB observed peak in the separate C:
+database trial. The browser is released between samples.
+
+Full 24-channel resource qualification remains partial: the R: run stopped after
+12 accepted receipts on probe stalls, and the C: run stopped after 21 when
+process metrics became unavailable. All recorded receipts were independently
+verified; neither interrupted run was reclassified as passing. R: responsiveness
+and the transient measurement failure remain open findings. These changes do not
+establish empirical 99% presence calibration.
+
+Both retained-history prefixes matched, the complete latest test database was
+returned to its original location, and credentials and original settings were
+preserved. The test instance on 8796 produced fresh durable samples from both
+original channels after restart. Production on 8795 remained unchanged.

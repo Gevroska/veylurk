@@ -29,7 +29,7 @@ No memory-trimming API, disk-swapping policy, browser flag, engine installation,
 1. Verify source-mode, UI, provenance, lifecycle, queue-deadline and cancellation regressions in the existing Windows workflows.
 2. Back up the latest isolated test history and credentials after normal exit; verify the existing production identity independently.
 3. Run one anonymous-profile negative check with the approved executable on port 8796 and a separate empty database/profile. Preserve the normal signed-in profile.
-4. Reuse the signed-in profile for three scheduled samples from a currently live `emmodem`, with the existing Fixed/30 settings and unchanged global pacing. Stop at a denial, unconfirmed cleanup or the existing 1 GiB investigation threshold.
+4. Reuse the signed-in profile for three scheduled samples from a currently live channel, with the existing Fixed/30 settings and unchanged global pacing. `emmodem` was the initial choice; qualification used `otplol_` after the official live check found `emmodem` offline. Stop at a denial, unconfirmed cleanup or the existing 1 GiB investigation threshold.
 5. Measure app and descendant browser private memory, working set, process counts, responsiveness and source outcomes. Verify process disappearance during waiting gaps and durable accepted receipts. CPU deltas across process churn remain unavailable.
 6. Only after the short check succeeds, attempt a bounded first circuit of the existing 24-channel set. Restore all original settings/row flags and verify both original channels afterward.
 
@@ -40,11 +40,16 @@ Previously recorded full-page measurements are comparison evidence, not a new ma
 | Gate | Status | Evidence |
 | --- | --- | --- |
 | Astra design and scope | Verified | Explicit popout mode and dormant lifecycle; no further owner decision needed. |
-| Implementation and independent review | Verified source | Strict route/readiness, unobservable panel phase, frozen receipt and dormant lifecycle reviewed; 124 local Node tests passed. Post-close Login and dormant disconnect findings corrected. |
-| Exact Windows CI and artifact | Correction pending CI | Native source `ef085ddf` passed 94 tests; complete app source `c426879` passed all Windows checks after the reviewed test-helper correction. The later opening-transition correction requires a new exact artifact. Any diagnostic artifact remains explicitly unqualified and cannot turn a failed workflow green. |
-| Anonymous negative and signed-in positive checks | Partial; correction pending | Fresh anonymous chat loaded with signed-in false and no accepted sample. Two signed-in receipts succeeded before a false-denial-compatible opening race stopped the third attempt. Failure evidence and the pause barrier were retained. The reproduced source path is corrected; the corrected build still needs requalification. |
-| Resource gains and breadth | Preliminary only | The interrupted run recorded about 427 MiB peak private memory, 11 MiB app-only waiting memory and repeated roughly 30-second gaps without browser descendants. These do not qualify the corrected build or many-channel breadth. |
-| History, credentials, settings and production preserved | Pending | Final independent verification required. |
+| Implementation and independent review | Verified source | Strict route/readiness, unobservable opening/panel phases, frozen receipt, explicit-denial priority and dormant lifecycle independently reviewed. Opening-transition and restore-deadline classification regressions are covered. |
+| Exact Windows CI and artifact | Passed | Source `3a685ed14897bc5e7247f0651a8f5147d5d95334`: native CI passed 96 tests; complete app CI passed tests, recovery, scale, build and packaging. The normal release artifact and executable hashes are recorded in the results report. |
+| Anonymous negative and signed-in positive checks | Passed | Corrected fresh anonymous profile loaded chat/Community without positive authentication or accepted samples. Three signed-in `otplol_` receipts were independently verified in SQLite; original channels also produced fresh receipts after final restart. First-failure evidence remains retained. |
+| Resource gains and breadth | Measured; full breadth partial | The corrected short trial measured 428 MiB peak private memory and about 11 MiB without browsers. The 24-channel R: run stopped after 12 receipts on probe stalls; the separate C: database run stopped after 21 receipts when process measurements became unavailable. That run recorded 467 MiB peak and about 12 MiB browser-free private memory. Neither interrupted circuit is a full 24-channel qualification. |
+| History, credentials, settings and production preserved | Passed | Both immutable history prefixes matched; the complete latest database was returned to R: with hash verification. Saved credentials and all 28 channel flags/policy/cadence were preserved. The usual two-channel test instance is running on 8796; production 8795 remained unchanged. |
+
+The [qualification report](community-ram-results-2026-11-01.md) preserves every
+interruption and the measurement limits. R: storage responsiveness and the cause
+of the transient process-measurement failure remain unresolved. C: results do not
+qualify the R: deployment's responsiveness.
 
 
 ### Diagnostic build policy
