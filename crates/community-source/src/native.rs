@@ -2290,7 +2290,7 @@ impl App {
         }
     }
 
-    fn revalidate_pending_body(&self, generation: u64) -> Result<(), &'static str> {
+    fn revalidate_pending_body(&self, generation: u64) -> std::result::Result<(), &'static str> {
         let mut state = self.state.borrow_mut();
         let id = state
             .pending_sample
