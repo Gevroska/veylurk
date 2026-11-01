@@ -168,6 +168,15 @@ The generic pause still persists unchanged, and the runtime does not infer a pas
 primary failure from it after restart. Persistent fault reporting is deferred. Native and
 coordinator regression tests cover identity, early/stale/abnormal exits, close during
 recycling, cleanup operation failures and preservation of the primary failure.
-Source review, hosted Windows checks and a short isolated test rotation remain
-pending for this candidate. Production port 8795 and its executable are outside
-this recovery task.
+Source review accepted the correction. Revision `223b0501` passed Windows application
+workflow [41268954989](https://github.com/Gevroska/veylurk/actions/runs/41268954989);
+the unchanged shared native source passed 59 tests in workflow
+[41268713871](https://github.com/Gevroska/veylurk/actions/runs/41268713871).
+A short test-only rotation saved a fresh 47-account sample. The other channel
+reached its page-readiness deadline with signed-in chat and Community available
+but no required Play control; normal browser cleanup was confirmed in 1,273 ms,
+and scheduling remained active rather than entering a global pause.
+All 24,858 pre-update IRC observations, 171 Community attempts and 15,742 Community
+member receipts compared identically, and saved credentials were reused unchanged.
+Production port 8795 and its executable were not modified or restarted. This short
+check does not establish that an intermittent cleanup failure can never recur.
