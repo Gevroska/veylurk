@@ -27,7 +27,16 @@ The lookup never fills older periods with a broadcast's current title. Missing t
 
 Ambiguous roster entries after a departure and out-of-order evidence do not produce inferred intervals. Collection gaps and session boundaries prevent inferred continuity across them. Older gaps that were never recorded cannot be reconstructed. Reported boundary and receipt times remain available in the accessible details table.
 
-## Why the chart does not claim 99%
+## Evidence and model-based 99% estimates
+
+The optional Community model adds conditional pointwise probability estimates
+to account and broadcast charts. It uses a dynamic arrival/departure model,
+actual elapsed sample times and a finite sensitivity analysis. Its separate
+lanes distinguish estimated present, estimated absent, uncertain and unknown.
+All model output remains explicitly uncalibrated. Cell shading refers to the
+reported evaluation midpoint, not every instant in a strip or an entire visit.
+Parameters, resolution, support and exclusion reasons are visible. Read
+[the model contract](community-presence-model.md) before interpreting a score.
 
 A mathematical confidence calculation requires a justified observation model. For independent, uniform samples of size `k` from a fixed population `N`, the chance of missing a continuously present account in `m` samples is:
 
@@ -35,16 +44,16 @@ A mathematical confidence calculation requires a justified observation model. Fo
 P(no detection | continuously present) = (1 - k/N)^m
 ```
 
-With 100 accounts sampled from 2,000, 90 independent samples reduce that conditional miss probability to about 0.99%. At three seconds per sample, the interval is four minutes and 30 seconds. This is a detection calculation under explicit assumptions. It is not `P(absent | no detection)` and does not identify an arrival or departure time.
+With 100 accounts sampled from 2,000, 90 independent samples reduce that conditional miss probability to about 0.99%. That counts hypothetical independent opportunities, not the application's actual sampling cadence. This is a detection calculation under explicit assumptions. It is not `P(absent | no detection)` and does not identify an arrival or departure time.
 
 Estimating the latter would additionally require assumptions about departures, returns, detection errors and observation dependence, followed by validation against known presence. A numerical model can produce a probability without that validation, but the result would not justify a calibrated 99% claim.
 
-Veylurk's current IRC event stream is not an independent uniform sampler. Twitch documents missing membership events in large chat rooms, and chat-connected accounts are a different population from video viewers. The chart therefore reports evidence and uncertainty without a probability score or an absence duration.
+Veylurk's IRC event stream is not an independent uniform sampler. Twitch documents missing membership events in large chat rooms, and chat-connected accounts are a different population from video viewers. IRC evidence retains its existing uncertain interpretation. The separate Community model supplies experimental probabilities under declared assumptions; it does not make either source empirically calibrated or turn an estimated absence into a verified absence duration.
 
 Sources: [NIST binomial distribution](https://www.itl.nist.gov/div898/handbook/eda/section3/eda366i.htm), [Twitch IRC membership limits](https://dev.twitch.tv/docs/chat/irc/#part-command), and [Get Chatters](https://dev.twitch.tv/docs/api/reference/#get-chatters).
 
 ## Preservation and resource bounds
 
-The endpoint is read-only and uses existing observations, visits and session boundaries. It neither changes collection cadence nor rewrites history. Response size, page size, date range and query execution are bounded. The chart uses embedded SVG and existing theme styles; collection requires no chart library or browser runtime.
+The endpoints are read-only and use existing observations, visits, Community samples and collection boundaries. They neither change collection cadence nor rewrite history. Response size, page size, date range, model admission and query execution are bounded. The chart uses embedded SVG and existing theme styles without a chart library. Optional Community collection uses the existing approved WebView2 runtime.
 
 The Windows workflow runs ordinary tests and the fixed-time 50-room buffered storage recovery fixture in separate test processes. The recovery fixture retains its debug profile, workload, four Tokio workers, PONG checks, durability assertions and original deadlines. Isolation removes overlapping storage workers from other tests; it does not establish why an earlier recovery deadline was missed or constitute extended live-capacity evidence.

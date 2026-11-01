@@ -95,6 +95,8 @@ jobs:
             if ($community.settings.enabled -or $community.state -ne 'disabled' -or $community.active_channel -or (Test-Path (Join-Path $smokeDirectory 'community-browser-profile'))) { throw 'Disabled Community startup unexpectedly created a browser or job' }
             $communityReceipts = Invoke-RestMethod -Uri "$baseUrl/api/community/receipts?account=fixture" -TimeoutSec 2
             if ($communityReceipts.rows.Count -ne 0 -or $null -ne $communityReceipts.next_before_member_id) { throw 'Empty Community history contract was invalid' }
+            $communityModel = Invoke-RestMethod -Uri "$baseUrl/api/community/presence?account=fixture&channel=fixture" -TimeoutSec 2
+            if ($communityModel.model_version -ne 'community_presence_v1' -or $communityModel.calibration_status -ne 'uncalibrated' -or $communityModel.probability_kind -ne 'model_based_pointwise' -or $communityModel.status -ne 'no_data' -or -not $communityModel.complete -or $communityModel.cells.Count -ne 0) { throw 'Empty Community presence model contract was invalid' }
             $metadata = Invoke-RestMethod -Uri "$baseUrl/api/metadata/status" -TimeoutSec 2
             if ($metadata.configured -or $metadata.channels.Count -ne 0) { throw 'Offline smoke unexpectedly enabled metadata' }
             foreach ($kind in @('account', 'channel')) {
@@ -132,7 +134,7 @@ jobs:
           Get-ChildItem -LiteralPath scripts -Filter '*Veylurk*.ps1' -File | Copy-Item -Destination app-package -ErrorAction Stop
           Copy-Item -LiteralPath scripts/Setup-Twitch.ps1 -Destination app-package -ErrorAction Stop
           New-Item -ItemType Directory -Path app-package/docs -ErrorAction Stop | Out-Null
-          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md, docs/timeline.md, docs/remaining-work.md, docs/community-cadence.md, docs/community-integration-plan.md -Destination app-package/docs -ErrorAction Stop
+          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md, docs/timeline.md, docs/remaining-work.md, docs/community-cadence.md, docs/community-integration-plan.md, docs/community-presence-model.md -Destination app-package/docs -ErrorAction Stop
       - name: Verify packaged background shutdown and offline backup with actual SQLite
         shell: powershell
         run: |

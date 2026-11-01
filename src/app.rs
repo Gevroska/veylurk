@@ -108,6 +108,7 @@ pub fn router(state: AppState, additional: Router) -> Router {
         .route("/api/relationships", get(relationships))
         .route("/api/history", get(visits))
         .route("/api/timeline", get(timeline))
+        .route("/api/community/presence", get(community_presence))
         .route("/api/presence", get(presence))
         .with_state(state.clone())
         .merge(additional)
@@ -461,6 +462,33 @@ async fn timeline(
     }
 }
 
+async fn community_presence(
+    State(state): State<AppState>,
+    query: Result<Query<crate::presence_model::PresenceModelQuery>, QueryRejection>,
+) -> Result<Json<crate::presence_model::PresenceModelResponse>, ApiError> {
+    let query = query.map(|query| query.0).map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "Community model query parameters are invalid.",
+        )
+    })?;
+    match state.store.community_presence(query).await {
+        Ok(model) => Ok(Json(model)),
+        Err(StoreError::NotFound) => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Broadcast not found.",
+        )),
+        Err(StoreError::Invalid) => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "Supply an exact account and channel or broadcast, valid model parameters, and RFC3339 bounds spanning at most 31 days.",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn visits(
     State(state): State<AppState>,
     query: Result<Query<Filters>, QueryRejection>,
@@ -543,6 +571,10 @@ async fn presence(
 #[cfg(test)]
 #[path = "app_suggestions_tests.rs"]
 mod suggestions_tests;
+
+#[cfg(test)]
+#[path = "app_presence_model_tests.rs"]
+mod presence_model_tests;
 
 #[cfg(test)]
 mod tests {

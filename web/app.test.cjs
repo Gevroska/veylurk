@@ -110,6 +110,7 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     if (target.pathname === "/api/settings") return { collection_mode: "all", unknown_policy: "collect" };
     if (target.pathname === "/api/community/status") return communityState();
     if (target.pathname === "/api/community/receipts") return { rows: [], next_before_member_id: null };
+    if (target.pathname === "/api/community/presence") return communityModel(target, { status: "no_data", cells: [], sensitivity_scenarios: 0 });
     if (target.pathname === "/api/suggestions") return { kind: target.searchParams.get("kind"), suggestions: [] };
     if (target.pathname === "/api/timeline") return timeline();
     if (target.pathname === "/api/history") return { visits: [], has_more: false, next_offset: null };
@@ -1434,7 +1435,7 @@ test("timeline renders hostile text literally with an accessible shared chart an
   const scroll = elements.find((item) => item.classList.contains("timeline-scroll"));
   assert.equal(scroll.tabIndex, 0); assert.equal(scroll.attributes.role, "region");
   scroll.focus(); assert.equal(app.document.activeElement, scroll);
-  const details = elements.find((item) => item.tagName === "DETAILS");
+  const details = elements.find((item) => item.tagName === "DETAILS" && item.classList.contains("timeline-details"));
   assert.equal(details.children[0].tagName, "SUMMARY");
   assert.ok(descendants(details).some((item) => item.tagName === "TABLE"));
   assert.ok(descendants(details).some((item) => item.tagName === "TIME" && item.dateTime === new Date(received).toISOString()));
@@ -1728,4 +1729,275 @@ test("selecting a stored login marks existing results stale without a new search
   assert.equal(app.get("search-results").classList.contains("stale"), true);
   assert.match(app.get("search-message").textContent, /Filters changed/);
   assert.equal(app.calls.filter((call) => call.target.pathname === "/api/search").length, before);
+});
+
+
+const modelDefaults = { connected_minutes: 60, disconnected_minutes: 720, detection_scale: 0.5, false_report_ratio: 0.01, lag_seconds: 30, max_gap_seconds: 3600 };
+function communityModel(target, extra = {}) {
+  const from = target.searchParams.get("from") || timelineFrom, to = target.searchParams.get("to") || timelineTo;
+  const start = Date.parse(from), end = Date.parse(to);
+  const states = [["estimated_present", 0.999, 0.995, 0.9999], ["estimated_absent", 0.001, 0.0001, 0.005], ["uncertain", 0.5, 0.1, 0.9], ["unknown", null, null, null]];
+  const cells = states.map(([classification, presence_probability, sensitivity_min, sensitivity_max], index) => {
+    const left = Math.round(start + (end - start) * index / states.length), right = Math.round(start + (end - start) * (index + 1) / states.length);
+    return { from: new Date(left).toISOString(), to: new Date(right).toISOString(), evaluated_at: new Date(Math.floor(left + (right - left) / 2)).toISOString(), presence_probability, sensitivity_min, sensitivity_max, classification, unknown_reason: classification === "unknown" ? "outside_support_or_segment_boundary" : null };
+  });
+  return {
+    model_version: "community_presence_v1", calibration_status: "uncalibrated", probability_kind: "model_based_pointwise", inference: "historical_smoother", threshold: 0.99, left_censored: true,
+    account: target.searchParams.get("account") || "sample_account", channel: target.searchParams.get("channel") || "sample_channel", broadcast_id: target.searchParams.has("broadcast_id") ? Number(target.searchParams.get("broadcast_id")) : null,
+    effective_range: { from, to }, context_range: { from: new Date(start - 6 * 3600000).toISOString(), to }, as_of: to, generated_at: to,
+    parameters: Object.fromEntries(Object.entries(modelDefaults).map(([key, value]) => [key, target.searchParams.has(key) ? Number(target.searchParams.get(key)) : value])),
+    sensitivity_scenarios: 65, complete: true, status: "ok", sample_counts: { successful_in_context: 20, attempts_in_id_span: 22, eligible_observations: 20, target_positive_receipts: 4, segments: 1, modeled_segments: 1 }, excluded_reason_counts: { not_successful: 2 }, cells, cell_width_seconds: (end - start) / 4000, ...extra,
+  };
+}
+const modelCalls = (app) => app.calls.filter((call) => call.target.pathname === "/api/community/presence");
+const modelCells = (app, prefix = "timeline") => descendants(app.get(prefix + "-results")).filter((item) => item.classList.contains("timeline-model-cell"));
+const modelControl = (app, key, prefix = "timeline") => descendants(app.get(prefix + "-results")).find((item) => item.id === prefix + "-model-" + key);
+async function searchModel(app, channel = "", source = "all") {
+  await settle(); app.navigate("history"); app.get("search-account").value = "sample_account"; app.get("search-channel").value = channel; app.get("search-source").value = source;
+  await app.get("search-form").dispatch("submit"); await settle();
+}
+
+test("Community model uses complete per-channel analysis and distinct midpoint-only lanes alongside raw IRC and ticks", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()]);
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(900)], next_before_member_id: 900 };
+    if (target.pathname === "/api/community/presence") return communityModel(target);
+  });
+  await searchModel(app, "sample_channel");
+  assert.equal(modelCalls(app).length, 1);
+  const target = modelCalls(app)[0].target;
+  assert.equal(target.searchParams.get("from"), timelineFrom); assert.equal(target.searchParams.get("to"), timelineTo);
+  assert.equal(target.searchParams.has("before_member_id"), false); assert.equal(target.searchParams.has("limit"), false);
+  assert.equal(modelCells(app).length, 4);
+  for (const classification of ["estimated_present", "estimated_absent", "uncertain", "unknown"]) assert.equal(modelCells(app).filter((item) => item.classList.contains(classification)).length, 1);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-inference")).length, 1);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-community")).length, 1);
+  const text = app.get("timeline-results").textContent;
+  assert.match(text, /Model estimates — uncalibrated/); assert.match(text, /Model-based, not empirically calibrated/);
+  assert.match(text, /99% threshold is pointwise/); assert.match(text, /not certainty for a whole display cell, interval, path or broadcast/);
+  assert.match(text, /Estimated absent under the model/); assert.match(text, /not a known arrival/); assert.match(text, /not a confidence interval/);
+  assert.match(text, /More receipts are retained/); assert.match(text, /processing complete/);
+  assert.doesNotMatch(text, /99% confident interval|observed absence is proven|whole.broadcast certainty/i);
+});
+
+test("Community model inspects original evaluated points with one row Tab stop and preserves title lookup through clipping and keyboard movement", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()]) : target.pathname === "/api/community/presence" ? communityModel(target) : target.pathname.endsWith("/metadata/at") ? metadataAt() : undefined);
+  await searchModel(app, "sample_channel");
+  const inspector = timelineElement(app, "timeline-model-inspector");
+  assert.equal(inspector.attributes.tabindex, "0"); inspector.focus(); await app.advance(180);
+  let request = app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1);
+  assert.equal(request.target.searchParams.get("at"), "2026-10-23T10:30:00.000Z");
+  await inspector.dispatch("keydown", { key: "ArrowRight" }); await app.advance(180);
+  request = app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1);
+  assert.equal(request.target.searchParams.get("at"), "2026-10-23T11:30:00.000Z");
+  assert.match(timelineElement(app, "timeline-hover").textContent, /Estimated absent under the model/);
+  await timelineButton(app, "Zoom in").dispatch("click");
+  const next = timelineElement(app, "timeline-model-inspector"); await next.dispatch("pointerenter", mouseAt(330, 114)); await app.advance(180);
+  request = app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1);
+  assert.equal(request.target.searchParams.get("at"), "2026-10-23T11:30:00.000Z");
+  assert.equal(modelCalls(app).length, 1);
+  for (const cell of modelCells(app)) { assert.ok(Number(cell.attributes.x) >= 180); assert.ok(Number(cell.attributes.x) + Number(cell.attributes.width) <= 970.000001); assert.equal(cell.attributes.tabindex, undefined); assert.equal(cell.listeners.size, 0); }
+});
+
+test("Community model requests explicit channels without positive receipts inside the displayed range and never models channel-only or IRC-only queries", async () => {
+  const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([], { empty: true }) : target.pathname === "/api/community/presence" ? communityModel(target) : undefined);
+  await searchModel(app, "sample_channel", "community");
+  assert.equal(modelCalls(app).length, 1); assert.equal(modelCells(app).length, 4);
+  assert.match(app.get("timeline-results").textContent, /No matching raw evidence/);
+  app.get("search-account").value = ""; await app.get("search-form").dispatch("submit"); await settle();
+  assert.equal(modelCalls(app).length, 1); assert.match(app.get("timeline-results").textContent, /Enter an exact account login/);
+  await searchModel(app, "sample_channel", "irc"); assert.equal(modelCalls(app).length, 1); assert.equal(modelCells(app).length, 0);
+});
+
+test("Community model keeps no-data, unsupported, limits, busy, timeout and SQL errors unknown without hiding raw evidence", async () => {
+  for (const status of ["no_data", "insufficient_data", "role_unsupported", "input_limit", "analysis_busy", "analysis_timeout", "sql_error"]) {
+    const app = createApp((target) => target.pathname === "/api/timeline" ? timeline([timelineVisit()]) : target.pathname === "/api/community/presence" ? status === "sql_error" ? { httpStatus: 503, error: { message: '<img src=x onerror="bad()"> unavailable' } } : communityModel(target, { status, complete: ["no_data", "insufficient_data", "role_unsupported"].includes(status), cells: [], sensitivity_scenarios: 0 }) : undefined);
+    await searchModel(app, "sample_channel");
+    assert.equal(modelCells(app).length, 0, status); assert.ok(timelineChart(app), status);
+    assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-inference")).length, 1);
+    assert.match(app.get("timeline-results").textContent, status === "sql_error" ? /Model unavailable: <img src=x/ : /no model probabilities drawn/);
+    assert.equal(descendants(app.get("timeline-results")).some((item) => item.tagName === "IMG"), false);
+  }
+});
+
+test("Community model rejects partial, mismatched, nonfinite, out-of-bounds and incorrectly strong results before drawing any cells", async () => {
+  const mutations = [
+    (value) => { value.complete = false; }, (value) => { value.channel = "other"; }, (value) => { value.effective_range.to = "2026-10-24T00:00:00Z"; },
+    (value) => { value.cells[0].presence_probability = NaN; }, (value) => { value.cells[0].sensitivity_max = 1.01; },
+    (value) => { value.cells[0].sensitivity_min = 0.98; }, (value) => { value.cells[1].sensitivity_max = 0.02; },
+    (value) => { value.cells[3].presence_probability = 0.5; }, (value) => { value.cells[1].from = value.cells[0].from; },
+    (value) => { value.cells[0].evaluated_at = value.cells[0].from; }, (value) => { value.sensitivity_scenarios = 66; },
+    (value) => { value.cells = Array(2049).fill(value.cells[0]); }, (value) => { value.parameters.lag_seconds = 31; },
+  ];
+  for (const mutate of mutations) {
+    const app = createApp((target) => { if (target.pathname === "/api/community/presence") { const result = communityModel(target); mutate(result); return result; } });
+    await searchModel(app, "sample_channel"); assert.equal(modelCells(app).length, 0); assert.match(app.get("timeline-results").textContent, /invalid or mismatched Community model/);
+  }
+});
+
+test("Community model overview requests at most eight visible channels sequentially and offers an honest omitted-channel notice", async () => {
+  const first = deferred(); let running = 0, maximum = 0;
+  const app = createApp(async (target) => {
+    if (target.pathname === "/api/timeline") return timeline(Array.from({ length: 10 }, (_, index) => timelineVisit({ id: index + 1, channel: "channel_" + index })));
+    if (target.pathname === "/api/community/presence") { running++; maximum = Math.max(maximum, running); if (target.searchParams.get("channel") === "channel_0") await first.promise; running--; return communityModel(target); }
+  });
+  await searchModel(app);
+  assert.equal(modelCalls(app).length, 1); first.resolve(); await settle();
+  assert.equal(modelCalls(app).length, 8); assert.equal(maximum, 1);
+  assert.match(app.get("timeline-results").textContent, /2 visible channel\(s\) omitted.*eight-channel overview/);
+  assert.match(app.get("timeline-results").textContent, /Filter one channel/);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-model-inspector")).length, 8);
+});
+
+test("Community model cache pins axis and channel identity across receipt loading and IRC pagination without recomputing completed channels", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit()], { has_more: !target.searchParams.has("before"), next_before: target.searchParams.has("before") ? null : 8 });
+    if (target.pathname === "/api/community/receipts") return { rows: [communityReceipt(target.searchParams.has("before_member_id") ? 899 : 900)], next_before_member_id: target.searchParams.has("before_member_id") ? null : 900 };
+    if (target.pathname === "/api/community/presence") return communityModel(target);
+  });
+  await searchModel(app, "sample_channel"); await timelineButton(app, "Zoom in").dispatch("click");
+  const viewport = descendants(app.get("timeline-results")).find((item) => item.id === "timeline-viewport").textContent;
+  await timelineButton(app, "Load more Community ticks").dispatch("click"); await settle();
+  await app.get("timeline-next").dispatch("click"); await settle();
+  assert.equal(modelCalls(app).length, 1);
+  assert.equal(descendants(app.get("timeline-results")).find((item) => item.id === "timeline-viewport").textContent, viewport);
+  assert.equal(modelCells(app).length, 2);
+  await searchModel(app, "another_channel"); assert.equal(modelCalls(app).length, 2);
+  assert.equal(modelCalls(app).at(-1).target.searchParams.get("channel"), "another_channel");
+});
+
+test("Community model assumption edits are stale until applied, accept finite fractions and bounds, and reject late old-parameter replies", async () => {
+  const old = deferred(); let oldTarget;
+  const app = createApp((target) => {
+    if (target.pathname === "/api/community/presence") { if (target.searchParams.get("detection_scale") === "0.5") { oldTarget = target; return old.promise; } return communityModel(target); }
+  });
+  await searchModel(app, "sample_channel");
+  const oldSignal = modelCalls(app)[0].options.signal;
+  const scale = modelControl(app, "detection_scale"); scale.value = "0.75"; await scale.dispatch("input");
+  assert.equal(oldSignal.aborted, true); assert.equal(modelCells(app).length, 0); assert.match(app.get("timeline-results").textContent, /Assumptions changed/);
+  const form = descendants(app.get("timeline-results")).find((item) => item.classList.contains("model-assumptions-form"));
+  modelControl(app, "connected_minutes").value = "5.5"; modelControl(app, "lag_seconds").value = "0.25";
+  await form.dispatch("submit"); await settle(); assert.equal(modelCalls(app).length, 2); assert.equal(modelCells(app).length, 4);
+  assert.equal(modelCalls(app)[1].target.searchParams.get("connected_minutes"), "5.5"); assert.equal(modelCalls(app)[1].target.searchParams.get("lag_seconds"), "0.25");
+  old.resolve(communityModel(oldTarget, { generated_at: "2026-10-23T10:00:00Z" })); await settle(); assert.equal(modelCells(app).length, 4);
+  for (const [key, invalid] of [["connected_minutes", ""], ["connected_minutes", "4.99"], ["disconnected_minutes", "10081"], ["detection_scale", "Infinity"], ["false_report_ratio", "0"], ["lag_seconds", "301"], ["max_gap_seconds", "59.9"]]) {
+    modelControl(app, key).value = invalid; await form.dispatch("submit"); await settle(); assert.equal(modelCalls(app).length, 2); modelControl(app, key).value = String(modelDefaults[key]);
+  }
+});
+
+test("Community model late responses are rejected after filters, newer searches, navigation or a hidden page", async () => {
+  for (const action of ["filters", "new_search", "navigate", "hidden"]) {
+    const pending = deferred(); let target;
+    const app = createApp((request) => { if (request.pathname === "/api/community/presence") { target = request; return pending.promise; } });
+    await searchModel(app, "sample_channel"); const signal = modelCalls(app)[0].options.signal;
+    if (action === "filters") { app.get("search-channel").value = "other_channel"; await app.get("search-channel").dispatch("input"); }
+    if (action === "new_search") { app.get("search-account").value = "new_account"; await app.get("search-form").dispatch("submit"); await settle(); }
+    if (action === "navigate") app.navigate("health");
+    if (action === "hidden") app.visibility(true);
+    assert.equal(signal.aborted, true, action); pending.resolve(communityModel(target)); await settle();
+    if (action !== "new_search") assert.equal(modelCells(app).length, 0, action);
+  }
+});
+
+test("Community model selected-broadcast request uses the resolved half-open bounds and exact evaluated-point title scope", async () => {
+  const from = "2026-10-23T11:30:00.000Z", to = "2026-10-23T12:30:00.001Z";
+  const app = createApp((target) => {
+    if (target.pathname === "/api/broadcasts") return { broadcasts: [{ id: 9, channel: "sample_channel", title: "Stored broadcast", started_at: from, last_live_at: "2026-10-23T12:30:00Z" }], next_before: null };
+    if (target.pathname === "/api/timeline") return timeline([], { effective_range: { from, to }, broadcast: { id: 9, channel: "sample_channel", started_at: from, last_live_at: "2026-10-23T12:30:00Z" } });
+    if (target.pathname === "/api/community/presence") return communityModel(target);
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt();
+  });
+  await settle(); app.navigate("broadcasts"); app.get("broadcasts-account").value = "sample_account";
+  await app.get("broadcasts-form").dispatch("submit"); await settle();
+  const open = descendants(app.get("broadcasts-results")).find((item) => item.tagName === "BUTTON" && item.textContent === "View summary / visits / events"); await open.dispatch("click"); await settle();
+  assert.equal(modelCalls(app).length, 1); const target = modelCalls(app)[0].target;
+  assert.equal(target.searchParams.get("broadcast_id"), "9"); assert.equal(target.searchParams.has("channel"), false); assert.equal(target.searchParams.get("from"), from); assert.equal(target.searchParams.get("to"), to);
+  timelineElement(app, "timeline-model-inspector", "broadcast-timeline").focus(); await app.advance(180);
+  const title = app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1);
+  assert.equal(title.target.searchParams.get("broadcast_id"), "9"); assert.equal(title.target.searchParams.get("at"), communityModel(target).cells[0].evaluated_at);
+});
+
+test("Community model 2048-cell rendering keeps one inspector and no per-cell listeners or tables, using theme tokens and distinct patterns", async () => {
+  const app = createApp((target) => {
+    if (target.pathname !== "/api/community/presence") return;
+    const result = communityModel(target), from = Date.parse(result.effective_range.from), to = Date.parse(result.effective_range.to);
+    result.cells = Array.from({ length: 2048 }, (_, index) => { const left = Math.round(from + (to - from) * index / 2048), right = Math.round(from + (to - from) * (index + 1) / 2048); return { ...result.cells[2], from: new Date(left).toISOString(), to: new Date(right).toISOString(), evaluated_at: new Date(Math.floor(left + (right - left) / 2)).toISOString() }; });
+    result.cell_width_seconds = (to - from) / 2048000; return result;
+  });
+  await searchModel(app, "sample_channel"); assert.equal(modelCells(app).length, 2048);
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-model-inspector")).length, 1);
+  assert.ok(modelCells(app).every((item) => item.listeners.size === 0 && item.attributes.tabindex === undefined));
+  const patterns = descendants(timelineChart(app)).filter((item) => item.tagName === "PATTERN"); assert.equal(patterns.length, 5);
+  assert.match(stylesheet, /\.model-pattern-background\.estimated_present\s*\{\s*fill: var\(--good\)/);
+  assert.match(stylesheet, /\.model-pattern-background\.estimated_absent\s*\{\s*fill: var\(--bad\)/);
+  assert.match(stylesheet, /@media \(max-width: 600px\)[\s\S]*?\.model-assumptions-form\s*\{\s*grid-template-columns: minmax\(0, 1fr\)/);
+});
+
+
+test("Community model exact probability thresholds and inclusive fractional assumptions remain conditional rather than rounded confidence", async () => {
+  const app = createApp((target) => {
+    if (target.pathname !== "/api/community/presence") return;
+    const model = communityModel(target);
+    Object.assign(model.cells[0], { presence_probability: 1, sensitivity_min: 0.99, sensitivity_max: 1 });
+    Object.assign(model.cells[1], { presence_probability: 0, sensitivity_min: 0, sensitivity_max: 0.01 });
+    Object.assign(model.cells[2], { presence_probability: 0.9899999999, sensitivity_min: 0.98, sensitivity_max: 0.999 });
+    return model;
+  });
+  await searchModel(app, "sample_channel");
+  assert.equal(modelCells(app).filter((cell) => cell.classList.contains("estimated_present")).length, 1);
+  assert.equal(modelCells(app).filter((cell) => cell.classList.contains("estimated_absent")).length, 1);
+  assert.equal(modelCells(app).filter((cell) => cell.classList.contains("uncertain")).length, 1);
+  const values = { connected_minutes: 5, disconnected_minutes: 10080, detection_scale: 0.05, false_report_ratio: 0.1, lag_seconds: 0, max_gap_seconds: 21600 };
+  for (const [key, value] of Object.entries(values)) modelControl(app, key).value = String(value);
+  await descendants(app.get("timeline-results")).find((item) => item.classList.contains("model-assumptions-form")).dispatch("submit"); await settle();
+  assert.equal(modelCalls(app).length, 2);
+  for (const [key, value] of Object.entries(values)) assert.equal(Number(modelCalls(app).at(-1).target.searchParams.get(key)), value);
+  const inspector = timelineElement(app, "timeline-model-inspector"); inspector.focus(); await inspector.dispatch("keydown", { key: "ArrowRight" }); await inspector.dispatch("keydown", { key: "ArrowRight" });
+  assert.match(inspector.attributes["aria-label"], /Model uncertain.*P\(present\)=0.9899999999/);
+});
+
+test("Community model preserves microsecond evaluated_at in historical-title requests even for a one-millisecond display cell", async () => {
+  const from = "2026-10-23T12:00:00.000Z", to = "2026-10-23T12:00:00.001Z", evaluated = "2026-10-23T12:00:00.000500Z";
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([], { effective_range: { from, to } });
+    if (target.pathname === "/api/community/presence") return communityModel(target, { cells: [{ from, to, evaluated_at: evaluated, classification: "unknown", presence_probability: null, sensitivity_min: null, sensitivity_max: null, unknown_reason: "outside_support_or_segment_boundary" }], cell_width_seconds: 0.001 });
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt();
+  });
+  await searchModel(app, "sample_channel"); assert.equal(modelCells(app).length, 1);
+  timelineElement(app, "timeline-model-inspector").focus(); await app.advance(180);
+  assert.equal(app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1).target.searchParams.get("at"), evaluated);
+  assert.match(timelineElement(app, "timeline-hover").textContent, /exact evaluation UTC 2026-10-23T12:00:00.000500Z/);
+});
+
+test("Community model asynchronous completion preserves raw hover/focus and completed-channel processing details", async () => {
+  const second = deferred();
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline([timelineVisit(), timelineVisit({ id: 9, channel: "second_channel" })]);
+    if (target.pathname === "/api/community/presence") return target.searchParams.get("channel") === "second_channel" ? second.promise.then(() => communityModel(target)) : communityModel(target);
+    if (target.pathname.endsWith("/metadata/at")) return metadataAt();
+  });
+  await searchModel(app);
+  const raw = descendants(timelineChart(app)).find((item) => item.classList.contains("positive-point")); raw.focus(); await app.advance(180);
+  const oldGraphic = timelineChart(app), hover = timelineElement(app, "timeline-hover"), text = hover.textContent;
+  const details = descendants(app.get("timeline-results")).find((item) => item.modelDetails)?.modelDetails; details.open = true;
+  second.resolve(); await settle();
+  assert.equal(timelineChart(app), oldGraphic); assert.equal(app.document.activeElement, raw); assert.equal(hover.textContent, text); assert.equal(details.open, true);
+  assert.ok(descendants(app.get("timeline-results")).includes(details));
+});
+
+
+test("Community model assumption changes reset the bounded overview cache and remove old-scope processing rows", async () => {
+  const app = createApp((target) => {
+    if (target.pathname === "/api/timeline") return timeline(Array.from({ length: 8 }, (_, index) => timelineVisit({ id: index + 1, channel: "m_channel_" + index })));
+    if (target.pathname === "/api/community/receipts") return { rows: target.searchParams.has("before_member_id") ? Array.from({ length: 8 }, (_, index) => communityReceipt(800 - index, { channel: "a_channel_" + index })) : [communityReceipt(900, { channel: "z_channel" })], next_before_member_id: target.searchParams.has("before_member_id") ? null : 900 };
+    if (target.pathname === "/api/community/presence") return communityModel(target);
+  });
+  await searchModel(app); assert.equal(modelCalls(app).length, 8);
+  await timelineButton(app, "Load more Community ticks").dispatch("click"); await settle(); assert.equal(modelCalls(app).length, 8);
+  modelControl(app, "detection_scale").value = "0.6"; await modelControl(app, "detection_scale").dispatch("input");
+  await descendants(app.get("timeline-results")).find((item) => item.classList.contains("model-assumptions-form")).dispatch("submit"); await settle();
+  assert.equal(modelCalls(app).length, 16);
+  const rows = descendants(app.get("timeline-results")).filter((item) => item.classList.contains("model-channel-status"));
+  assert.equal(rows.length, 8); assert.ok(rows.every((row) => row.textContent.startsWith("a_channel_")));
+  assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-model-inspector")).length, 8);
 });

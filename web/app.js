@@ -777,6 +777,7 @@
         result.replaceChildren(content);
         result.classList.toggle("stale", state.dirty);
         message(prefix + "-message", state.dirty ? "Filters changed. Submit the search to update these results." : "Loaded " + clock.format(new Date()) + ". Results do not update automatically.", state.dirty ? "warning" : "");
+        if (typeof content.afterAttach === "function") content.afterAttach();
       } catch (error) {
         if (generation !== state.generation) return;
         if (!state.loaded) result.replaceChildren(empty("Results unavailable. Retry the search."));
@@ -951,7 +952,7 @@
     query.timelineBefore = before;
     data.community_receipts = [];
     data.community_next = null;
-    if (query.source !== "irc" && !data.empty && Date.parse(range.to) > Date.parse(range.from)) {
+    if (query.source !== "irc" && Date.parse(range.to) > Date.parse(range.from)) {
       try {
         const community = await fetchCommunityReceipts({ ...query, limit: 100 }, null);
         data.community_receipts = rows(community, "rows");
@@ -960,6 +961,65 @@
     }
     if (query.source === "community") { data.has_more = false; data.next_before = null; }
     return data;
+  }
+
+  const modelFields = [
+    ["connected_minutes", "Assumed connected duration (minutes)", 60, 5, 1440, "Mean connected duration assumed by the transition model; not measured attendance."],
+    ["disconnected_minutes", "Assumed disconnected duration (minutes)", 720, 30, 10080, "Mean disconnected duration assumed by the model; not learned from this account."],
+    ["detection_scale", "Detection scale", 0.5, 0.05, 1, "Assumed scaling of response inclusion. Actual detection rate and population coverage are unknown."],
+    ["false_report_ratio", "False-report ratio", 0.01, 0.0001, 0.1, "Assumed relative false-report rate. This setting is not empirically calibrated."],
+    ["lag_seconds", "Assumed receipt lag (seconds)", 30, 0, 300, "Assumed response lag; actual server freshness remains unknown."],
+    ["max_gap_seconds", "Maximum supported gap (seconds)", 3600, 60, 21600, "Larger observation gaps remain unknown. This is a modeling rule, not a collection guarantee."],
+  ];
+  const modelClasses = { estimated_present: "Estimated present under the model", estimated_absent: "Estimated absent under the model", uncertain: "Model uncertain", unknown: "Model unknown" };
+  const modelStatuses = { ok: "Model evaluations available", no_data: "No successful samples in the model context", insufficient_data: "Insufficient usable observations", role_unsupported: "Account role is unsupported by this model", input_limit: "Input limit reached; no partial estimates shown", analysis_busy: "Analysis busy; retry explicitly", analysis_timeout: "Analysis deadline reached; no partial estimates shown" };
+  const modelCounters = [["successful_in_context", "Successful samples in context"], ["attempts_in_id_span", "Attempts in source ID span"], ["eligible_observations", "Eligible observations"], ["target_positive_receipts", "Target positive receipts"], ["segments", "Temporal segments"], ["modeled_segments", "Modeled segments"]];
+
+  function modelParameters(draft) {
+    return Object.fromEntries(modelFields.map(([key, title, fallback, min, max]) => {
+      const raw = draft && draft[key] !== undefined ? draft[key] : fallback;
+      const value = typeof raw === "string" && raw.trim() === "" ? NaN : Number(raw);
+      if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${title} must be a finite number from ${min} to ${max}.`);
+      return [key, value];
+    }));
+  }
+
+  function modelInstant(value) {
+    const milliseconds = Date.parse(value);
+    const fraction = typeof value === "string" && value.match(/\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/);
+    return milliseconds + (fraction ? (Number("0." + fraction[1]) * 1000) % 1 : 0);
+  }
+
+  function validateCommunityModel(data, query, channel, parameters) {
+    const invalid = () => { throw new Error("The local app returned an invalid or mismatched Community model response. No estimates are drawn."); };
+    const range = data.effective_range;
+    if (data.model_version !== "community_presence_v1" || data.calibration_status !== "uncalibrated" || data.probability_kind !== "model_based_pointwise" || data.inference !== "historical_smoother" || data.threshold !== 0.99 || data.left_censored !== true || data.account !== query.account || data.channel !== channel || (query.broadcast_id != null && data.broadcast_id !== query.broadcast_id) || !range || modelInstant(range.from) !== modelInstant(query.from) || modelInstant(range.to) !== modelInstant(query.to)) invalid();
+    if (!data.context_range || !Number.isFinite(Date.parse(data.context_range.from)) || !Number.isFinite(Date.parse(data.context_range.to)) || !Number.isFinite(Date.parse(data.as_of)) || !Number.isFinite(Date.parse(data.generated_at))) invalid();
+    if (typeof data.complete !== "boolean" || !Object.hasOwn(modelStatuses, data.status) || !Array.isArray(data.cells) || data.cells.length > 2048 || !Number.isInteger(data.sensitivity_scenarios) || data.sensitivity_scenarios < 0 || data.sensitivity_scenarios > 65) invalid();
+    if (!data.parameters || modelFields.some(([key]) => data.parameters[key] !== parameters[key])) invalid();
+    if (!data.sample_counts || modelCounters.some(([key]) => !Number.isSafeInteger(data.sample_counts[key]) || data.sample_counts[key] < 0)) invalid();
+    if (!data.excluded_reason_counts || Array.isArray(data.excluded_reason_counts) || Object.entries(data.excluded_reason_counts).length > 32 || Object.entries(data.excluded_reason_counts).some(([key, value]) => !/^[a-z][a-z0-9_]{0,80}$/.test(key) || !Number.isSafeInteger(value) || value < 0)) invalid();
+    if (!data.complete || data.status !== "ok") { if (data.cells.length || data.status === "ok") invalid(); return data; }
+    let previous = modelInstant(query.from);
+    for (const cell of data.cells) {
+      const from = modelInstant(cell.from), to = modelInstant(cell.to), at = modelInstant(cell.evaluated_at);
+      if (!Number.isFinite(from) || !Number.isFinite(to) || !Number.isFinite(at) || from !== previous || to <= from || to > modelInstant(query.to) || at < from || at >= to || Math.abs(at - (from + (to - from) / 2)) > 1 || !Object.hasOwn(modelClasses, cell.classification)) invalid();
+      const values = [cell.presence_probability, cell.sensitivity_min, cell.sensitivity_max];
+      if (cell.classification === "unknown") { if (values.some((value) => value !== null)) invalid(); }
+      else {
+        if (values.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) || cell.sensitivity_min > cell.presence_probability || cell.presence_probability > cell.sensitivity_max) invalid();
+        if (cell.classification === "estimated_present" && cell.sensitivity_min < 0.99 - 1e-12 || cell.classification === "estimated_absent" && cell.sensitivity_max > 0.01 + 1e-12) invalid();
+      }
+      if (cell.unknown_reason != null && (typeof cell.unknown_reason !== "string" || cell.unknown_reason.length > 100)) invalid();
+      previous = to;
+    }
+    if (!data.cells.length || data.sensitivity_scenarios < 1 || previous !== modelInstant(query.to) || !Number.isFinite(data.cell_width_seconds) || data.cell_width_seconds <= 0) invalid();
+    return data;
+  }
+
+  function modelPointText(channel, point) {
+    const probability = point.presence_probability === null ? "No supported probability" : `P(present)=${point.presence_probability}; tested-assumption sensitivity ${point.sensitivity_min} to ${point.sensitivity_max} (not a confidence interval)`;
+    return `${channel}: ${modelClasses[point.classification]} at evaluated point ${timelineText(point.evaluated_at)}; exact evaluation UTC ${point.evaluated_at}. ${probability}. Model-based, not empirically calibrated. Color represents this point only, not the whole display cell or broadcast.${point.unknown_reason ? " Reason: " + label(point.unknown_reason) + "." : ""}`;
   }
 
   function timelinePage(data, query, prefix) {
@@ -980,7 +1040,7 @@
     if (query.source !== "irc") result.append(node("p", "Community ticks show individual returned account receipts at their local receipt time. Server freshness is unknown. No interval, arrival, departure, or viewing time is inferred from them.", "table-note"));
     result.append(node("p", "The query period is not a frozen snapshot: stored evidence can change between page requests.", "table-note"));
     if (query.source !== "community" && (data.has_more || query.timelineBefore != null)) result.append(node("p", "Partial evidence page: additional evidence is on other pages and is not drawn here. The query period stays fixed. Zoom uses only this loaded page. Unmarked areas remain unknown; they are not evidence of absence.", "timeline-warning"));
-    if (data.empty || end <= start) {
+    if (end <= start) {
       result.append(empty("No overlapping timeline period is available for these bounds and broadcast metadata. Account presence remains unknown."));
       return result;
     }
@@ -999,8 +1059,144 @@
     }
     result.append(legend);
     const channelNames = [...new Set([...intervals, ...communityReceipts].map((item) => String(item.channel || "Unknown channel")))].sort((a, b) => a.localeCompare(b));
+    const explicitModelChannel = query.broadcast_id ? data.broadcast && data.broadcast.channel || query.channel : query.channel;
+    if (explicitModelChannel && !channelNames.includes(explicitModelChannel)) { channelNames.push(explicitModelChannel); channelNames.sort((a, b) => a.localeCompare(b)); }
     if (!channelNames.length) channelNames.push(data.channel || query.channel || "No recorded channel");
-    let height = 95 + channelNames.length * 58;
+    const modelEligible = Boolean(query.account) && query.source !== "irc";
+    if (query.modelEnabled === undefined) query.modelEnabled = modelEligible;
+    query.modelParameters = modelParameters(query.modelParameters);
+    const modelVisible = () => modelEligible && query.modelEnabled;
+    const rowSpacing = () => modelVisible() ? 98 : 58;
+    let modelGeneration = 0, modelController = null, modelRunning = false, modelLayer = null, modelLayerDraw = null, modelPause = "";
+    let modelStatus = null, modelRows = null, modelLegend = null, modelDisclosure = null, modelStatusIdentity = "";
+    const modelFieldsByKey = new Map();
+    const modelStatusRows = new Map();
+    function modelCache() {
+      const identity = JSON.stringify([query.account, query.channel || null, query.broadcast_id || null, query.from, query.to, modelFields.map(([key]) => query.modelParameters[key])]);
+      if (!query.modelCache || query.modelCache.identity !== identity) query.modelCache = { identity, channels: [], results: new Map() };
+      return query.modelCache;
+    }
+    function discoverModelChannels() {
+      const cache = modelCache();
+      for (const channel of explicitModelChannel ? [explicitModelChannel] : channelNames) if (/^[a-z0-9_]{1,25}$/.test(channel) && !cache.channels.includes(channel) && cache.channels.length < 8) cache.channels.push(channel);
+      return cache;
+    }
+    function currentModel(generation) {
+      return generation === modelGeneration && modelVisible() && !query.modelDirty && !document.hidden && !$("section-" + (prefix === "timeline" ? "history" : "broadcasts")).hidden && $(prefix + "-results").contains(result) && !$(prefix + "-results").classList.contains("stale");
+    }
+    function cancelModel(reason = "Estimate loading paused. Recalculate explicitly to continue.") {
+      modelGeneration += 1;
+      if (modelController) modelController.abort();
+      modelController = null; modelRunning = false; modelPause = reason;
+      updateModelStatus();
+    }
+    function updateModelStatus() {
+      if (!modelStatus) return;
+      const cache = discoverModelChannels();
+      if (modelStatusIdentity !== cache.identity) { modelStatusRows.clear(); modelRows.replaceChildren(); modelStatusIdentity = cache.identity; }
+      const visible = channelNames.filter((channel) => cache.channels.includes(channel));
+      const omitted = channelNames.filter((channel) => /^[a-z0-9_]{1,25}$/.test(channel) && !cache.channels.includes(channel));
+      modelLegend.hidden = !modelVisible(); modelDisclosure.hidden = !modelVisible() || query.modelDirty;
+      modelStatus.textContent = !query.modelEnabled ? "Community model estimates are hidden. Raw evidence is unchanged." : query.modelDirty ? "Assumptions changed. Apply them before using model estimates; the model lane is unknown meanwhile." : modelRunning ? "Loading complete channel histories sequentially for model analysis… Raw receipt pages are not model inputs." : modelPause || "Model processing is separate from observed receipts. Complete means processing completed, not confidence or calibrated support.";
+      if (query.modelEnabled && !query.modelDirty) {
+        const outcomes = new Map();
+        for (const channel of visible) { const entry = cache.results.get(channel); if (entry) { const status = entry.error ? "unavailable" : entry.data.status; outcomes.set(status, (outcomes.get(status) || 0) + 1); } }
+        for (const [status, total] of outcomes) modelStatus.textContent += ` ${count(total)} channel(s): ${status === "unavailable" ? "model unavailable; raw evidence remains usable" : modelStatuses[status]}.`;
+      }
+      if (omitted.length) modelStatus.textContent += ` ${count(omitted.length)} visible channel(s) omitted from this bounded eight-channel overview. Filter one channel to inspect it.`;
+      if (!visible.length) modelStatus.textContent += " No usable channel identities are loaded. Choose an explicit channel; missing receipts do not establish absence.";
+      for (const channel of visible) {
+        const entry = cache.results.get(channel);
+        let item = modelStatusRows.get(channel);
+        if (!item) { item = node("div", null, "model-channel-status"); modelStatusRows.set(channel, item); modelRows.append(item); }
+        if (entry && item.modelEntry === entry) continue;
+        const detailsOpen = item.modelDetails && item.modelDetails.open;
+        item.modelEntry = entry; item.replaceChildren();
+        item.append(node("strong", channel + ": "));
+        if (!entry) item.append(node("span", modelRunning ? "Waiting for complete model response; unknown" : "Not analyzed; unknown"));
+        else if (entry.error) item.append(node("span", "Model unavailable: " + entry.error + " Raw evidence remains usable; model lane is unknown."));
+        else {
+          const model = entry.data;
+          item.append(node("span", modelStatuses[model.status] + (model.complete ? " · processing complete" : " · processing incomplete") + (model.status !== "ok" ? " · no model probabilities drawn" : "")));
+          const details = node("details"); details.open = detailsOpen === true; item.modelDetails = details; details.append(node("summary", "Processing details / model scope"));
+          const list = node("dl");
+          detail(list, "Model", model.model_version + " · uncalibrated historical smoother");
+          detail(list, "Generated", timelineText(model.generated_at)); detail(list, "Inference cutoff", timelineText(model.as_of));
+          detail(list, "Left-censored segments", "Each segment starts at its first eligible positive receipt, not a known arrival.");
+          detail(list, "Observation context", timelineText(model.context_range.from) + " — " + timelineText(model.context_range.to));
+          detail(list, "Sensitivity scenarios", `${model.sensitivity_scenarios} finite central/corner assumptions; not all possible settings`);
+          for (const [key, title] of modelCounters) detail(list, title, count(model.sample_counts[key]));
+          for (const [key, value] of Object.entries(model.excluded_reason_counts)) detail(list, "Excluded · " + label(key), count(value));
+          details.append(list); item.append(details);
+        }
+      }
+    }
+    async function loadModels() {
+      if (!modelEligible || modelRunning) return;
+      const generation = modelGeneration;
+      if (!currentModel(generation)) { updateModelStatus(); return; }
+      const cache = discoverModelChannels();
+      modelRunning = true; modelPause = ""; updateModelStatus();
+      if (activeTimelineCancel && activeTimelineCancel !== cancelPending) activeTimelineCancel();
+      activeTimelineCancel = cancelPending;
+      try {
+        while (currentModel(generation)) {
+          const channel = cache.channels.find((candidate) => channelNames.includes(candidate) && !cache.results.has(candidate));
+          if (!channel) break;
+          const controller = new AbortController(); modelController = controller;
+          try {
+            const response = await api(url("/api/community/presence", { account: query.account, channel: query.broadcast_id ? undefined : channel, broadcast_id: query.broadcast_id, from: query.from, to: query.to, ...query.modelParameters }), { signal: controller.signal });
+            if (!currentModel(generation)) return;
+            cache.results.set(channel, { data: validateCommunityModel(response, query, channel, query.modelParameters) });
+          } catch (error) {
+            if (!currentModel(generation)) return;
+            cache.results.set(channel, { error: failure(error) });
+          } finally { if (generation === modelGeneration) modelController = null; }
+          updateModelStatus(); if (modelLayerDraw) modelLayerDraw();
+        }
+      } finally { if (generation === modelGeneration) { modelRunning = false; updateModelStatus(); } }
+    }
+    if (query.source !== "irc") {
+      const section = node("section", null, "community-model-controls"); section.setAttribute("aria-label", "Community model estimates");
+      const toggleLabel = node("label", null, "model-toggle");
+      const toggle = node("input"); toggle.type = "checkbox"; toggle.id = prefix + "-model-enabled"; toggle.checked = modelVisible(); toggle.disabled = !modelEligible;
+      toggleLabel.append(toggle, node("span", "Show Community model estimates")); section.append(toggleLabel);
+      if (!modelEligible) section.append(node("p", "Enter an exact account login to request Community model estimates. Channel-only receipts cannot support account inference.", "help"));
+      else {
+        section.append(node("h4", "Model estimates — uncalibrated"), node("p", "Model-based, not empirically calibrated. The 99% threshold is pointwise at each evaluated midpoint and must hold across all tested sensitivity scenarios. It is not certainty for a whole display cell, interval, path or broadcast. Modeled absence is conditional, never observed absence.", "model-disclaimer"));
+        const assumptions = node("details"); assumptions.open = query.modelAssumptionsOpen === true;
+        assumptions.append(node("summary", "Assumptions and model version · community_presence_v1"));
+        assumptions.addEventListener("toggle", () => { query.modelAssumptionsOpen = assumptions.open; });
+        const form = node("form", null, "model-assumptions-form"); form.setAttribute("aria-label", "Model assumptions");
+        for (const [key, title, fallback, min, max, help] of modelFields) {
+          const field = node("div", null, "field"); const label = node("label", title); const input = node("input");
+          input.id = prefix + "-model-" + key; input.type = "number"; input.min = min; input.max = max; input.step = "any"; input.required = true;
+          input.value = String(query.modelDraft && query.modelDraft[key] !== undefined ? query.modelDraft[key] : query.modelParameters[key] ?? fallback);
+          label.htmlFor = input.id;
+          const hint = node("p", `${help} Allowed ${min}–${max}; fractional values are accepted.`, "help"); hint.id = input.id + "-help"; input.setAttribute("aria-describedby", hint.id);
+          input.addEventListener("input", () => { query.modelDraft = Object.fromEntries([...modelFieldsByKey].map(([name, control]) => [name, control.value])); query.modelDirty = true; cancelHover(); cancelModel("Assumptions changed."); apply.disabled = false; if (modelLayerDraw) modelLayerDraw(); });
+          modelFieldsByKey.set(key, input); field.append(label, input, hint); form.append(field);
+        }
+        const apply = button("Apply assumptions", () => {}); apply.type = "submit"; apply.id = prefix + "-model-apply"; apply.disabled = !query.modelDirty;
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          if ($(prefix + "-results").classList.contains("stale")) { modelStatus.textContent = "Search filters changed. Submit the search before recalculating."; return; }
+          try { const parameters = modelParameters(Object.fromEntries([...modelFieldsByKey].map(([key, input]) => [key, input.value]))); cancelHover(); cancelModel(); query.modelParameters = parameters; query.modelDraft = { ...parameters }; query.modelDirty = false; apply.disabled = true; modelPause = ""; modelCache(); updateModelStatus(); if (modelLayerDraw) modelLayerDraw(); loadModels(); }
+          catch (error) { modelStatus.textContent = failure(error); }
+        });
+        form.append(apply); assumptions.append(form, node("p", "These are declared assumptions, not learned rates. Actual detection, freshness, population coverage and calibration remain unknown. Historical smoothing uses observations through the inference cutoff, including later observations to estimate earlier points. The six-hour context is bounded; no temporal extrapolation is claimed. The displayed sensitivity range is not a confidence interval.", "help"));
+        section.append(assumptions);
+        const retry = button("Recalculate model", () => { if ($(prefix + "-results").classList.contains("stale") || query.modelDirty) return; cancelHover(); cancelModel(); const cache = modelCache(); for (const channel of channelNames) cache.results.delete(channel); modelPause = ""; updateModelStatus(); if (modelLayerDraw) modelLayerDraw(); loadModels(); }); retry.id = prefix + "-model-recalculate";
+        modelStatus = node("p", null, "model-status"); modelStatus.id = prefix + "-model-status"; modelStatus.setAttribute("role", "status"); modelStatus.setAttribute("aria-live", "polite");
+        modelLegend = node("ul", null, "timeline-legend model-legend");
+        for (const [key, title] of Object.entries(modelClasses)) { const item = node("li"); const swatch = node("span", null, "timeline-key model-key " + key); swatch.setAttribute("aria-hidden", "true"); item.append(swatch, node("span", title)); modelLegend.append(item); }
+        modelDisclosure = node("details", null, "model-processing-details"); modelDisclosure.append(node("summary", "Per-channel processing, exclusions and model scope")); modelRows = node("div"); modelDisclosure.append(modelRows);
+        section.append(retry, modelStatus, modelLegend, modelDisclosure);
+        toggle.addEventListener("change", () => { query.modelEnabled = toggle.checked; cancelModel(); modelPause = ""; height = 95 + channelNames.length * rowSpacing(); renderViewport(); updateModelStatus(); if (query.modelEnabled) loadModels(); });
+      }
+      result.append(section);
+    }
+    let height = 95 + channelNames.length * rowSpacing();
     const minimumSpan = Math.min(1000, loadedEnd - loadedStart);
     const controls = node("div", null, "timeline-zoom-controls");
     controls.setAttribute("role", "group"); controls.setAttribute("aria-label", "Timeline zoom");
@@ -1036,8 +1232,8 @@
         data.community_error = null;
         channelNames.splice(0, channelNames.length, ...[...new Set([...intervals, ...communityReceipts].map((item) => String(item.channel || "Unknown channel")))].sort((a, b) => a.localeCompare(b)));
         if (!channelNames.length) channelNames.push(data.channel || query.channel || "No recorded channel");
-        height = 95 + channelNames.length * 58;
-        renderViewport();
+        height = 95 + channelNames.length * rowSpacing();
+        renderViewport(); updateModelStatus(); loadModels();
       } catch (error) { if (generation === receiptGeneration) data.community_error = failure(error); }
       finally { if (generation === receiptGeneration) { receiptLoading = false; updateReceiptStatus(); } }
     }
@@ -1047,7 +1243,7 @@
     hover.setAttribute("role", "status"); hover.setAttribute("aria-live", "polite");
     hover.setAttribute("aria-label", "Stored broadcast metadata; scroll for full details");
     result.append(hover);
-    const hoverPrompt = "Hover or focus an IRC positive receipt, a Community receipt tick, or an uncertain patterned span to inspect stored broadcast title metadata. Metadata does not establish account viewing.";
+    const hoverPrompt = "Hover or focus an IRC positive receipt, a Community receipt tick, an uncertain IRC span, or a model evaluation point to inspect stored broadcast title metadata. Metadata does not establish account viewing.";
     let hoverTimer = null, hoverController = null, hoverGeneration = 0, hoverKey = null, cancelDrag = null, hoverComplete = false;
     function cancelHover(keepResult = false) {
       hoverGeneration += 1; hoverKey = null;
@@ -1059,6 +1255,7 @@
     function cancelPending() {
       cancelHover(); if (cancelDrag) cancelDrag();
       receiptGeneration += 1; receiptLoading = false;
+      cancelModel();
       updateReceiptStatus();
       if (activeTimelineCancel === cancelPending) activeTimelineCancel = null;
     }
@@ -1066,9 +1263,9 @@
     function currentHover(generation) {
       return generation === hoverGeneration && !document.hidden && !$("section-" + (prefix === "timeline" ? "history" : "broadcasts")).hidden && $(prefix + "-results").contains(result) && !$(prefix + "-results").classList.contains("stale");
     }
-    function scheduleHover(channel, at, evidence) {
+    function scheduleHover(channel, at, evidence, modelPoint = false) {
       if (!Number.isFinite(at)) return;
-      const selectedAt = new Date(Math.max(start, Math.min(end - 1, Math.floor(at)))).toISOString();
+      const selectedAt = modelPoint || new Date(Math.max(start, Math.min(end - 1, Math.floor(at)))).toISOString();
       const key = `${channel}:${selectedAt}:${evidence}`;
       if (key === hoverKey) return;
       if (activeTimelineCancel && activeTimelineCancel !== cancelPending) activeTimelineCancel();
@@ -1115,7 +1312,7 @@
     function renderViewport() {
       cancelHover();
       if (cancelDrag) cancelDrag();
-      viewport.textContent = `Visible viewport (local): ${timelineText(new Date(start).toISOString())} inclusive — ${timelineText(new Date(end).toISOString())} exclusive. Current loaded evidence page only.`;
+      viewport.textContent = `Visible viewport (local): ${timelineText(new Date(start).toISOString())} inclusive — ${timelineText(new Date(end).toISOString())} exclusive. ${modelVisible() ? "Raw evidence page plus separately computed model evaluations." : "Current loaded evidence page only."}`;
       zoomIn.disabled = end - start <= minimumSpan;
       zoomOut.disabled = reset.disabled = start === loadedStart && end === loadedEnd;
       const priorScroll = display.children[0];
@@ -1125,10 +1322,14 @@
       intervalDetails = null; receiptDetails = null;
       display.replaceChildren();
       const graphic = svgElement("svg", { id: prefix + "-chart", viewBox: `0 0 1000 ${height}`, width: 1000, height, role: "img", "aria-labelledby": prefix + "-chart-title " + prefix + "-chart-description" });
-      graphic.append(svgElement("title", { id: prefix + "-chart-title" }, `Chat evidence for ${data.account || query.account || query.channel}, grouped by channel on a shared time axis`), svgElement("desc", { id: prefix + "-chart-description" }, `Visible viewport ${timelineText(new Date(start).toISOString())} inclusive to ${timelineText(new Date(end).toISOString())} exclusive. Community ticks mark individual local receipts. Actual IRC receipt endpoint dots and PART diamonds are separate from patterned uncertain inference. Unmarked and unloaded evidence is unknown. Exact times and evidence basis follow in tables.`));
+      graphic.append(svgElement("title", { id: prefix + "-chart-title" }, `Chat evidence for ${data.account || query.account || query.channel}, grouped by channel on a shared time axis`), svgElement("desc", { id: prefix + "-chart-description" }, `Visible viewport ${timelineText(new Date(start).toISOString())} inclusive to ${timelineText(new Date(end).toISOString())} exclusive. Community ticks mark individual local receipts. ${modelVisible() ? "Separate model lanes show uncalibrated midpoint evaluations, not guaranteed intervals; Left/Right and Home/End inspect model points. " : ""}Actual IRC receipt endpoint dots and PART diamonds are separate from patterned uncertain inference. Unmarked and unloaded evidence is unknown. Exact times and evidence basis follow in tables.`));
       const defs = svgElement("defs");
       const pattern = svgElement("pattern", { id: prefix + "-hatch", width: 7, height: 7, patternUnits: "userSpaceOnUse" });
       pattern.append(svgElement("path", { d: "M-2 2L2 -2M0 7L7 0M5 9L9 5", class: "timeline-hatch" })); defs.append(pattern); graphic.append(defs);
+      for (const [classification, path] of [["estimated_present", "M0 2H8M0 6H8"], ["estimated_absent", "M0 0L8 8M8 0L0 8"], ["uncertain", "M1 1h2v2H1zM5 5h2v2H5z"], ["unknown", "M0 4H3M5 4H8"]]) {
+        const hatch = svgElement("pattern", { id: prefix + "-model-" + classification, width: 8, height: 8, patternUnits: "userSpaceOnUse" });
+        hatch.append(svgElement("rect", { width: 8, height: 8, class: "model-pattern-background " + classification }), svgElement("path", { d: path, class: "model-pattern " + classification })); defs.append(hatch);
+      }
       const x = (at) => 180 + 790 * (at - start) / (end - start);
       for (let tick = 0; tick <= 4; tick += 1) {
         const at = start + (end - start) * tick / 4;
@@ -1137,7 +1338,7 @@
         graphic.append(svgElement("line", { x1: position, y1: 47, x2: position, y2: height - 20, class: "chart-axis" }), svgElement("text", { x: position, y: 18, "text-anchor": anchor, class: "timeline-axis-label" }, timelineDay.format(new Date(at))), svgElement("text", { x: position, y: 35, "text-anchor": anchor, class: "timeline-axis-label" }, timelineTime.format(new Date(at))));
       }
       for (const [index, channel] of channelNames.entries()) {
-        const y = 62 + index * 58;
+        const y = 62 + index * rowSpacing();
         const channelLabel = channel.length > 16 ? channel.slice(0, 15) + "…" : channel;
         const channelAttributes = { x: 12, y: y + 17, class: "timeline-channel" };
         // Leave a 12px gutter before the plot, even for wide valid login glyphs.
@@ -1148,7 +1349,7 @@
         if (data.broadcast) graphic.append(svgElement("rect", { x: 180, y: y - 3, width: 790, height: 38, class: "timeline-window" }));
       }
       for (const item of intervals) {
-        const y = 78 + channelNames.indexOf(String(item.channel || "Unknown channel")) * 58;
+        const y = 78 + channelNames.indexOf(String(item.channel || "Unknown channel")) * rowSpacing();
         const inferenceFrom = Date.parse(item.inference_from), inferenceTo = Date.parse(item.inference_to);
         if (item.kind === "visit" && item.supported_visit === true && !item.out_of_order && Number.isFinite(inferenceFrom) && Number.isFinite(inferenceTo)) {
           const left = Math.max(start, inferenceFrom), right = Math.min(end, inferenceTo);
@@ -1175,15 +1376,72 @@
       for (const receipt of communityReceipts) {
         const at = Date.parse(receipt.received_at_utc);
         if (!Number.isFinite(at) || at < start || at >= end) continue;
-        const y = 78 + channelNames.indexOf(String(receipt.channel || "Unknown channel")) * 58;
+        const y = 78 + channelNames.indexOf(String(receipt.channel || "Unknown channel")) * rowSpacing();
         const tick = svgElement("rect", { x: x(at) - 1.8, y: y - 12, width: 3.6, height: 24, class: "timeline-community" });
         tick.append(svgElement("title", {}, communityReceiptText(receipt)));
         bindHover(tick, receipt.channel, at, communityReceiptText(receipt), at);
         graphic.append(tick);
       }
+      modelLayer = svgElement("g", { class: "timeline-model-layer" });
+      const modelGroups = new Map();
+      if (modelVisible()) for (const channel of channelNames) {
+        const group = svgElement("g", { "data-channel": channel }); modelGroups.set(channel, group); modelLayer.append(group);
+      }
+      graphic.append(modelLayer);
+      modelLayerDraw = () => {
+        const cache = discoverModelChannels();
+        for (const [channel, group] of modelGroups) {
+          const entry = query.modelDirty ? null : cache.results.get(channel);
+          if (group.modelDrawn && group.modelEntry === entry && group.modelDirty === query.modelDirty) continue;
+          group.modelDrawn = true; group.modelEntry = entry; group.modelDirty = query.modelDirty;
+          const y = 104 + channelNames.indexOf(channel) * rowSpacing();
+          group.replaceChildren(svgElement("text", { x: 12, y: y + 17, class: "timeline-model-caption" }, "Model points"), svgElement("rect", { x: 180, y, width: 790, height: 24, class: "timeline-model-unknown", "aria-hidden": "true" }), svgElement("rect", { x: 180, y, width: 790, height: 24, fill: `url(#${prefix}-model-unknown)`, "aria-hidden": "true", "pointer-events": "none" }));
+          const model = entry && entry.data;
+          if (!model || !model.complete || model.status !== "ok") continue;
+          const points = [];
+          for (const point of model.cells) {
+            const left = Math.max(start, modelInstant(point.from)), right = Math.min(end, modelInstant(point.to));
+            if (right <= left) continue;
+            points.push(point);
+            group.append(svgElement("rect", { x: x(left), y, width: x(right) - x(left), height: 24, fill: `url(#${prefix}-model-${point.classification})`, class: "timeline-model-cell " + point.classification, "data-evaluated-at": point.evaluated_at }));
+          }
+          if (!points.length) continue;
+          let selected = 0;
+          const cursor = svgElement("line", { y1: y + 3, y2: y + 21, class: "timeline-model-midpoint", "pointer-events": "none", "aria-hidden": "true", visibility: "hidden" });
+          const inspector = svgElement("rect", { x: 180, y, width: 790, height: 24, class: "timeline-model-inspector", tabindex: 0, "aria-describedby": hover.id });
+          function inspectPoint(index, lookup = true) {
+            selected = Math.max(0, Math.min(points.length - 1, index));
+            const point = points[selected], at = modelInstant(point.evaluated_at), evidence = modelPointText(channel, point);
+            inspector.setAttribute("aria-label", evidence + " Use Left/Right or Home/End to inspect other model points in this channel.");
+            inspector.replaceChildren(svgElement("title", {}, evidence));
+            cursor.setAttribute("x1", x(at)); cursor.setAttribute("x2", x(at)); cursor.setAttribute("visibility", at >= start && at < end ? "visible" : "hidden");
+            if (lookup) scheduleHover(channel, at, evidence, point.evaluated_at);
+          }
+          function inspectPointer(event) {
+            if (drag || event.pointerType === "touch") return;
+            const position = plotPosition(event); if (!position) return;
+            const at = start + (end - start) * (Math.max(180, Math.min(970, position.x)) - 180) / 790;
+            let low = 0, high = points.length - 1;
+            while (low < high) { const middle = Math.floor((low + high) / 2); if (at < modelInstant(points[middle].to)) high = middle; else low = middle + 1; }
+            inspectPoint(low);
+          }
+          inspector.addEventListener("pointerenter", inspectPointer); inspector.addEventListener("pointermove", inspectPointer);
+          inspector.addEventListener("pointerleave", () => cancelHover(true)); inspector.addEventListener("blur", () => cancelHover(true));
+          inspector.addEventListener("focus", () => { if (!drag) inspectPoint(selected); });
+          inspector.addEventListener("keydown", (event) => {
+            if (event.key === "Escape") { cancelHover(); return; }
+            const index = event.key === "ArrowLeft" ? selected - 1 : event.key === "ArrowRight" ? selected + 1 : event.key === "Home" ? 0 : event.key === "End" ? points.length - 1 : null;
+            if (index === null) return;
+            event.preventDefault(); inspectPoint(index);
+          });
+          inspectPoint(0, false);
+          group.append(cursor, inspector);
+        }
+      };
+      modelLayerDraw();
       const scroll = node("div", null, "timeline-scroll");
       scroll.tabIndex = 0; scroll.setAttribute("role", "region"); scroll.setAttribute("aria-label", "Scrollable account evidence timeline; exact values are in the following evidence table"); scroll.append(graphic); display.append(scroll); scroll.scrollLeft = previousScroll;
-      if (!intervals.length && !communityReceipts.length) display.append(node("p", "No matching evidence is loaded in this period. The entire visible period remains unknown; this does not establish absence.", "table-note"));
+      if (!intervals.length && !communityReceipts.length) display.append(node("p", modelVisible() ? "No matching raw evidence is loaded in this period. Raw source evidence remains unknown; separate model estimates can use complete earlier context under declared assumptions." : "No matching evidence is loaded in this period. The entire visible period remains unknown; this does not establish absence.", "table-note"));
       const details = node("details", null, "timeline-details");
       details.append(node("summary", `Exact times and evidence basis (${count(intervals.length)} segments on this page)`));
       details.append(table(["Channel / session", "Evidence quality", "Actual positive endpoint receipts", "Uncertain inference shown", "Actual PART receipts / boundary"], intervals, (item) => {
@@ -1211,7 +1469,7 @@
       }, "Equivalent timeline evidence · exact local receipt times and UTC · IRC observations only · unknown is not absence"));
       details.open = detailsOpen; if (query.source !== "community") { display.append(details); intervalDetails = details; }
       if (communityReceipts.length) { const receipts = node("details", null, "timeline-details"); receipts.append(node("summary", `Exact Community receipt times and source (${count(communityReceipts.length)} loaded)`), communityReceiptTable({ rows: communityReceipts })); receipts.open = communityDetailsOpen; display.append(receipts); receiptDetails = receipts; }
-      const plotTop = 62, plotBottom = 62 + (channelNames.length - 1) * 58 + 32;
+      const plotTop = 62, plotBottom = 62 + (channelNames.length - 1) * rowSpacing() + (modelVisible() ? 72 : 32);
       const selection = svgElement("rect", { x: 180, y: plotTop, width: 0, height: plotBottom - plotTop, class: "timeline-selection", visibility: "hidden", "aria-hidden": "true" });
       graphic.append(selection);
       let drag = null;
@@ -1225,17 +1483,17 @@
           return Number.isFinite(local.x) && Number.isFinite(local.y) ? local : null;
         } catch (_) { return null; }
       }
-      function bindHover(shape, channel, exactAt, evidence, focusAt) {
+      function bindHover(shape, channel, exactAt, evidence, focusAt, modelPoint = false) {
         shape.setAttribute("tabindex", "0"); shape.setAttribute("aria-describedby", hover.id);
         shape.setAttribute("aria-label", `${channel}: ${evidence}. Focus inspects metadata at ${timelineText(new Date(focusAt).toISOString())}.`);
         function inspect(event) {
           if (drag || event.pointerType === "touch") return;
           const position = exactAt === null ? plotPosition(event) : null;
-          if (exactAt !== null || position) scheduleHover(channel, exactAt === null ? start + (end - start) * (position.x - 180) / 790 : exactAt, evidence);
+          if (exactAt !== null || position) scheduleHover(channel, exactAt === null ? start + (end - start) * (position.x - 180) / 790 : exactAt, evidence, modelPoint);
         }
         shape.addEventListener("pointerenter", inspect); shape.addEventListener("pointermove", inspect);
         shape.addEventListener("pointerleave", () => cancelHover(true));
-        shape.addEventListener("focus", () => { if (!drag) scheduleHover(channel, focusAt, evidence); });
+        shape.addEventListener("focus", () => { if (!drag) scheduleHover(channel, focusAt, evidence, modelPoint); });
         shape.addEventListener("blur", () => cancelHover(true));
         shape.addEventListener("keydown", (event) => { if (event.key === "Escape") cancelHover(); });
       }
@@ -1278,6 +1536,8 @@
       graphic.addEventListener("pointerleave", () => { cancelHover(true); if (drag && !graphic.hasPointerCapture(drag.pointerId)) finishDrag(); });
     }
     renderViewport();
+    updateModelStatus();
+    result.afterAttach = loadModels;
     return result;
   }
 

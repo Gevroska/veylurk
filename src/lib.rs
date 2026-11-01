@@ -11,9 +11,11 @@ pub mod diagnostics;
 pub mod history;
 pub mod irc;
 pub mod metadata;
+pub mod presence_model;
 pub mod runtime;
 pub mod shutdown;
 pub mod store;
+mod store_presence_model;
 pub mod timeline;
 
 pub const COMMUNITY_TAB_HASH: &str =
