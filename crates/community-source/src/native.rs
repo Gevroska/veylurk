@@ -6,9 +6,9 @@ use crate::host::{
     SourceFailure, SourceSample, Status, WindowDismissal, RECYCLE_NAVIGATIONS,
 };
 use crate::{
-    channel_login, is_channel_page, is_popout_page, parse_response,
+    channel_login, parse_response,
     sampling::{self, BodyRequest, Config, RunEvidence, Schedule, Tracker},
-    Evidence, Failure, MAX_SAMPLES,
+    Evidence, Failure, SourcePage, MAX_SAMPLES,
 };
 use serde::Deserialize;
 use std::sync::{atomic::Ordering, mpsc::TryRecvError};
@@ -56,9 +56,19 @@ const COMMUNITY_UI: &str = r#"(() => {
     || buttons.find(e => (e.textContent || '').trim() === 'Community');
   const player = buttons.find(e => e.getAttribute('data-a-target') === 'player-play-pause-button')
     || buttons.find(e => /^(Pause|Play) \(space\/k\)$/.test(label(e)));
-  const signed_in = buttons.some(e => label(e) === 'User Avatar' || e.querySelector('img[alt="User Avatar"]'))
+  const identity = buttons.find(e => label(e) === 'ChatBadgeCarousel'
+    && e.getAttribute('data-a-target') === 'chat-badge-carousel-badge-icon'
+    && !e.disabled && e.closest('[data-a-target="chat-badge-carousel"]'));
+  const signed_in = (__POPOUT__ ? !!identity
+    : buttons.some(e => label(e) === 'User Avatar' || e.querySelector('img[alt="User Avatar"]')))
     && !buttons.some(e => e.getAttribute('data-a-target') === 'login-button');
-  const chat_ready = !!document.querySelector('[data-a-target="chat-input"],.chat-scrollable-area__message-container');
+  const chat_input = document.querySelector('[data-a-target="chat-input"]');
+  const chat_ready = __POPOUT__ ? !!chat_input && visible(chat_input)
+    && chat_input.isContentEditable && chat_input.getAttribute('aria-label') === 'Send a message'
+    : !!document.querySelector('[data-a-target="chat-input"],.chat-scrollable-area__message-container');
+  const panels = __POPOUT__ ? [...document.querySelectorAll('section.chat-viewers__container')].filter(visible) : [];
+  const panel_header = panels.length === 1 ? panels[0].querySelector('[data-test-selector="chat-viewers__header"]') : null;
+  const expected_panel = !!panel_header && visible(panel_header);
   let pause_clicked = false;
   const snapshot = () => {
     const videos = [...document.querySelectorAll('video')];
@@ -75,6 +85,28 @@ const COMMUNITY_UI: &str = r#"(() => {
     return result('challenge_denied');
   if (__AUTOMATIC__) {
     const before = snapshot();
+    if (__POPOUT__ && before.video_present) return result('unexpected_popout_video');
+    if (__POPOUT__ && __AUTH_REQUIRED__
+        && buttons.some(e => e.getAttribute('data-a-target') === 'login-button'))
+      return result('authentication_denied');
+    if (__POPOUT__ && __RESTORE_COMMUNITY__) {
+      if (!expected_panel || panels.length !== 1) return result('community_restore_panel_mismatch');
+      const close = buttons.filter(e => e.getAttribute('data-test-selector') === 'close-viewer-list'
+        && label(e) === 'Close' && !e.disabled);
+      if (close.length !== 1) return result('community_restore_control_unavailable');
+      const deadline = __TRIGGER_DEADLINE_MS__;
+      const now = performance.timeOrigin + performance.now();
+      if (!Number.isFinite(deadline) || !Number.isFinite(now) || now <= 0 || now >= deadline)
+        return result('community_restore_deadline');
+      close[0].click();
+      return result('community_restore_clicked');
+    }
+    if (__POPOUT__ && __PANEL_EXPECTED__) {
+      if (expected_panel && panels.length === 1) return result('community_panel_open');
+      if (panels.length || !before.signed_in || !before.chat_ready) return result('community_panel_unverified');
+      return result('community_panel_waiting');
+    }
+    if (__POPOUT__ && panels.length) return result('unexpected_community_panel');
     if (__ALLOW_PAUSE__ && before.video_present && before.video_paused === false
         && player && !player.disabled && /^Pause(?: \(space\/k\))?$/.test(label(player))) {
       player.click();
@@ -83,7 +115,7 @@ const COMMUNITY_UI: &str = r#"(() => {
     }
     if (!__CLICK__) return result('observed');
     if (!before.signed_in || !before.chat_ready || !before.community_ready
-        || !before.video_present || before.video_paused !== true)
+        || (__POPOUT__ ? before.video_present : !before.video_present || before.video_paused !== true))
       return result('pause_or_readiness_lost');
   }
   if (!target || target.disabled) return result('waiting_ui');
@@ -117,8 +149,35 @@ struct Engine {
     process_failed_token: i64,
 }
 
+/// Dormant owns no environment/controller; initialization and retirement never overlap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BrowserPhase {
+    #[default]
+    Dormant,
+    Initializing,
+    Attached,
+    Retiring,
+    Closing,
+}
+
+/// Authentication is unobservable while the ordinary Community panel covers
+/// the composer. Only freshly restored, visible chat can authorize acceptance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PopoutPhase {
+    #[default]
+    Chat,
+    AwaitingPanel,
+    AwaitingBody,
+    Disabling,
+    Restoring,
+    Revalidating,
+}
+
 #[derive(Default)]
 struct State {
+    phase: BrowserPhase,
+    source_page: SourcePage,
+    popout_phase: PopoutPhase,
     selected_channel: Option<String>,
     armed_until: Option<Instant>,
     last_round: Option<Instant>,
@@ -151,6 +210,20 @@ struct State {
 }
 
 impl State {
+    fn begin_popout_revalidation(&mut self) {
+        self.popout_phase = PopoutPhase::Revalidating;
+        self.player_gate = sampling::PlayerGate::for_page(SourcePage::PopoutChat);
+    }
+
+    fn source_acceptance_ready(&self) -> bool {
+        self.player_gate.ready()
+            && (self.source_page == SourcePage::FullChannel
+                || (self.popout_phase == PopoutPhase::Revalidating
+                    && !self.network_enabled
+                    && !self.network_pending
+                    && self.tracker.is_none()))
+    }
+
     fn reset_after_cleanup(&mut self) {
         self.recycling_at = None;
         self.browser = BrowserLifecycle::default();
@@ -158,9 +231,11 @@ impl State {
         self.navigation_ready = false;
         self.frame_id = None;
         self.last_player_observation = None;
-        self.player_gate = sampling::PlayerGate::default();
+        self.player_gate = sampling::PlayerGate::for_page(self.source_page);
         self.selected_channel = None;
-        self.initializing_at = Some(Instant::now());
+        self.popout_phase = PopoutPhase::Chat;
+        self.initializing_at = None;
+        self.phase = BrowserPhase::Dormant;
     }
 }
 
@@ -229,6 +304,81 @@ fn unix_milliseconds() -> i64 {
 }
 
 impl App {
+    fn initialization_current(&self, epoch: u64) -> bool {
+        self.epoch() == epoch && self.state.borrow().initializing_at.is_some()
+    }
+
+    fn resolve_without_controller(&self) {
+        let closing = self.state.borrow().closing_at.is_some();
+        {
+            let mut state = self.state.borrow_mut();
+            state.initializing_at = None;
+            state.phase = if closing {
+                BrowserPhase::Closing
+            } else {
+                BrowserPhase::Dormant
+            };
+        }
+        if closing {
+            self.finish_without_browser();
+        }
+    }
+
+    fn initialization_needed(&self) -> bool {
+        if self.state.borrow().closing_at.is_some() {
+            return false;
+        }
+        let Some(service) = &self.service else {
+            return true;
+        };
+        if service.bridge.control.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        match &*service.pending_command.borrow() {
+            Some(QueuedCommand::Sample { job }) => {
+                service.bridge.control.is_pending(job.ticket)
+                    && job.cancel_version
+                        == service
+                            .bridge
+                            .control
+                            .cancel_version
+                            .load(Ordering::Acquire)
+                    && !job.queue_deadline_expired(Instant::now())
+                    && !self.state.borrow().denied
+            }
+            Some(QueuedCommand::ShowLogin { publication }) => service
+                .bridge
+                .control
+                .login_cancel_version(*publication)
+                .is_some(),
+            None => false,
+        }
+    }
+
+    fn finish_without_browser(&self) {
+        let diagnostics = crate::host::CleanupDiagnostics {
+            controller_epoch: self.epoch(),
+            no_browser_cleanup_required: true,
+            confirmed: true,
+            ..Default::default()
+        };
+        self.state.borrow_mut().fault.cleanup_diagnostics = Some(diagnostics);
+        self.publish_fault();
+        {
+            let mut evidence = self.evidence.borrow_mut();
+            evidence.phase = "closed";
+            evidence.browser_cleanup = "no_browser_cleanup_required";
+        }
+        self.save();
+        if self.service.is_some() {
+            self.finish_service(true);
+        } else {
+            unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+    }
+
     fn epoch(&self) -> u64 {
         self.state.borrow().controller_epoch
     }
@@ -357,7 +507,11 @@ impl App {
         if self.state.borrow().closing_at.is_some() || self.state.borrow().recycling_at.is_some() {
             return;
         }
-        if self.engine.borrow().is_none() {
+        let recoverable_without_browser = matches!(
+            code,
+            "operator_cancelled" | "sample_queue_deadline" | "community_paused"
+        );
+        if self.engine.borrow().is_none() && !recoverable_without_browser {
             let reason = if self.state.borrow().initializing_at.is_some() {
                 HostTerminationReason::StartupFailed
             } else {
@@ -430,8 +584,16 @@ impl App {
         self.cancel_round();
         self.state.borrow_mut().auto_stage = None;
         if self.engine.borrow().is_none() {
-            service.bridge.emit(Status::Paused { code });
-            self.close();
+            service.pending_command.borrow_mut().take();
+            self.state.borrow_mut().selected_channel = None;
+            if recoverable_without_browser {
+                if let Some((ticket, outcome)) = service.pending_result.borrow_mut().take() {
+                    service.bridge.control.complete(ticket, outcome);
+                }
+            } else {
+                service.bridge.emit(Status::Paused { code });
+                self.close();
+            }
         } else {
             self.begin_recycle();
         }
@@ -455,6 +617,7 @@ impl App {
                     .set_controller_epoch(state.controller_epoch);
             }
             state.recycling_at = Some(Instant::now());
+            state.phase = BrowserPhase::Retiring;
             state.auto_stage = None;
         }
         self.detach_engine();
@@ -694,12 +857,6 @@ impl App {
                 if let Some((ticket, outcome)) = service.pending_result.borrow_mut().take() {
                     service.bridge.control.complete(ticket, outcome);
                 }
-                if unsafe { initialize(self, service.profile.clone()) }.is_err() {
-                    self.fail(
-                        "runtime_start_failed",
-                        "The existing browser runtime could not restart.",
-                    );
-                }
             }
             return;
         }
@@ -707,33 +864,92 @@ impl App {
             self.service_failure(code, false);
             return;
         }
-        if self.engine.borrow().is_none() {
-            if self
-                .state
-                .borrow()
-                .initializing_at
-                .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
-            {
-                self.fail(
-                    "runtime_start_deadline",
-                    "The existing browser runtime did not initialize within its deadline.",
-                );
-            }
-            return;
-        }
         if service.active.borrow().is_none() {
-            let command = service.pending_command.borrow_mut().take().or_else(|| {
-                match service.bridge.commands.try_recv() {
-                    Ok(command) => Some(command),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => {
-                        self.observe_termination(HostTerminationReason::CommandChannelClosed);
-                        self.close();
-                        None
-                    }
+            // close() can finish a dormant host synchronously and clear this
+            // slot, so release its borrow before inspecting disconnection.
+            let pending_command = service.pending_command.borrow_mut().take();
+            let command = pending_command.or_else(|| match service.bridge.commands.try_recv() {
+                Ok(command) => Some(command),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    self.observe_termination(HostTerminationReason::CommandChannelClosed);
+                    self.close();
+                    None
                 }
             });
             if let Some(command) = command {
+                // Cancellation, publication identity and the original queue
+                // deadline are checked before either cold start or activation.
+                let valid = match &command {
+                    QueuedCommand::Sample { job } => {
+                        let code = if !service.bridge.control.is_pending(job.ticket) {
+                            Some("stale_sample_ticket")
+                        } else if job.cancel_version
+                            != service
+                                .bridge
+                                .control
+                                .cancel_version
+                                .load(Ordering::Acquire)
+                        {
+                            Some("operator_cancelled")
+                        } else if job.queue_deadline_expired(Instant::now()) {
+                            Some("sample_queue_deadline")
+                        } else if self.state.borrow().denied {
+                            Some("community_paused")
+                        } else {
+                            None
+                        };
+                        if let Some(code) = code {
+                            service.bridge.control.complete(
+                                job.ticket,
+                                Err(SourceFailure {
+                                    code,
+                                    pauses_community: code == "community_paused",
+                                }),
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    QueuedCommand::ShowLogin { publication } => service
+                        .bridge
+                        .control
+                        .login_cancel_version(*publication)
+                        .is_some(),
+                };
+                if !valid {
+                    // An already-created blank controller must not survive a
+                    // command that expired while initialization was pending.
+                    if self.engine.borrow().is_some() && !*service.login_visible.borrow() {
+                        self.begin_recycle();
+                    }
+                    return;
+                }
+                if self.engine.borrow().is_none() {
+                    *service.pending_command.borrow_mut() = Some(command);
+                    if self.state.borrow().phase == BrowserPhase::Dormant {
+                        if unsafe { initialize(self, service.profile.clone()) }.is_err() {
+                            self.state.borrow_mut().initializing_at = None;
+                            self.state.borrow_mut().phase = BrowserPhase::Dormant;
+                            self.fail(
+                                "runtime_start_failed",
+                                "The existing browser runtime could not start.",
+                            );
+                        }
+                    } else if self
+                        .state
+                        .borrow()
+                        .initializing_at
+                        .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
+                    {
+                        self.fail(
+                            "runtime_start_deadline",
+                            "The existing browser runtime did not initialize within its deadline.",
+                        );
+                    }
+                    return;
+                }
                 if self.state.borrow().script_pending
                     || self.state.borrow().pending
                     || self.state.borrow().network_pending
@@ -760,7 +976,7 @@ impl App {
                             state.denied = false;
                             state.selected_channel = None;
                             state.auto_stage = None;
-                            state.player_gate = sampling::PlayerGate::default();
+                            state.player_gate = sampling::PlayerGate::for_page(state.source_page);
                             state.login_failure_reported = false;
                         }
                         *service.login_visible.borrow_mut() = true;
@@ -795,16 +1011,16 @@ impl App {
                         }
                         *service.last_cancel.borrow_mut() = current;
                         let channel = job.channel.clone();
+                        let navigation_deadline =
+                            job.queued_at + Duration::from_millis(sampling::NAVIGATION_UI_MS);
                         self.cancel_round();
                         *service.login_visible.borrow_mut() = false;
                         *service.active.borrow_mut() = Some(job);
                         {
                             let mut state = self.state.borrow_mut();
                             state.selected_channel = Some(channel.clone());
-                            state.player_gate = sampling::PlayerGate::default();
-                            state.auto_stage = Some(AutoStage::Navigating(
-                                Instant::now() + Duration::from_millis(sampling::NAVIGATION_UI_MS),
-                            ));
+                            state.player_gate = sampling::PlayerGate::for_page(state.source_page);
+                            state.auto_stage = Some(AutoStage::Navigating(navigation_deadline));
                         }
                         let minimized = unsafe {
                             let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
@@ -814,11 +1030,29 @@ impl App {
                             self.service_failure("native_minimize_unverified", false);
                             return;
                         }
-                        self.navigate(format!("https://www.twitch.tv/{channel}"));
+                        self.navigate(
+                            SourcePage::PopoutChat
+                                .url(&channel)
+                                .expect("validated channel"),
+                        );
                     }
                 }
                 return;
             }
+        }
+        if self.engine.borrow().is_none() {
+            if self
+                .state
+                .borrow()
+                .initializing_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
+            {
+                self.fail(
+                    "runtime_start_deadline",
+                    "The existing browser runtime did not initialize within its deadline.",
+                );
+            }
+            return;
         }
         let stage = self.state.borrow().auto_stage;
         match stage {
@@ -837,7 +1071,7 @@ impl App {
             Some(AutoStage::Preparing(_) | AutoStage::Enabling(_) | AutoStage::Ready(_)) => {
                 self.ui_step(false)
             }
-            None if self.state.borrow().player_gate.pause_verified()
+            None if self.state.borrow().player_gate.readiness_verified()
                 && !*service.login_visible.borrow() =>
             {
                 self.ui_step(false)
@@ -961,6 +1195,7 @@ impl App {
         state.pending_sample = None;
         state.trigger_pending = false;
         state.trigger_deadline = None;
+        state.popout_phase = PopoutPhase::Chat;
     }
 
     fn record_action(&self, target: &'static str) {
@@ -1111,6 +1346,17 @@ impl App {
                         return Ok(());
                     }
                     if let Some(core) = app.core() {
+                        let expired = app.service.as_ref().is_some_and(|service| {
+                            service
+                                .active
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|job| job.queue_deadline_expired(Instant::now()))
+                        });
+                        if expired {
+                            app.service_failure("navigation_ui_deadline", false);
+                            return Ok(());
+                        }
                         if !app.state.borrow_mut().navigation_gate.issue(intent) {
                             return Ok(());
                         }
@@ -1146,7 +1392,7 @@ impl App {
             .unwrap_or_default();
         if !self
             .current_uri()
-            .is_ok_and(|uri| is_channel_page(&uri, &channel))
+            .is_ok_and(|uri| self.state.borrow().source_page.matches(&uri, &channel))
         {
             self.sample_failure(Failure::AuthenticationDenied);
             return;
@@ -1170,7 +1416,7 @@ impl App {
                     }
                     if !app
                         .current_uri()
-                        .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                        .is_ok_and(|uri| app.state.borrow().source_page.matches(&uri, &channel))
                     {
                         app.sample_failure(Failure::AuthenticationDenied);
                         return Ok(());
@@ -1212,7 +1458,8 @@ impl App {
                     );
                     return Ok(());
                 }
-                let frame = match sampling::root_frame(&json, &channel) {
+                let source_page = app.state.borrow().source_page;
+                let frame = match sampling::root_frame(&json, &channel, source_page) {
                     Ok(frame) => frame,
                     Err(code) => {
                         app.fail(code, "Cannot identify the current source frame.");
@@ -1221,7 +1468,7 @@ impl App {
                 };
                 if !app
                     .current_uri()
-                    .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                    .is_ok_and(|uri| app.state.borrow().source_page.matches(&uri, &channel))
                 {
                     app.sample_failure(Failure::AuthenticationDenied);
                     return Ok(());
@@ -1282,7 +1529,7 @@ impl App {
         if channel.is_empty()
             || !self
                 .current_uri()
-                .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                .is_ok_and(|uri| self.state.borrow().source_page.matches(&uri, &channel))
         {
             self.status("Open the selected Twitch channel before sampling.");
             return;
@@ -1301,8 +1548,8 @@ impl App {
     fn begin_sample(self: &Rc<Self>, browser_observed_ms: Option<f64>) {
         if self.automatic() && !self.state.borrow().player_gate.ready() {
             self.fail(
-                "player_pause_not_verified",
-                "The normal player pause must be verified before sampling.",
+                "source_readiness_not_verified",
+                "The expected source readiness must be verified before sampling.",
             );
             return;
         }
@@ -1339,6 +1586,7 @@ impl App {
                 generation,
                 state.selected_channel.clone().unwrap_or_default(),
                 state.frame_id.clone().unwrap_or_default(),
+                state.source_page,
             ));
             if state.schedule.is_some() || self.service.is_some() {
                 state.auto_stage = Some(AutoStage::Sampling);
@@ -1382,7 +1630,10 @@ impl App {
     fn ui_step(self: &Rc<Self>, click: bool) {
         let (channel, generation, automatic, allow_pause, require_readiness, checks_pending_sample) = {
             let state = self.state.borrow();
-            if state.script_pending || state.closing_at.is_some() {
+            if state.script_pending
+                || state.closing_at.is_some()
+                || state.popout_phase == PopoutPhase::Disabling
+            {
                 return;
             }
             (
@@ -1393,6 +1644,7 @@ impl App {
                     && state.player_gate.may_click_pause(),
                 click
                     || state.trigger_pending
+                    || state.popout_phase == PopoutPhase::Revalidating
                     || matches!(
                         state.auto_stage,
                         Some(AutoStage::Preparing(_) | AutoStage::Ready(_))
@@ -1411,11 +1663,16 @@ impl App {
             );
             return;
         };
-        if !is_channel_page(&uri, &channel) || automatic && is_popout_page(&uri, &channel) {
+        if !self.state.borrow().source_page.matches(&uri, &channel) {
             self.sample_failure(Failure::AuthenticationDenied);
             return;
         }
-        let popout = is_popout_page(&uri, &channel);
+        let popout = self.state.borrow().source_page == SourcePage::PopoutChat;
+        let popout_phase = self.state.borrow().popout_phase;
+        if popout && popout_phase != PopoutPhase::Chat && !self.is_active(generation) {
+            self.end_auto_attempt("source_reverification_deadline", false);
+            return;
+        }
         let deadline_json = self
             .state
             .borrow()
@@ -1427,6 +1684,33 @@ impl App {
             .replace("__CHANNEL__", &channel)
             .replace("__POPOUT__", if popout { "true" } else { "false" })
             .replace("__AUTOMATIC__", if automatic { "true" } else { "false" })
+            .replace(
+                "__AUTH_REQUIRED__",
+                if popout_phase != PopoutPhase::Chat {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__PANEL_EXPECTED__",
+                if matches!(
+                    popout_phase,
+                    PopoutPhase::AwaitingPanel | PopoutPhase::AwaitingBody
+                ) {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__RESTORE_COMMUNITY__",
+                if popout_phase == PopoutPhase::Restoring {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .replace(
                 "__ALLOW_PAUSE__",
                 if allow_pause { "true" } else { "false" },
@@ -1492,16 +1776,80 @@ impl App {
                 );
                 return Ok(());
             };
+            let source_page = if popout {
+                SourcePage::PopoutChat
+            } else {
+                SourcePage::FullChannel
+            };
+            if !app
+                .current_uri()
+                .is_ok_and(|uri| source_page.matches(&uri, &channel))
+            {
+                app.sample_failure(Failure::AuthenticationDenied);
+                return Ok(());
+            }
             app.state.borrow_mut().last_player_observation = Some(ui.player.clone());
             if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
                 if let Some(attempt) = run.attempts.last_mut() {
                     attempt.video_element_present = Some(ui.player.video_present);
                     attempt.video_paused = ui.player.video_paused;
-                    attempt.player_pause_last_checked_ms = Some(app.elapsed_ms());
+                    attempt.source_readiness_last_checked_ms = Some(app.elapsed_ms());
+                    if !popout {
+                        attempt.player_pause_last_checked_ms = Some(app.elapsed_ms());
+                    }
                     attempt.normal_pause_clicks += usize::from(ui.player.pause_clicked);
                     attempt.signed_in_ui_verified |= ui.player.signed_in;
                     attempt.last_player_observation = Some(ui.player.clone());
                 }
+            }
+            // Observed denials take precedence over an occluded composer.
+            let denial = match ui.code.as_str() {
+                "challenge_denied" => Some(Failure::ChallengeDenied),
+                "wrong_page" | "authentication_denied" => Some(Failure::AuthenticationDenied),
+                _ => None,
+            };
+            if let Some(denial) = denial {
+                app.sample_failure(denial);
+                return Ok(());
+            }
+            // The panel hides positive identity controls. This branch records
+            // authentication as unobservable and can never accept a sample.
+            if popout
+                && matches!(
+                    ui.code.as_str(),
+                    "community_panel_open"
+                        | "community_panel_waiting"
+                        | "community_restore_clicked"
+                )
+            {
+                if ui.player.video_present {
+                    app.fail(
+                        "unexpected_popout_video",
+                        "The chat-only page unexpectedly contains video.",
+                    );
+                    return Ok(());
+                }
+                match (popout_phase, ui.code.as_str()) {
+                    (
+                        PopoutPhase::AwaitingPanel | PopoutPhase::AwaitingBody,
+                        "community_panel_open",
+                    ) => {
+                        app.state.borrow_mut().popout_phase = PopoutPhase::AwaitingBody;
+                        if app.state.borrow().pending_sample.is_some() {
+                            app.freeze_popout_body();
+                        }
+                    }
+                    (PopoutPhase::AwaitingPanel, "community_panel_waiting") => (),
+                    (PopoutPhase::Restoring, "community_restore_clicked") => {
+                        app.state.borrow_mut().begin_popout_revalidation();
+                    }
+                    _ => app.fail(
+                        "community_panel_phase_mismatch",
+                        "The ordinary Community panel changed unexpectedly.",
+                    ),
+                }
+                app.save();
+                return Ok(());
             }
             let player_ready = if automatic
                 && !matches!(ui.code.as_str(), "wrong_page" | "challenge_denied")
@@ -1515,6 +1863,8 @@ impl App {
                     Ok(ready) => {
                         if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
                             if let Some(attempt) = run.attempts.last_mut() {
+                                attempt.source_readiness_verified |=
+                                    app.state.borrow().player_gate.readiness_verified();
                                 attempt.player_pause_verified |=
                                     app.state.borrow().player_gate.pause_verified();
                             }
@@ -1522,7 +1872,7 @@ impl App {
                         ready
                     }
                     Err(code) => {
-                        app.fail(code, "The verified normal player pause or signed-in state was lost. The proof is stopped.");
+                        app.fail(code, "The source readiness or signed-in state was lost. Collection is stopped.");
                         return Ok(());
                     }
                 }
@@ -1530,8 +1880,12 @@ impl App {
                 false
             };
             match ui.code.as_str() {
-                "challenge_denied" => app.sample_failure(Failure::ChallengeDenied),
-                "wrong_page" => app.sample_failure(Failure::AuthenticationDenied),
+                "community_restore_deadline" => app.end_auto_attempt("source_reverification_deadline", false),
+                "community_panel_unverified" | "unexpected_community_panel" | "community_restore_panel_mismatch" | "community_restore_control_unavailable" => app.fail("community_panel_unverified", "The expected ordinary Community panel or restore control could not be verified."),
+                "unexpected_popout_video" => app.fail(
+                    "unexpected_popout_video",
+                    "The chat-only page unexpectedly contains video. Collection is stopped.",
+                ),
                 // The script made no Community click. Actual playback loss has
                 // already failed the gate; missing controls wait within the
                 // original response deadline without rearming or a source retry.
@@ -1590,14 +1944,15 @@ impl App {
                     }
                     if automatic && !player_ready {
                         app.fail(
-                            "player_pause_not_verified",
-                            "Player pause was not verified at the Community trigger.",
+                            "source_readiness_not_verified",
+                            "Source readiness was not verified at the Community trigger.",
                         );
                         return Ok(());
                     }
                     if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
                         if let Some(attempt) = run.attempts.last_mut() {
-                            attempt.pause_verified_before_trigger = player_ready;
+                            attempt.readiness_verified_before_trigger = player_ready;
+                            attempt.pause_verified_before_trigger = player_ready && !popout;
                         }
                     }
                     let outcome = app
@@ -1612,6 +1967,7 @@ impl App {
                     match outcome {
                         Ok(()) => {
                             app.state.borrow_mut().trigger_pending = false;
+                            if popout { app.state.borrow_mut().popout_phase = PopoutPhase::AwaitingPanel; }
                             app.try_body();
                         }
                         Err(code) => {
@@ -1688,7 +2044,7 @@ impl App {
         };
         if !self
             .current_uri()
-            .is_ok_and(|uri| is_channel_page(&uri, &channel))
+            .is_ok_and(|uri| self.state.borrow().source_page.matches(&uri, &channel))
         {
             self.sample_failure(Failure::AuthenticationDenied);
             return Ok(());
@@ -1782,7 +2138,7 @@ impl App {
                 app.state.borrow_mut().pending = false;
                 if !app
                     .current_uri()
-                    .is_ok_and(|uri| is_channel_page(&uri, &channel))
+                    .is_ok_and(|uri| app.state.borrow().source_page.matches(&uri, &channel))
                 {
                     app.sample_failure(Failure::AuthenticationDenied);
                     return Ok(());
@@ -1859,15 +2215,132 @@ impl App {
         }
     }
 
+    fn freeze_popout_body(self: &Rc<Self>) {
+        let generation = self.state.borrow().generation;
+        if !self.is_active(generation)
+            || self.state.borrow().popout_phase != PopoutPhase::AwaitingBody
+        {
+            return;
+        }
+        if let Err(code) = self.revalidate_pending_body(generation) {
+            if code == "http_denied" {
+                self.sample_failure(Failure::HttpDenied);
+            } else {
+                self.fail(
+                    code,
+                    "Native response identity changed before closing Community.",
+                );
+            }
+            return;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.popout_phase = PopoutPhase::Disabling;
+            state.network_pending = true;
+        }
+        let epoch = self.epoch();
+        let weak = Rc::downgrade(self);
+        let done =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |result, _| {
+                let Some(app) = weak.upgrade() else {
+                    return Ok(());
+                };
+                if !app.callback_current(epoch, generation) || !app.is_active(generation) {
+                    return Ok(());
+                }
+                app.state.borrow_mut().network_pending = false;
+                if result.is_err() {
+                    app.fail(
+                        "network_disable_failed",
+                        "Native observation could not stop before restoring chat.",
+                    );
+                    return Ok(());
+                }
+                // Include every event delivered while Network.disable was pending.
+                if let Err(code) = app.revalidate_pending_body(generation) {
+                    if code == "http_denied" {
+                        app.sample_failure(Failure::HttpDenied);
+                    } else {
+                        app.fail(
+                            code,
+                            "Native response identity changed while stopping observation.",
+                        );
+                    }
+                    return Ok(());
+                }
+                {
+                    let mut state = app.state.borrow_mut();
+                    state.network_enabled = false;
+                    state.tracker = None;
+                    state.popout_phase = PopoutPhase::Restoring;
+                }
+                app.ui_step(false);
+                Ok(())
+            }));
+        if let Some(core) = self.core() {
+            if unsafe { core.CallDevToolsProtocolMethod(w!("Network.disable"), w!("{}"), &done) }
+                .is_err()
+            {
+                self.state.borrow_mut().network_pending = false;
+                self.fail(
+                    "network_disable_failed",
+                    "Native observation could not stop before restoring chat.",
+                );
+            }
+        }
+    }
+
+    fn revalidate_pending_body(&self, generation: u64) -> Result<(), &'static str> {
+        let mut state = self.state.borrow_mut();
+        let id = state
+            .pending_sample
+            .as_ref()
+            .ok_or("missing_pending_sample")?
+            .1
+            .id
+            .clone();
+        let body = state
+            .tracker
+            .as_ref()
+            .ok_or("missing_request_tracker")?
+            .complete_body(generation, &id)?;
+        state
+            .pending_sample
+            .as_mut()
+            .ok_or("missing_pending_sample")?
+            .1 = body;
+        Ok(())
+    }
+
     fn finish_pending_sample(&self) {
         let generation = self.state.borrow().generation;
-        if !self.is_active(generation) || !self.state.borrow().player_gate.ready() {
+        if !self.is_active(generation) || !self.state.borrow().source_acceptance_ready() {
+            return;
+        }
+        let (channel, source_page) = {
+            let state = self.state.borrow();
+            (
+                state.selected_channel.clone().unwrap_or_default(),
+                state.source_page,
+            )
+        };
+        if !self
+            .current_uri()
+            .is_ok_and(|uri| source_page.matches(&uri, &channel))
+        {
+            self.sample_failure(Failure::AuthenticationDenied);
             return;
         }
         let pending = self.state.borrow_mut().pending_sample.take();
         let Some((parsed, body, received_at_unix_ms)) = pending else {
             return;
         };
+        if source_page == SourcePage::PopoutChat {
+            // This immutable receipt was fully validated before acknowledged
+            // observer shutdown. Fresh visible chat readiness authorizes it.
+            self.accept_sample(parsed, &body, received_at_unix_ms);
+            return;
+        }
         let verified = self
             .state
             .borrow()
@@ -2004,6 +2477,8 @@ impl App {
     }
 
     fn auto_tick(self: &Rc<Self>) {
+        // This finite source proof keeps its bounded controller. True dormant
+        // gaps belong to the integrated service and require native host proof.
         let now = self.elapsed_ms();
         let (stop, expired, complete) = {
             let state = self.state.borrow();
@@ -2058,7 +2533,7 @@ impl App {
             {
                 let mut state = self.state.borrow_mut();
                 state.selected_channel = Some(attempt.channel.clone());
-                state.player_gate = sampling::PlayerGate::default();
+                state.player_gate = sampling::PlayerGate::for_page(state.source_page);
                 state.auto_stage = Some(AutoStage::Navigating(
                     Instant::now() + Duration::from_millis(sampling::NAVIGATION_UI_MS),
                 ));
@@ -2067,8 +2542,12 @@ impl App {
                 run.start(attempt.clone());
                 run.status = "running";
             }
-            self.record_action("twitch_full_channel_paused");
-            self.navigate(format!("https://www.twitch.tv/{}", attempt.channel));
+            self.record_action("twitch_popout_chat");
+            self.navigate(
+                SourcePage::PopoutChat
+                    .url(&attempt.channel)
+                    .expect("validated channel"),
+            );
             return;
         }
         let stage = self.state.borrow().auto_stage;
@@ -2091,7 +2570,7 @@ impl App {
             Some(AutoStage::Preparing(_) | AutoStage::Enabling(_) | AutoStage::Ready(_)) => {
                 self.ui_step(false)
             }
-            None if self.state.borrow().player_gate.pause_verified() => self.ui_step(false),
+            None if self.state.borrow().player_gate.readiness_verified() => self.ui_step(false),
             _ => (),
         }
     }
@@ -2125,9 +2604,21 @@ impl App {
             run.finalize(self.elapsed_ms(), "operator_cancelled");
         }
         self.cancel_round();
+        let no_browser = {
+            let state = self.state.borrow();
+            self.engine.borrow().is_none()
+                && state.initializing_at.is_none()
+                && state.recycling_at.is_none()
+                && state.phase == BrowserPhase::Dormant
+        };
         {
             let mut state = self.state.borrow_mut();
             state.closing_at = Some(state.recycling_at.take().unwrap_or_else(Instant::now));
+            state.phase = BrowserPhase::Closing;
+        }
+        if no_browser {
+            self.finish_without_browser();
+            return;
         }
         self.evidence.borrow_mut().phase = "closing";
         self.evidence.borrow_mut().browser_cleanup = "waiting_for_browser_exit";
@@ -2135,6 +2626,11 @@ impl App {
         self.status(
             "Closing the embedded browser and flushing aggregate evidence (up to five seconds)...",
         );
+        // Creation owns its callback until it resolves. Do not create a new
+        // epoch or claim cleanup before a late controller can be retired.
+        if self.state.borrow().initializing_at.is_some() {
+            return;
+        }
         {
             let mut state = self.state.borrow_mut();
             if state.browser.retire() {
@@ -2153,6 +2649,13 @@ impl App {
     fn tick(self: &Rc<Self>) {
         let closing = self.state.borrow().closing_at;
         if let Some(started) = closing {
+            let initializing = self.state.borrow().initializing_at;
+            if let Some(initializing) = initializing {
+                if initializing.elapsed() >= Duration::from_secs(30) {
+                    self.finish_service(false);
+                }
+                return;
+            }
             let exited = self.state.borrow().browser.diagnostics.normal_exit_observed;
             if exited || started.elapsed() >= FLUSH_TIME {
                 {
@@ -2206,7 +2709,13 @@ impl App {
         } else if self.automatic() {
             self.auto_tick();
         }
-        if self.state.borrow().tracker.is_some() && self.is_active(self.state.borrow().generation) {
+        if (self.state.borrow().tracker.is_some()
+            || matches!(
+                self.state.borrow().popout_phase,
+                PopoutPhase::Restoring | PopoutPhase::Revalidating
+            ))
+            && self.is_active(self.state.borrow().generation)
+        {
             self.ui_step(false);
         }
     }
@@ -2240,6 +2749,12 @@ unsafe fn bounded_pwstr(value: PWSTR, cap: usize) -> std::result::Result<String,
     result
 }
 unsafe fn initialize(app: &Rc<App>, profile: PathBuf) -> windows::core::Result<()> {
+    {
+        let mut state = app.state.borrow_mut();
+        debug_assert_eq!(state.phase, BrowserPhase::Dormant);
+        state.phase = BrowserPhase::Initializing;
+        state.initializing_at = Some(Instant::now());
+    }
     let epoch = app.epoch();
     let weak = Rc::downgrade(app);
     let environment_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
@@ -2247,10 +2762,16 @@ unsafe fn initialize(app: &Rc<App>, profile: PathBuf) -> windows::core::Result<(
             let Some(app) = weak.upgrade() else {
                 return Ok(());
             };
-            if !app.controller_current(epoch) {
+            if !app.initialization_current(epoch) {
+                return Ok(());
+            }
+            if !app.initialization_needed() {
+                app.resolve_without_controller();
                 return Ok(());
             }
             let Some(environment) = environment.filter(|_| result.is_ok()) else {
+                app.state.borrow_mut().initializing_at = None;
+                app.state.borrow_mut().phase = BrowserPhase::Dormant;
                 app.fail(
                     "environment_creation_failed",
                     "The existing WebView2 runtime could not start. No software was installed.",
@@ -2262,25 +2783,65 @@ unsafe fn initialize(app: &Rc<App>, profile: PathBuf) -> windows::core::Result<(
             let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
                 move |result, controller| {
                     let Some(app) = weak.upgrade() else {
+                        if let Some(controller) = controller {
+                            let _ = controller.Close();
+                        }
                         return Ok(());
                     };
-                    if !app.controller_current(epoch) {
+                    if !app.initialization_current(epoch) {
                         if let Some(controller) = controller {
                             let _ = controller.Close();
                         }
                         return Ok(());
                     }
                     let Some(controller) = controller.filter(|_| result.is_ok()) else {
+                        app.state.borrow_mut().initializing_at = None;
+                        app.state.borrow_mut().phase = BrowserPhase::Dormant;
+                        if app.state.borrow().closing_at.is_some() {
+                            app.finish_without_browser();
+                            return Ok(());
+                        }
                         app.fail(
                             "controller_creation_failed",
                             "The embedded browser window could not be created.",
                         );
                         return Ok(());
                     };
+                    let needed = app.initialization_needed();
                     match attach(&app, environment_for_controller, controller) {
-                Ok(()) => (),
-                Err(_) => app.fail("observer_setup_failed", "Native browser observation could not be initialized. Sampling is unavailable."),
-            }
+                        Ok(()) => {
+                            if app.state.borrow().closing_at.is_some() {
+                                {
+                                    let mut state = app.state.borrow_mut();
+                                    state.closing_at = Some(Instant::now());
+                                    state.phase = BrowserPhase::Closing;
+                                    if state.browser.retire() {
+                                        state.controller_epoch += 1;
+                                    }
+                                    if let Some(service) = &app.service {
+                                        service
+                                            .bridge
+                                            .control
+                                            .set_controller_epoch(state.controller_epoch);
+                                    }
+                                }
+                                app.detach_engine();
+                            } else if !needed {
+                                app.begin_recycle();
+                            }
+                        }
+                        Err(_) => {
+                            // A controller existed and its guard closed it; without
+                            // the complete exit subscription cleanup stays unproven.
+                            app.state.borrow_mut().initializing_at = None;
+                            app.state.borrow_mut().phase = BrowserPhase::Attached;
+                            if app.state.borrow().closing_at.is_some() {
+                                app.state.borrow_mut().closing_at = Some(Instant::now());
+                            } else {
+                                app.fail("observer_setup_failed", "Native browser observation could not be initialized. Sampling is unavailable.");
+                            }
+                        }
+                    }
                     Ok(())
                 },
             ));
@@ -2288,6 +2849,12 @@ unsafe fn initialize(app: &Rc<App>, profile: PathBuf) -> windows::core::Result<(
                 .CreateCoreWebView2Controller(app.hwnd, &handler)
                 .is_err()
             {
+                app.state.borrow_mut().initializing_at = None;
+                app.state.borrow_mut().phase = BrowserPhase::Dormant;
+                if app.state.borrow().closing_at.is_some() {
+                    app.finish_without_browser();
+                    return Ok(());
+                }
                 app.fail(
                     "controller_creation_failed",
                     "The embedded browser window could not be created.",
@@ -2512,9 +3079,8 @@ unsafe fn attach(
     app.evidence.borrow_mut().browser_cleanup = "browser_running";
     app.save();
     app.state.borrow_mut().initializing_at = None;
-    if let Some(service) = &app.service {
-        service.bridge.emit(Status::Ready);
-    } else if !app.automatic() {
+    app.state.borrow_mut().phase = BrowserPhase::Attached;
+    if app.service.is_none() && !app.automatic() {
         app.open_login();
     }
     Ok(())
@@ -2667,7 +3233,12 @@ unsafe fn make_window(
         None,
     )?;
     let evidence = Evidence {
-        schema_version: 2,
+        schema_version: 3,
+        source_mode: if config.is_some() || service_options.is_some() {
+            SourcePage::PopoutChat
+        } else {
+            SourcePage::FullChannel
+        },
         autonomous: config.as_ref().map(RunEvidence::new),
         ..Evidence::default()
     };
@@ -2687,7 +3258,11 @@ unsafe fn make_window(
         engine: RefCell::new(None),
         state: RefCell::new(State {
             schedule: config.map(Schedule::new),
-            initializing_at: Some(Instant::now()),
+            source_page: if service.is_some() || evidence.autonomous.is_some() {
+                SourcePage::PopoutChat
+            } else {
+                SourcePage::FullChannel
+            },
             ..State::default()
         }),
         evidence: RefCell::new(evidence),
@@ -2764,6 +3339,10 @@ fn startup(
                     "profile_directory_unavailable",
                     "Cannot create the app's browser profile next to this executable.",
                 );
+            } else if let Some(service) = &app.service {
+                // Admission readiness deliberately precedes browser creation.
+                app.status("Community source is dormant. A sample or sign-in request will start the browser.");
+                service.bridge.emit(Status::Ready);
             } else if initialize(&app, profile).is_err() {
                 app.fail(
                     "runtime_start_failed",
@@ -2863,6 +3442,7 @@ mod lifecycle_tests {
         *service.active.borrow_mut() = Some(job);
         let mut state = app.state.borrow_mut();
         state.browser.bind(3, 100);
+        state.phase = BrowserPhase::Attached;
         state.selected_channel = Some("room".into());
         state.auto_stage = Some(AutoStage::Sampling);
         ticket
@@ -2909,6 +3489,337 @@ mod lifecycle_tests {
         assert_eq!(sample.reported_chatters, Some(2));
         assert_eq!(sample.http_status, 200);
         assert!(sample.provenance.request_after_trigger_verified);
+    }
+
+    #[test]
+    fn dormant_idle_tick_has_no_browser_or_initialization() {
+        let (handle, app) = fixture();
+        for _ in 0..3 {
+            app.service_tick();
+        }
+        let state = app.state.borrow();
+        assert_eq!(state.phase, BrowserPhase::Dormant);
+        assert!(state.initializing_at.is_none());
+        assert!(state.recycling_at.is_none());
+        assert!(state.closing_at.is_none());
+        assert!(app.engine.borrow().is_none());
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn disconnected_dormant_command_channel_finishes_without_reborrowing_a_held_slot() {
+        let (handle, mut app) = fixture();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(sender);
+        Rc::get_mut(&mut app)
+            .unwrap()
+            .service
+            .as_mut()
+            .unwrap()
+            .bridge
+            .commands = receiver;
+        app.service_tick();
+        let Ok(crate::host::HostEvent::Stopped {
+            cleanup_confirmed: true,
+            diagnostics,
+        }) = handle.try_event()
+        else {
+            panic!("expected immediate disconnected dormant shutdown");
+        };
+        assert_eq!(
+            diagnostics.host_termination.unwrap().reason,
+            HostTerminationReason::CommandChannelClosed
+        );
+        assert!(
+            diagnostics
+                .cleanup_diagnostics
+                .unwrap()
+                .no_browser_cleanup_required
+        );
+        assert!(app.engine.borrow().is_none());
+    }
+
+    #[test]
+    fn explicit_auth_denial_after_restore_discards_frozen_receipt_and_cannot_revive() {
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 64);
+        let generation = app.state.borrow().generation;
+        {
+            let mut state = app.state.borrow_mut();
+            state.source_page = SourcePage::PopoutChat;
+            state.armed_until = Some(Instant::now() + Duration::from_secs(20));
+            state.begin_popout_revalidation();
+            state.pending_sample = Some((
+                crate::ParsedSample {
+                    count: 2,
+                    categories: Default::default(),
+                    accounts: Default::default(),
+                    roles: Default::default(),
+                },
+                BodyRequest {
+                    id: "frozen-fixture".into(),
+                    selection: crate::Selection {
+                        index: 0,
+                        batch_len: 1,
+                        batched: false,
+                        operation: "CommunityTab",
+                    },
+                    status: 200,
+                    provenance: sampling::Provenance::default(),
+                },
+                12_345,
+            ));
+        }
+        // The script's authentication_denied result reaches this same handler
+        // before readiness evaluation, including after the gate was reset.
+        app.sample_failure(Failure::AuthenticationDenied);
+        assert!(app.state.borrow().denied);
+        assert!(app.state.borrow().pending_sample.is_none());
+        assert!(!app.is_active(generation));
+        let returned_identity = sampling::PlayerObservation {
+            signed_in: true,
+            chat_ready: true,
+            community_ready: true,
+            ..Default::default()
+        };
+        {
+            let mut state = app.state.borrow_mut();
+            state.begin_popout_revalidation();
+            state
+                .player_gate
+                .observe(0, &returned_identity, true)
+                .unwrap();
+            assert!(state
+                .player_gate
+                .observe(2_000, &returned_identity, true)
+                .unwrap());
+        }
+        app.finish_pending_sample();
+        app.finish_service(false);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 64,
+                outcome: Err(SourceFailure {
+                    code: "authentication_denied",
+                    pauses_community: true
+                }),
+                ..
+            })
+        ));
+        assert!(app.state.borrow().pending_sample.is_none());
+    }
+
+    #[test]
+    fn hidden_panel_auth_cannot_accept_and_restoration_requires_new_stability_without_a_new_deadline(
+    ) {
+        let (_handle, app) = fixture();
+        let observed = sampling::PlayerObservation {
+            signed_in: true,
+            chat_ready: true,
+            community_ready: true,
+            ..Default::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut state = app.state.borrow_mut();
+        state.source_page = SourcePage::PopoutChat;
+        state.player_gate = sampling::PlayerGate::for_page(SourcePage::PopoutChat);
+        state.armed_until = Some(deadline);
+        state.player_gate.observe(0, &observed, true).unwrap();
+        assert!(state.player_gate.observe(2_000, &observed, true).unwrap());
+        for phase in [
+            PopoutPhase::AwaitingPanel,
+            PopoutPhase::AwaitingBody,
+            PopoutPhase::Disabling,
+            PopoutPhase::Restoring,
+        ] {
+            state.popout_phase = phase;
+            assert!(!state.source_acceptance_ready());
+        }
+        state.begin_popout_revalidation();
+        assert!(!state.source_acceptance_ready());
+        assert!(
+            !state.player_gate.readiness_verified(),
+            "Pretrigger identity is never cached through the hidden panel."
+        );
+        assert!(!state.player_gate.observe(3_000, &observed, true).unwrap());
+        assert!(!state.player_gate.observe(4_999, &observed, true).unwrap());
+        assert!(state.player_gate.observe(5_000, &observed, true).unwrap());
+        assert!(state.source_acceptance_ready());
+        assert_eq!(state.armed_until, Some(deadline));
+        assert!(!state.player_gate.pause_verified());
+        for busy in [true, false] {
+            state.network_enabled = busy;
+            state.network_pending = !busy;
+            assert!(!state.source_acceptance_ready());
+        }
+    }
+
+    #[test]
+    fn dormant_shutdown_finishes_without_fake_exit_or_cleanup_wait() {
+        let (handle, app) = fixture();
+        handle.shutdown();
+        app.service_tick();
+        let Ok(crate::host::HostEvent::Stopped {
+            cleanup_confirmed: true,
+            diagnostics,
+        }) = handle.try_event()
+        else {
+            panic!("expected immediate no-browser terminal receipt");
+        };
+        let cleanup = diagnostics.cleanup_diagnostics.unwrap();
+        assert!(cleanup.no_browser_cleanup_required);
+        assert!(cleanup.confirmed);
+        assert!(!cleanup.normal_exit_observed);
+        assert!(cleanup.expected_browser_pid.is_none());
+        assert!(cleanup.observed_exit_pid.is_none());
+        assert_eq!(cleanup.elapsed_ms, 0);
+        assert!(app.state.borrow().initializing_at.is_none());
+        assert!(app.engine.borrow().is_none());
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn cancelled_dormant_sample_completes_without_waking() {
+        let (handle, app) = fixture();
+        handle.try_sample(61, "room").unwrap();
+        handle.cancel();
+        app.service_tick();
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 61,
+                outcome: Err(SourceFailure {
+                    code: "operator_cancelled",
+                    pauses_community: false
+                }),
+                ..
+            })
+        ));
+        assert_eq!(app.state.borrow().phase, BrowserPhase::Dormant);
+        assert!(app.state.borrow().initializing_at.is_none());
+        assert!(app.engine.borrow().is_none());
+    }
+
+    #[test]
+    fn expired_dormant_sample_completes_without_waking_or_resetting_its_budget() {
+        let (handle, app) = fixture();
+        handle.try_sample(62, "room").unwrap();
+        let service = app.service.as_ref().unwrap();
+        let QueuedCommand::Sample { mut job } = service.bridge.commands.try_recv().unwrap() else {
+            panic!("expected sample");
+        };
+        job.queued_at = Instant::now() - Duration::from_millis(sampling::NAVIGATION_UI_MS);
+        *service.pending_command.borrow_mut() = Some(QueuedCommand::Sample { job });
+        app.service_tick();
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 62,
+                outcome: Err(SourceFailure {
+                    code: "sample_queue_deadline",
+                    pauses_community: false
+                }),
+                ..
+            })
+        ));
+        assert_eq!(app.state.borrow().phase, BrowserPhase::Dormant);
+        assert!(app.state.borrow().initializing_at.is_none());
+        assert!(app.engine.borrow().is_none());
+    }
+
+    #[test]
+    fn cold_initialization_keeps_one_original_command_and_never_renews_queue_time() {
+        let (handle, app) = fixture();
+        handle.try_sample(63, "room").unwrap();
+        let service = app.service.as_ref().unwrap();
+        let original = service.bridge.control.pending_job().unwrap();
+        let started = Instant::now();
+        {
+            let mut state = app.state.borrow_mut();
+            state.phase = BrowserPhase::Initializing;
+            state.initializing_at = Some(started);
+        }
+        for _ in 0..3 {
+            app.service_tick();
+            assert_eq!(app.state.borrow().initializing_at, Some(started));
+            assert!(
+                matches!(&*service.pending_command.borrow(), Some(QueuedCommand::Sample { job })
+                if job.ticket == original.ticket && job.queued_at == original.queued_at)
+            );
+            assert!(app.initialization_needed());
+        }
+        handle.cancel();
+        app.service_tick();
+        assert!(!app.initialization_needed());
+        assert!(app.initialization_current(3));
+        assert!(!app.initialization_current(2));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 63,
+                outcome: Err(SourceFailure {
+                    code: "operator_cancelled",
+                    ..
+                }),
+                ..
+            })
+        ));
+        // An environment callback with no controller resolves creation before
+        // the host becomes eligible for a replacement cold start.
+        app.resolve_without_controller();
+        assert_eq!(app.state.borrow().phase, BrowserPhase::Dormant);
+        assert!(!app.initialization_current(3));
+        assert!(app.engine.borrow().is_none());
+    }
+
+    #[test]
+    fn obsolete_login_publication_never_opens_or_wakes_a_page() {
+        for initializing in [false, true] {
+            let (handle, app) = fixture();
+            handle.show_login().unwrap();
+            if initializing {
+                let mut state = app.state.borrow_mut();
+                state.phase = BrowserPhase::Initializing;
+                state.initializing_at = Some(Instant::now());
+            }
+            handle.cancel();
+            app.service_tick();
+            assert!(!app.initialization_needed());
+            assert!(!*app.service.as_ref().unwrap().login_visible.borrow());
+            assert!(app.engine.borrow().is_none());
+            assert!(handle.try_event().is_err());
+            if initializing {
+                app.resolve_without_controller();
+            }
+            assert_eq!(app.state.borrow().phase, BrowserPhase::Dormant);
+        }
+    }
+
+    #[test]
+    fn shutdown_during_environment_creation_waits_for_its_resolution_before_no_browser_receipt() {
+        let (handle, app) = fixture();
+        {
+            let mut state = app.state.borrow_mut();
+            state.phase = BrowserPhase::Initializing;
+            state.initializing_at = Some(Instant::now());
+        }
+        handle.shutdown();
+        app.service_tick();
+        assert_eq!(app.state.borrow().phase, BrowserPhase::Closing);
+        assert_eq!(app.epoch(), 3);
+        assert!(app.initialization_current(3));
+        assert!(handle.try_event().is_err());
+        app.resolve_without_controller();
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::Stopped {
+                cleanup_confirmed: true,
+                ..
+            })
+        ));
+        assert!(!app.initialization_current(3));
+        assert!(app.engine.borrow().is_none());
     }
 
     #[test]
@@ -3112,7 +4023,12 @@ mod lifecycle_tests {
             state.last_player_observation = Some(ready.clone());
             assert!(!state.player_gate.observe(0, &ready, true).unwrap());
             assert!(state.player_gate.observe(2_000, &ready, true).unwrap());
-            state.tracker = Some(Tracker::new(7, "room".into(), "old-frame".into()));
+            state.tracker = Some(Tracker::new(
+                7,
+                "room".into(),
+                "old-frame".into(),
+                SourcePage::FullChannel,
+            ));
             state.trigger_deadline = sampling::TriggerDeadline::new(7, 0, 1_000.0, 25_000);
             state.denied = true;
         }
@@ -3136,7 +4052,8 @@ mod lifecycle_tests {
             assert!(!state.player_gate.pause_verified());
             assert!(!state.player_gate.ready());
             assert!(state.denied, "cleanup must preserve an owner pause");
-            assert!(state.initializing_at.is_some());
+            assert!(state.initializing_at.is_none());
+            assert_eq!(state.phase, BrowserPhase::Dormant);
         }
         assert!(!app.trigger_dispatch_allowed(app.state.borrow().generation));
         for missing in 0..6 {
@@ -3512,6 +4429,9 @@ mod lifecycle_tests {
         let job = service.bridge.control.pending_job().unwrap();
         {
             let mut state = app.state.borrow_mut();
+            // This is a stalled attached guard, not a dormant host. No real
+            // controller is created, so cleanup deliberately remains unproven.
+            state.phase = BrowserPhase::Attached;
             state.script_pending = true;
             state.script_pending_since = Some(job.queued_at);
         }

@@ -122,11 +122,17 @@ Failure to verify minimization stops the run. Later receipts must follow that
 milestone to establish minimized collection. Manual mode stays visible; no
 visibility, suspension, or browser flags are changed.
 
-This route is explicit: autonomous mode never tries the chat popout and never
-falls back or retries after a denial. A normal full-channel control succeeded
-after a separate denied popout run; that does not establish the denial's cause.
+The earlier accepted autonomous revision used a full-channel page after a
+separate denied popout experiment; that history does not establish the denial's
+cause. The owner-authorized 2026-11-01 RAM revision uses an explicit Popout Chat
+route with positive signed-in chat/Community readiness and no video, while the
+manual full-channel mode retains paused-video checks. No route falls back or
+retries after a denial. See [current qualification](../../docs/community-ram-optimization.md).
 
-There is at most one ordinary Community click per attempt. No failed attempt is retried:
+There is at most one ordinary Community opening per attempt. Popout mode closes
+the expected panel normally after freezing its validated response, then checks
+visible authentication again; closing does not request another sample.
+No failed attempt is retried:
 a channel that reaches a response deadline is skipped in later circuits while
 its paused page remains guarded. Navigation/UI failure stops the run because
 pause cannot be assured during a scheduling gap. HTTP 401/403/429, integrity,
@@ -208,8 +214,10 @@ response are distinct. `server_freshness` remains `unknown`, and
 cannot establish server freshness, independence, randomness, full coverage,
 viewing time, or calibrated absence. No samples become IRC NAMES/JOIN events.
 
-Live acceptance requires positive native samples from normal full-channel pages
-with verified paused playback; multiple channel circuits and profile restart;
+Live acceptance requires positive native samples from the explicitly declared
+source mode: authenticated zero-video Popout Chat for automatic operation, or
+verified paused playback for the legacy full-channel manual mode. It also needs
+multiple channel circuits and profile restart;
 correct channel isolation and useful repeated-sample evidence; and measurements
 of the whole browser/app process tree. Check minimized operation separately.
 Build success and fixtures do not establish these conditions. Cache-only or

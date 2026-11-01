@@ -43,23 +43,48 @@ pub fn is_source_uri(uri: &str) -> bool {
     uri == "https://gql.twitch.tv/gql" || uri.starts_with("https://gql.twitch.tv/gql?")
 }
 
+/// The expected page is fixed before navigation, never inferred from a redirect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePage {
+    #[default]
+    FullChannel,
+    PopoutChat,
+}
+
+impl SourcePage {
+    pub fn matches(self, uri: &str, channel: &str) -> bool {
+        let Some(channel) = channel_login(channel)
+            .filter(|channel| !matches!(channel.as_str(), "login" | "signup" | "settings"))
+        else {
+            return false;
+        };
+        let Some(path) = uri.strip_prefix("https://www.twitch.tv/") else {
+            return false;
+        };
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        match self {
+            Self::FullChannel => path.eq_ignore_ascii_case(&channel),
+            Self::PopoutChat => path.eq_ignore_ascii_case(&format!("popout/{channel}/chat")),
+        }
+    }
+
+    pub fn url(self, channel: &str) -> Option<String> {
+        let channel = channel_login(channel)?;
+        let url = match self {
+            Self::FullChannel => format!("https://www.twitch.tv/{channel}"),
+            Self::PopoutChat => format!("https://www.twitch.tv/popout/{channel}/chat?popout="),
+        };
+        self.matches(&url, &channel).then_some(url)
+    }
+}
+
 pub fn is_channel_page(uri: &str, channel: &str) -> bool {
-    let Some(path) = uri.strip_prefix("https://www.twitch.tv/") else {
-        return false;
-    };
-    let path = path.split(['?', '#']).next().unwrap_or("");
-    (path.eq_ignore_ascii_case(channel)
-        || path.eq_ignore_ascii_case(&format!("popout/{channel}/chat")))
-        && !matches!(
-            channel.to_ascii_lowercase().as_str(),
-            "login" | "signup" | "settings"
-        )
+    SourcePage::FullChannel.matches(uri, channel) || SourcePage::PopoutChat.matches(uri, channel)
 }
 
 pub fn is_popout_page(uri: &str, channel: &str) -> bool {
-    uri.split(['?', '#']).next().is_some_and(|uri| {
-        uri.eq_ignore_ascii_case(&format!("https://www.twitch.tv/popout/{channel}/chat"))
-    })
+    SourcePage::PopoutChat.matches(uri, channel)
 }
 
 #[derive(Clone, Debug)]
@@ -349,6 +374,7 @@ impl Default for BrowserDiagnostics {
 pub struct Evidence {
     pub schema_version: u8,
     pub source: &'static str,
+    pub source_mode: SourcePage,
     pub phase: &'static str,
     pub status: &'static str,
     pub channel: Option<String>,
@@ -372,6 +398,7 @@ impl Default for Evidence {
         Self {
             schema_version: 1,
             source: "native_twitch_community_webview2",
+            source_mode: SourcePage::FullChannel,
             phase: "starting",
             status: "source_unproved",
             channel: None,
@@ -619,5 +646,33 @@ mod tests {
         assert!(is_channel_page("https://www.twitch.tv/KaMeT0", "kamet0"));
         assert!(!is_channel_page("https://www.twitch.tv/login", "login"));
         assert!(!is_channel_page("https://www.twitch.tv/other", "kamet0"));
+    }
+
+    #[test]
+    fn source_mode_canonicalizes_channel_but_never_accepts_another_route_or_origin() {
+        assert_eq!(
+            SourcePage::PopoutChat.url("KaMeT0").as_deref(),
+            Some("https://www.twitch.tv/popout/kamet0/chat?popout=")
+        );
+        for page in [SourcePage::FullChannel, SourcePage::PopoutChat] {
+            assert!(page.matches(&page.url("kamet0").unwrap(), "KaMeT0"));
+            let other = if page == SourcePage::FullChannel {
+                SourcePage::PopoutChat
+            } else {
+                SourcePage::FullChannel
+            };
+            assert!(!page.matches(&other.url("kamet0").unwrap(), "kamet0"));
+            for wrong in [
+                "http://www.twitch.tv/kamet0",
+                "https://www.twitch.tv.evil.example/kamet0",
+                "https://www.twitch.tv@evil.example/kamet0",
+                "https://www.twitch.tv/kamet0/",
+                "https://www.twitch.tv/popout/other/chat",
+            ] {
+                assert!(!page.matches(wrong, "kamet0"));
+            }
+            assert!(page.url("login").is_none());
+            assert!(page.url("invalid/channel").is_none());
+        }
     }
 }

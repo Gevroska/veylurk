@@ -2,7 +2,7 @@
 
 Veylurk is a Rust application for Windows that collects observable Twitch chat membership into a local SQLite database. Its embedded English interface searches accounts, channels, connection history, and optional broadcast metadata at `http://127.0.0.1:8794`.
 
-The application runs continuously while its process is open. IRC collection needs no Twitch login or browser runtime. Optional Community sampling uses the existing Windows WebView2 runtime with a dedicated Twitch sign-in; it needs no Brave installation or extension. You can open the local interface in an ordinary browser and close that page without stopping collection. Windows launchers support foreground collection, hidden background operation and optional per-user login startup through Task Scheduler. See [Windows operation and recovery](docs/windows-operation.md) for installation, graceful stop, backup and restore.
+The application runs continuously while its process is open. IRC collection needs no Twitch login or browser runtime. Optional Community sampling uses Twitch Popout Chat in the existing Windows WebView2 runtime with a dedicated Twitch sign-in; it needs no Brave installation or extension. The integrated browser starts on demand and is closed after each sample, preserving the website profile between jobs. You can open the local interface in an ordinary browser and close that page without stopping collection. Windows launchers support foreground collection, hidden background operation and optional per-user login startup through Task Scheduler. See [Windows operation and recovery](docs/windows-operation.md) for installation, graceful stop, backup and restore.
 
 ## Run the application
 

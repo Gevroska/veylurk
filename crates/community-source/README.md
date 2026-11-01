@@ -2,8 +2,11 @@
 
 The optional native host runs on one dedicated STA thread. Constructing ordinary
 application settings or leaving Community disabled does not start it. An explicit
-`HostHandle::spawn(HostOptions { profile_dir })` starts the existing WebView2 runtime
-with that absolute application-owned directory; no browser or profile is imported.
+`HostHandle::spawn(HostOptions { profile_dir })` starts the command host and checks
+the existing runtime/profile. Admission-ready does not mean browser or source
+readiness. The integrated host creates WebView2 only for a valid Sample or
+ShowLogin, using that absolute application-owned directory; no browser or
+profile is imported.
 
 The coordinator submits one `try_sample(job_id, channel)` and consumes its
 `SampleCompleted` before submitting another. Successful payloads contain normalized
@@ -23,7 +26,8 @@ every accepted sample has one completion even if startup fails before dequeuing 
 An idle pause check has a five-second callback deadline. A queued sample retains
 its original 25-second admission deadline; neither waiting nor recycling renews it.
 Ordinary source/UI failures close the controller and confirm normal browser exit
-before a replacement is created. Authentication, challenge, integrity and HTTP
+before entering dormancy. A later valid command creates the next browser.
+Authentication, challenge, integrity and HTTP
 401/403/429 failures pause Community. No IRC state is touched.
 
 At quiet boundaries the host recycles before 48 retained navigation IDs, below the
@@ -32,10 +36,24 @@ detaches handlers, closes normally, and requires browser-exit confirmation withi
 five seconds before replacement. Old callbacks fail their epoch/generation checks.
 An unconfirmed cleanup stops this host rather than starting a second controller.
 Background jobs use a fixed 1280 by 808 browser viewport and ordinary minimization;
-normal player pause checks continue before the click, after the body and while idle.
+automatic sampling loads only Twitch Popout Chat. Exact route and zero video
+elements remain required. Visible positive identity/chat readiness is verified
+for two seconds before opening Community. Its expected panel temporarily hides
+those controls, so authentication is unobservable until the normal panel Close
+action restores chat. The fully validated response is held until visible
+authentication is stable again for two seconds, within the original deadline.
+Denials still latch throughout. Unexpected video fails the attempt. The manual
+full-channel proof retains its separate paused-video contract.
 
-The finite proof is an adapter over this same parser, correlation, player, deadline
-and native code. Only its finite aggregate-evidence mode retains overlap/union sets.
+After an accepted service sample, confirmed browser cleanup leaves the host
+dormant instead of creating an empty page. Dormant shutdown requires no invented
+browser-exit observation. Cold initialization consumes the original accepted
+job deadline; cancellation, shutdown and stale commands remain checked.
+
+The finite proof is an adapter over this same parser, mode-specific readiness,
+correlation, deadline and native code. Its autonomous source uses Popout Chat
+but keeps its finite controller schedule; only the integrated service qualifies
+browser dormancy. Only finite aggregate-evidence mode retains overlap/union sets.
 Production mode never writes those artifacts or retains cumulative account unions.
 
 Run the crate's formatting, clippy and tests with its committed lockfile on Windows.

@@ -1,7 +1,7 @@
 //! Pure bounded scheduling and native request identity. No network transport.
 use crate::{
-    channel_login, is_channel_page, is_source_uri, select_request, Failure, ParsedSample,
-    Selection, REQUEST_CAP, RESPONSE_CAP,
+    channel_login, is_source_uri, select_request, Failure, ParsedSample, Selection, SourcePage,
+    REQUEST_CAP, RESPONSE_CAP,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -75,20 +75,28 @@ pub struct PlayerObservation {
     pub pause_clicked: bool,
 }
 
-/// One ordinary pause action per navigation. Stable readiness must precede
-/// observer arming. Actual playback, missing video, or unknown pause state
-/// after established readiness is terminal, never retried.
+/// Mode-specific stable readiness precedes observer arming. Full-channel mode
+/// allows one ordinary Pause action; PopoutChat forbids every video immediately.
+/// Established readiness never weakens the ongoing media or signed-in guards.
 #[derive(Default)]
 pub struct PlayerGate {
+    source_page: SourcePage,
     pause_clicked: bool,
     pause_verified: bool,
+    readiness_verified: bool,
     stable_since: Option<u64>,
     ready: bool,
 }
 
 impl PlayerGate {
+    pub fn for_page(source_page: SourcePage) -> Self {
+        Self {
+            source_page,
+            ..Self::default()
+        }
+    }
     pub fn may_click_pause(&self) -> bool {
-        !self.pause_clicked && !self.pause_verified
+        self.source_page == SourcePage::FullChannel && !self.pause_clicked && !self.pause_verified
     }
     pub fn ready(&self) -> bool {
         self.ready
@@ -96,12 +104,19 @@ impl PlayerGate {
     pub fn pause_verified(&self) -> bool {
         self.pause_verified
     }
+    pub fn readiness_verified(&self) -> bool {
+        self.readiness_verified
+    }
     pub fn observe(
         &mut self,
         now: u64,
         observation: &PlayerObservation,
         require_readiness: bool,
     ) -> Result<bool, &'static str> {
+        if self.source_page == SourcePage::PopoutChat && observation.video_present {
+            self.ready = false;
+            return Err("unexpected_popout_video");
+        }
         if observation.pause_clicked {
             if !self.may_click_pause() {
                 return Err("unexpected_repeated_pause_action");
@@ -110,8 +125,13 @@ impl PlayerGate {
             self.stable_since = None;
             self.ready = false;
         }
-        let paused = observation.video_present && observation.video_paused == Some(true);
-        if !paused {
+        let media_ready = match self.source_page {
+            SourcePage::FullChannel => {
+                observation.video_present && observation.video_paused == Some(true)
+            }
+            SourcePage::PopoutChat => !observation.video_present,
+        };
+        if !media_ready {
             self.stable_since = None;
             self.ready = false;
             if self.pause_verified {
@@ -119,13 +139,13 @@ impl PlayerGate {
             }
             return Ok(false);
         }
-        if self.pause_verified && !observation.signed_in {
+        if self.readiness_verified && !observation.signed_in {
             self.ready = false;
             return Err("signed_in_ui_lost");
         }
         if !observation.signed_in
             || (require_readiness && (!observation.chat_ready || !observation.community_ready))
-            || (!self.pause_verified && !require_readiness)
+            || (!self.readiness_verified && !require_readiness)
         {
             self.stable_since = None;
             self.ready = false;
@@ -134,7 +154,8 @@ impl PlayerGate {
         let since = self.stable_since.get_or_insert(now);
         self.ready = now.saturating_sub(*since) >= PAUSED_READY_STABLE_MS;
         // A preliminary paused snapshot is not an irreversible latch.
-        self.pause_verified |= self.ready;
+        self.readiness_verified |= self.ready;
+        self.pause_verified |= self.ready && self.source_page == SourcePage::FullChannel;
         Ok(self.ready)
     }
 }
@@ -438,10 +459,14 @@ struct FrameTree {
     frame_tree: FrameNode,
 }
 
-pub fn root_frame(json: &str, channel: &str) -> Result<String, &'static str> {
+pub fn root_frame(
+    json: &str,
+    channel: &str,
+    source_page: SourcePage,
+) -> Result<String, &'static str> {
     let tree: FrameTree = event(json)?;
     let frame = tree.frame_tree.frame;
-    if frame.id.is_empty() || frame.id.len() > 128 || !is_channel_page(&frame.url, channel) {
+    if frame.id.is_empty() || frame.id.len() > 128 || !source_page.matches(&frame.url, channel) {
         return Err("native_root_frame_mismatch");
     }
     Ok(frame.id)
@@ -511,6 +536,7 @@ pub struct BodyRequest {
 pub struct Tracker {
     generation: u64,
     channel: String,
+    source_page: SourcePage,
     expected_frame: String,
     trigger: Option<f64>,
     candidates: Vec<Candidate>,
@@ -520,10 +546,16 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn new(generation: u64, channel: String, expected_frame: String) -> Self {
+    pub fn new(
+        generation: u64,
+        channel: String,
+        expected_frame: String,
+        source_page: SourcePage,
+    ) -> Self {
         Self {
             generation,
             channel,
+            source_page,
             expected_frame,
             trigger: None,
             candidates: Vec::new(),
@@ -553,7 +585,7 @@ impl Tracker {
         if generation != self.generation
             || !is_source_uri(&value.request.url)
             || value.request.method != "POST"
-            || !is_channel_page(&value.document_url, &self.channel)
+            || !self.source_page.matches(&value.document_url, &self.channel)
         {
             return Ok(());
         }
@@ -835,6 +867,10 @@ pub fn response_body(json: &str) -> Result<Vec<u8>, &'static str> {
 #[derive(Debug, Serialize)]
 pub struct AttemptEvidence {
     pub attempt: Attempt,
+    pub source_mode: SourcePage,
+    pub source_readiness_verified: bool,
+    pub readiness_verified_before_trigger: bool,
+    pub source_readiness_last_checked_ms: Option<u64>,
     pub ended_ms: Option<u64>,
     pub status: &'static str,
     pub video_element_present: Option<bool>,
@@ -869,6 +905,7 @@ pub struct ChannelEvidence {
 #[derive(Debug, Serialize)]
 pub struct RunEvidence {
     pub mode: &'static str,
+    pub source_mode: SourcePage,
     pub circuits: usize,
     pub max_seconds: u64,
     pub status: &'static str,
@@ -883,7 +920,8 @@ pub struct RunEvidence {
 impl RunEvidence {
     pub fn new(config: &Config) -> Self {
         Self {
-            mode: "finite_autonomous_full_channel_paused",
+            mode: "finite_autonomous_popout_chat",
+            source_mode: SourcePage::PopoutChat,
             circuits: config.circuits,
             max_seconds: config.max_seconds,
             status: "starting",
@@ -903,6 +941,10 @@ impl RunEvidence {
         self.channels.get_mut(&attempt.channel).unwrap().attempts += 1;
         self.attempts.push(AttemptEvidence {
             attempt,
+            source_mode: SourcePage::PopoutChat,
+            source_readiness_verified: false,
+            readiness_verified_before_trigger: false,
+            source_readiness_last_checked_ms: None,
             ended_ms: None,
             status: "navigating",
             video_element_present: None,
@@ -966,6 +1008,165 @@ impl RunEvidence {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn popout_chat() -> PlayerObservation {
+        PlayerObservation {
+            signed_in: true,
+            chat_ready: true,
+            community_ready: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chat_only_readiness_requires_two_seconds_and_never_claims_player_pause() {
+        let observed = popout_chat();
+        let mut gate = PlayerGate::for_page(SourcePage::PopoutChat);
+        assert!(!gate.may_click_pause());
+        assert!(!gate.observe(0, &observed, true).unwrap());
+        assert!(!gate.observe(1_999, &observed, true).unwrap());
+        assert!(gate.observe(2_000, &observed, true).unwrap());
+        assert!(gate.readiness_verified());
+        assert!(gate.ready());
+        assert!(!gate.pause_verified());
+        assert!(!gate.may_click_pause());
+        let mut full = PlayerGate::for_page(SourcePage::FullChannel);
+        assert!(!full.observe(0, &observed, true).unwrap());
+        assert!(!full.observe(2_000, &observed, true).unwrap());
+        assert!(!full.readiness_verified());
+    }
+
+    #[test]
+    fn chat_only_readiness_cannot_start_from_guard_or_anonymous_chat_observations() {
+        for missing in ["signed_in", "chat", "community", "initial_readiness"] {
+            let mut observed = popout_chat();
+            match missing {
+                "signed_in" => observed.signed_in = false,
+                "chat" => observed.chat_ready = false,
+                "community" => observed.community_ready = false,
+                _ => (),
+            }
+            let mut gate = PlayerGate::for_page(SourcePage::PopoutChat);
+            let required = missing != "initial_readiness";
+            assert!(!gate.observe(0, &observed, required).unwrap());
+            assert!(!gate.observe(10_000, &observed, required).unwrap());
+            assert!(!gate.readiness_verified());
+        }
+    }
+
+    #[test]
+    fn any_chat_only_video_fails_before_and_after_readiness_without_pause_authorization() {
+        for established in [false, true] {
+            for paused in [Some(true), Some(false), None] {
+                let mut gate = PlayerGate::for_page(SourcePage::PopoutChat);
+                let mut observed = popout_chat();
+                if established {
+                    gate.observe(0, &observed, true).unwrap();
+                    assert!(gate.observe(2_000, &observed, true).unwrap());
+                }
+                observed.video_present = true;
+                observed.video_paused = paused;
+                assert_eq!(
+                    gate.observe(2_001, &observed, established),
+                    Err("unexpected_popout_video")
+                );
+                assert!(!gate.ready());
+                assert!(!gate.pause_verified());
+                assert!(!gate.may_click_pause());
+            }
+        }
+    }
+
+    #[test]
+    fn chat_only_auth_loss_after_readiness_is_terminal_even_after_community_opens() {
+        let mut gate = PlayerGate::for_page(SourcePage::PopoutChat);
+        let mut observed = popout_chat();
+        gate.observe(0, &observed, true).unwrap();
+        assert!(gate.observe(2_000, &observed, true).unwrap());
+        observed.chat_ready = false;
+        observed.community_ready = false;
+        assert!(gate.observe(2_100, &observed, false).unwrap());
+        observed.signed_in = false;
+        assert_eq!(
+            gate.observe(2_101, &observed, false),
+            Err("signed_in_ui_lost")
+        );
+    }
+
+    #[test]
+    fn top_frame_requires_the_expected_source_mode_and_channel() {
+        for page in [SourcePage::FullChannel, SourcePage::PopoutChat] {
+            let matching = page.url("test").unwrap();
+            let frame =
+                |url: &str| json!({"frameTree":{"frame":{"id":"top","url":url}}}).to_string();
+            assert_eq!(
+                root_frame(&frame(&matching), "test", page),
+                Ok("top".into())
+            );
+            for wrong in [
+                "https://www.twitch.tv/other",
+                "https://www.twitch.tv/popout/other/chat?popout=",
+                "http://www.twitch.tv/test",
+                "https://www.twitch.tv.evil.example/test",
+            ] {
+                assert_eq!(
+                    root_frame(&frame(wrong), "test", page),
+                    Err("native_root_frame_mismatch")
+                );
+            }
+            let other = if page == SourcePage::FullChannel {
+                SourcePage::PopoutChat
+            } else {
+                SourcePage::FullChannel
+            };
+            assert_eq!(
+                root_frame(&frame(&other.url("test").unwrap()), "test", page),
+                Err("native_root_frame_mismatch")
+            );
+        }
+    }
+
+    #[test]
+    fn chat_only_tracker_rejects_full_channel_wrong_channel_and_subframe_requests() {
+        let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::PopoutChat);
+        tracker.set_trigger(100_000.0).unwrap();
+        tracker.request(2, req("full-page", 101.0)).unwrap();
+        let mut wrong = req("wrong-channel", 101.0);
+        wrong.document_url = SourcePage::PopoutChat.url("other").unwrap();
+        tracker.request(2, wrong).unwrap();
+        let mut child = req("subframe", 101.0);
+        child.document_url = SourcePage::PopoutChat.url("test").unwrap();
+        child.frame_id = Some("child".into());
+        tracker.request(2, child).unwrap();
+        assert!(tracker.candidates.is_empty());
+        let mut valid = req("popout", 101.0);
+        valid.document_url = SourcePage::PopoutChat.url("test").unwrap();
+        tracker.request(2, valid).unwrap();
+        tracker.response(2, resp("popout", Some(false))).unwrap();
+        tracker.finished(2, finish("popout")).unwrap();
+        assert!(
+            tracker
+                .take_ready()
+                .unwrap()
+                .unwrap()
+                .provenance
+                .request_after_trigger_verified
+        );
+    }
+
+    #[test]
+    fn chat_only_tracker_preserves_http_denial_before_body_acceptance() {
+        let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::PopoutChat);
+        tracker.set_trigger(100_000.0).unwrap();
+        let mut request = req("denied", 101.0);
+        request.document_url = SourcePage::PopoutChat.url("test").unwrap();
+        tracker.request(2, request).unwrap();
+        let mut response = resp("denied", Some(false));
+        response.response.status = 403;
+        tracker.response(2, response).unwrap();
+        tracker.finished(2, finish("denied")).unwrap();
+        assert_eq!(tracker.take_ready().unwrap_err(), "http_denied");
+    }
 
     #[test]
     fn delayed_ready_callback_cannot_dispatch_after_the_round_deadline() {
@@ -1300,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_defaults_are_full_channel_evidence_and_finite_240_seconds() {
+    fn autonomous_defaults_are_popout_chat_evidence_and_finite_240_seconds() {
         let config = arguments(&[
             "--autonomous".into(),
             "--channel".into(),
@@ -1314,7 +1515,8 @@ mod tests {
         assert_eq!(config.max_seconds, 240);
         let mut evidence = RunEvidence::new(&config);
         evidence.start(Schedule::new(config).start_due(0).unwrap());
-        assert_eq!(evidence.mode, "finite_autonomous_full_channel_paused");
+        assert_eq!(evidence.mode, "finite_autonomous_popout_chat");
+        assert_eq!(evidence.source_mode, SourcePage::PopoutChat);
         assert!(!evidence.attempts[0].player_pause_verified);
         assert!(!evidence.attempts[0].pause_verified_before_trigger);
         assert_eq!(evidence.attempts[0].normal_pause_clicks, 0);
@@ -1361,7 +1563,7 @@ mod tests {
 
     #[test]
     fn late_second_source_request_invalidates_pending_body_completion() {
-        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         tracker.set_trigger(100_000.0).unwrap();
         tracker.request(2, req("first", 101.0)).unwrap();
         tracker.response(2, resp("first", Some(false))).unwrap();
@@ -1386,7 +1588,7 @@ mod tests {
 
     #[test]
     fn pending_body_rechecks_late_cache_or_failure_events() {
-        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         tracker.set_trigger(100_000.0).unwrap();
         tracker.request(2, req("first", 101.0)).unwrap();
         tracker.response(2, resp("first", Some(false))).unwrap();
@@ -1503,7 +1705,7 @@ mod tests {
 
     #[test]
     fn two_posttrigger_candidates_are_ambiguous_not_an_earliest_guess() {
-        let mut t = Tracker::new(2, "test".into(), "top".into());
+        let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         t.request(2, req("a", 101.0)).unwrap();
         t.request(2, req("b", 102.0)).unwrap();
         t.set_trigger(100_000.0).unwrap();
@@ -1511,7 +1713,7 @@ mod tests {
     }
     #[test]
     fn delayed_pretrigger_request_and_previous_generation_cannot_become_samples() {
-        let mut t = Tracker::new(2, "test".into(), "top".into());
+        let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         t.request(1, req("old-generation", 101.0)).unwrap();
         t.request(2, req("before-click", 99.0)).unwrap();
         t.response(2, resp("before-click", Some(false))).unwrap();
@@ -1524,7 +1726,7 @@ mod tests {
     }
     #[test]
     fn callback_reordering_keeps_exact_id_and_frame() {
-        let mut t = Tracker::new(2, "test".into(), "top".into());
+        let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         t.request(2, req("current", 100.1)).unwrap();
         t.finished(2, finish("current")).unwrap();
         t.response(2, resp("unrelated", Some(false))).unwrap();
@@ -1535,7 +1737,7 @@ mod tests {
         assert_eq!(b.provenance.transport, "network_response");
         assert_eq!(b.provenance.server_freshness, "unknown");
         assert!(t.take_ready().unwrap().is_none());
-        let mut t = Tracker::new(2, "test".into(), "top".into());
+        let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         t.request(2, req("a", 101.0)).unwrap();
         let mut r = resp("a", Some(false));
         r.frame_id = Some("other".into());
@@ -1548,7 +1750,7 @@ mod tests {
             (None, false, "unknown"),
             (Some(false), true, "cache_or_service_worker"),
         ] {
-            let mut t = Tracker::new(2, "test".into(), "top".into());
+            let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
             t.set_trigger(100_000.0).unwrap();
             t.request(2, req("a", 101.0)).unwrap();
             if cached {
@@ -1564,7 +1766,7 @@ mod tests {
     #[test]
     fn network_finish_before_response_event_preserves_raw_times_and_identity() {
         for finish_callback_first in [false, true] {
-            let mut tracker = Tracker::new(2, "test".into(), "top".into());
+            let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
             tracker.request(2, req("matched", 100.1)).unwrap();
             let mut finished = finish("matched");
             finished.timestamp = 20.05;
@@ -1599,7 +1801,7 @@ mod tests {
 
     #[test]
     fn unknown_wire_length_accepts_bounded_body_without_freshness_claim() {
-        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         tracker.set_trigger(100_000.0).unwrap();
         tracker.request(2, req("matched", 100.1)).unwrap();
         tracker.response(2, resp("matched", Some(false))).unwrap();
@@ -1657,7 +1859,7 @@ mod tests {
                 "response_size_limit",
             ),
         ] {
-            let mut tracker = Tracker::new(2, "test".into(), "top".into());
+            let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
             tracker.set_trigger(100_000.0).unwrap();
             tracker
                 .request(2, req("private_request_id", 100.1))
@@ -1690,7 +1892,7 @@ mod tests {
 
     #[test]
     fn unrelated_or_stale_finish_events_cannot_create_timing_diagnostics() {
-        let mut tracker = Tracker::new(2, "test".into(), "top".into());
+        let mut tracker = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         tracker.set_trigger(100_000.0).unwrap();
         tracker.request(2, req("matched", 100.1)).unwrap();
         for (generation, id) in [(1, "matched"), (2, "unrelated")] {
@@ -1704,7 +1906,7 @@ mod tests {
 
     #[test]
     fn caps_and_denials_fail_closed() {
-        let mut t = Tracker::new(2, "test".into(), "top".into());
+        let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         t.set_trigger(100_000.0).unwrap();
         t.request(2, req("a", 101.0)).unwrap();
         let mut r = resp("a", Some(false));
@@ -1717,7 +1919,7 @@ mod tests {
         )
         .is_err());
         assert!(response_body(r#"{"body":"e30=","base64Encoded":true}"#).is_err());
-        let mut t = Tracker::new(2, "test".into(), "top".into());
+        let mut t = Tracker::new(2, "test".into(), "top".into(), SourcePage::FullChannel);
         for _ in 0..MAX_EVENTS {
             t.count_event().unwrap();
         }
@@ -1734,7 +1936,7 @@ mod tests {
         let mut e = RunEvidence::new(&config);
         for i in 0..4 {
             e.start(s.start_due(i * START_GAP_MS).unwrap());
-            let mut t = Tracker::new(1, "test".into(), "top".into());
+            let mut t = Tracker::new(1, "test".into(), "top".into(), SourcePage::FullChannel);
             t.set_trigger(100_000.0).unwrap();
             t.request(1, req("a", 101.0)).unwrap();
             t.response(1, resp("a", Some(false))).unwrap();

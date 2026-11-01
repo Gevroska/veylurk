@@ -1,6 +1,6 @@
 # Community collector integration plan
 
-Status: implemented and accepted in an isolated Windows application test. Updated 2026-10-31 (Europe/Paris).
+Status: full-channel integration accepted historically; owner-authorized chat-only/RAM revision in qualification. Updated 2026-11-01 (Europe/Paris).
 
 The finite autonomous full-channel source gate passed at revision d947fc6c.
 Two circuits over kamet0 and otplol_ returned four accepted HTTP200 samples
@@ -12,8 +12,12 @@ absent. Exact Windows proof checks passed in run41243918757.
 This establishes finite autonomous signed-in source operation. It does not
 establish independent samples, server freshness, complete video-viewer coverage,
 watch time, indefinite authentication or production application acceptance.
-The denied popout route is not used as a fallback. Normal full-channel pages
-with verified paused playback are the accepted route.
+That accepted historical revision used normal full-channel pages with verified
+paused playback, without falling back after a separate denied popout run.
+On 2026-11-01 the owner authorized Popout Chat as the automatic source and a
+dormant browser between samples. See the [RAM qualification](community-ram-optimization.md)
+for the new route-specific contract and separate fresh acceptance gates; the
+earlier denied result is retained.
 
 ## Application acceptance
 

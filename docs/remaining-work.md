@@ -367,3 +367,15 @@ not supply independent membership or absence truth. Independent empirical 99%
 calibration remains `not_run_missing_independent_reference`; the production model
 retains `uncalibrated` and its existing defaults. No further owner-supplied
 dataset question is pending.
+
+
+## Chat-only source and additional RAM reduction
+
+The owner authorized Popout Chat and on-demand browser creation on 2026-11-01.
+Astra's [source/lifecycle plan](community-ram-optimization.md) defines strict
+route-specific readiness, preserved source/authentication guards, dormant command
+handling and a bounded isolated qualification. Implementation is in progress.
+Fresh signed-out and signed-in checks, exact Windows artifacts, measured gains
+and history/configuration preservation remain separate acceptance gates. The
+prior denied-popout result remains historical; this authorization does not
+reclassify it as successful. Production on 8795 remains excluded.

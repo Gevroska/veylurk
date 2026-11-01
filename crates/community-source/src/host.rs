@@ -123,6 +123,8 @@ pub struct NativeOperationFailure {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CleanupDiagnostics {
+    /// True only when no browser/controller creation remains outstanding.
+    pub no_browser_cleanup_required: bool,
     pub controller_epoch: u64,
     pub expected_browser_pid: Option<u32>,
     pub observed_exit_pid: Option<u32>,
@@ -254,6 +256,8 @@ impl BrowserLifecycle {
 // slot. Keeping the payload inline avoids an extra allocation per receipt.
 #[allow(clippy::large_enum_variant)]
 pub enum HostEvent {
+    /// Runtime/profile preflight passed and commands may be admitted. This is
+    /// not evidence that a browser, signed-in session or source page is ready.
     Ready,
     LoginShown,
     LoginFailed,
