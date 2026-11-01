@@ -1883,10 +1883,7 @@ impl App {
                     }
                     (PopoutPhase::AwaitingPanel, "community_panel_waiting") => (),
                     (PopoutPhase::AwaitingPanel, "community_panel_transition")
-                        if app.panel_transition_allowed(generation) =>
-                    {
-                        ()
-                    }
+                        if app.panel_transition_allowed(generation) => {}
                     (PopoutPhase::Restoring, "community_restore_clicked") => {
                         app.state.borrow_mut().begin_popout_revalidation();
                     }
