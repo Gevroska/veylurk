@@ -181,7 +181,7 @@ member receipts compared identically, and saved credentials were reused unchange
 Production port 8795 and its executable were not modified or restarted. This short
 check does not establish that an intermittent cleanup failure can never recur.
 
-## Paused-player readiness candidate
+## Paused-player readiness correction
 
 The test instance's `strano` page reached the unchanged 25-second navigation/UI
 deadline with signed-in chat, Community and paused video present, but without the
@@ -203,6 +203,18 @@ Focused Rust regressions cover these readiness and pause-action boundaries. An
 offline Node VM fixture executes the actual embedded `COMMUNITY_UI`: paused video
 without Play or decoded frames produces one ordinary Community click; playback,
 missing/unknown video, wrong pages, challenge pages, lost prerequisites and
-expired deadlines produce none. Windows Rust/CI checks and fresh isolated live
-`strano` acceptance remain separate candidate verification gates. Existing cleanup
-acceptance above does not establish this candidate's live success.
+expired deadlines produce none.
+
+Revision `fa02cc66` passed Windows application workflow
+[41270487906](https://github.com/Gevroska/veylurk/actions/runs/41270487906), including
+108 Node tests, and the shared native source passed all 60 tests in workflow
+[41270487924](https://github.com/Gevroska/veylurk/actions/runs/41270487924).
+A bounded test-only rotation accepted `strano` samples with 32 and 31 accounts
+in 7.070 and 7.800 seconds, with a successful `normanajari` navigation between them.
+All four rotation attempts succeeded. A later attempt stopped for the cleanup
+check remains recorded as cancelled. The temporary Fixed/30 cadence was restored to
+the saved Adaptive/300 setting. Normal browser cleanup was confirmed in 518 ms,
+with no remaining profile processes before collection was re-enabled.
+The 24,974 original IRC observations, 182 Community attempts and 15,986 member
+receipts compared identically; encrypted API credentials and website sign-in were
+reused. Production port 8795 and its executable were not modified or restarted.
