@@ -694,7 +694,7 @@ impl Coordinator {
         Ok(())
     }
 
-    async fn record_fault(&self, report: FaultReport) {
+    async fn record_fault(&mut self, report: FaultReport) {
         let mut status = self.service.status.write().await;
         if report.primary_failure.is_some() {
             status.primary_failure = report.primary_failure;
