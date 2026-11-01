@@ -120,3 +120,15 @@ A real extended trial at 10, 25 and 50 channels is outside the requested optimiz
 For any owner-run reliability trial, record duration, enabled and available channel counts, receive throughput, reconnects and gaps, database/WAL growth, process working set/CPU and local query latency. Keep credentials and tokens out of reports. Reliability results remain separate from short performance measurements.
 
 Windows sign-out, sleep, network loss, unavailable Twitch membership and missing messages are coverage gaps. Report them as unknown periods. An uninterrupted process alone does not establish uninterrupted or complete observations. Keep live measurement notes separate from offline fixture results and human interface acceptance.
+
+
+## 2026-11-01 native Community comparison
+
+The [isolated completion report](completion-results-2026-11-01.md) records the
+fixed 24-channel before/after trial and artifact identities. Confirmed page
+retirement after each accepted sample reduced comparable idle private memory
+about 81% and stable idle CPU about 98%. Full-cycle CPU and throughput gains were
+not established. Both runs stopped at the same 1 GiB investigation trigger;
+the candidate reached four successful distinct channels across six initiated
+attempts in 231.663 seconds. Full 24-channel Community acceptance remains partial.
+No source, player, authentication, pacing or durability guard was relaxed.

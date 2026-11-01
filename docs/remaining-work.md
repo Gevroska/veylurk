@@ -336,26 +336,34 @@ from source rejection while preserving the persisted restart barrier.
 
 ## Current four-item completion increment
 
-The owner authorized the written [completion plan](completion-plan-2026-11-01.md).
-Its ledger separates source implementation, hosted checks, live measurements and
-statistical proof. The current candidate implements the cleanup pause distinction
-and atomic Community v3 migration, persist-first retirement barriers, independent
-memory-only storage activity and bounded read waits, and the offline numerical,
-simulation and reference-evaluation tool. Source review and 114 local Node tests
-passed; hosted Windows and candidate runtime acceptance remain pending.
+The [Astra plan](completion-plan-2026-11-01.md) has a final evidence ledger; the
+[completion report](completion-results-2026-11-01.md) records the four separate
+outcomes. Cleanup classification/v3 barriers, memory-only storage activity,
+bounded read responses and the offline numerical/simulation/reference tool are
+implemented and verified at source `4ea5d9e`. Windows app/native CI, independent
+review and relevant local checks passed. The test instance on 8796 retained its
+history, credentials and sign-in; both original channels produced fresh durable
+receipts after final restart. Production on 8795 was unchanged.
 
-The first fixed 24-channel baseline stopped at its predeclared 1 GiB private-memory
-investigation trigger after 60.7 seconds and two durable successes. The first
-channel peaked near 879 MiB, its retained idle page remained near 833–938 MiB,
-and the second channel reached 1,418 MiB across the app and browser descendants.
-This is partial breadth evidence, not 24-channel acceptance. Exact original
-settings and tracking state were restored. The candidate now releases a retained
-source page after an accepted success through its existing confirmed-cleanup and
-same-profile recycle path. Native tests and a matched runtime comparison must
-establish its effect; no memory reduction is claimed from source changes alone.
+The measured page-retirement optimization reduced comparable idle private memory
+from about 840 to 156 MiB (~81%) and stable idle CPU from 30.6% to 0.62% of one
+core (~98%). These are idle-phase measurements, not overall throughput gains.
+The same 1 GiB guard ended the candidate circuit after 231.663 seconds: four
+successful channels, six initiated attempts and 24 configured. One attempt timed
+out and one was cancelled during cleanup. Full many-channel Community breadth
+therefore remains partial, and active-page memory remains a residual cost.
 
-The empirical 99% claim remains separate from simulated and proxy agreement.
-Choosing live channels supplies real observations but does not create independent
-membership/absence truth. The agent will run feasible tests autonomously without
-asking the owner to supply a dataset again; unavailable reference evidence must
-remain explicit in the final report.
+The storage observation and new activity endpoint improve diagnosis and bounded
+read responsiveness. The historical and recurrent R: read-delay cause remains
+unresolved; no disk, Storage Spaces or Syncthing setting was changed. See the
+[storage investigation](storage-investigation-2026-11-01.md).
+
+All nine 200-trajectory simulation scenarios completed. Correlated draws and
+stale positives exposed model sensitivity; no settings were tuned after holdout
+inspection. Strong-absence error was unmeasured because no strong-absence
+classification occurred. The autonomous two-live-channel proxy pilot was
+resource-truncated and yielded zero usable complete-window comparisons. It does
+not supply independent membership or absence truth. Independent empirical 99%
+calibration remains `not_run_missing_independent_reference`; the production model
+retains `uncalibrated` and its existing defaults. No further owner-supplied
+dataset question is pending.

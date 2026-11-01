@@ -93,3 +93,16 @@ Without admissible independent labels, the required factual result is `not_run_m
 ## Acceptance record
 
 Implementation, source formatting, fixture structure, hosted numerical/tests, full bounded simulation and real reference availability are separate gates. Record the actual revision, executable hash, CLI options, output hashes, runtime and completion status in the coordinating evidence report. Until those executions are recorded, this document describes a protocol and implementation, not passed runtime results. Independent empirical 99% membership calibration remains outstanding unless independently defensible evidence and a qualifying analysis establish it.
+
+
+### Executed 2026-11-01 evidence
+
+At `4ea5d9e`, Windows CI `41321346204` passed numerical/oracle, production
+integration, strict reference and CLI smoke checks. The verified offline artifact
+completed all nine 200-trajectory/120-observation scenarios in 6.663 seconds.
+The invented reference passed separately; real reference evaluation recorded
+`not_run_missing_independent_reference`. Correlated and stale-positive stress
+errors and missing strong-absence support remain findings. The live proxy pilot
+supplied zero usable complete-window comparisons. See the
+[completion report](completion-results-2026-11-01.md) for counts, coverage,
+limitations and the unchanged `uncalibrated` status.

@@ -256,18 +256,18 @@ Allowed ledger statuses: `planned`, `in_progress`, `verified`, `partial`, `faile
 | --- | --- | --- |
 | Baseline identities/settings and preservation snapshot | verified | C: staging `veylurk-completion-20261101-1540`: exact configuration snapshot, consistent read-only-source backup, offline integrity `ok`, no pending sample, encrypted credential and executable hashes. Root revalidates runtime before mutations. |
 | Optional bounded 24-channel baseline | partial | Stopped at the predeclared 1 GiB resource trigger after 60.7 seconds: 2/24 durable successes, 1,418 MiB sampled group private peak. Original settings/tracking restoration verified. |
-| Cleanup enum, v3 migration and all retirement paths | in_progress | Implementation handed off; local Node tests and formatting passed. Independent review and Windows Rust checks remain required. |
-| Cleanup restart barrier, denial precedence and UI | in_progress | Source and targeted UI regressions complete; independent review passed, Windows Rust/runtime evidence pending. |
-| Memory-only storage activity and abandoned-read behavior | in_progress | Storage worker; unchanged mutation policy, proposed 10-second read-response wait separate from 5-second SQL execution budget. |
-| Five-minute independent storage observation | in_progress | Read-only OS/process sampling to C:; no disk, Syncthing or production settings changes. |
-| Numerical, simulation and reference-evaluator implementation | in_progress | Model-validation worker; bounded offline CLI and typed reference schema, no production inference/default changes. |
-| Independent real reference available and admissible | not_run_missing_independent_reference | No dataset established at planning time; inventory relevant authorized artifacts. |
+| Cleanup enum, v3 migration and all retirement paths | verified | Atomic v2→v3 isolated migration, persist-first retirement/cancellation fixtures, rollback and independent review passed; Windows app CI `41321346204`. |
+| Cleanup restart barrier, denial precedence and UI | verified | Targeted Rust/UI checks passed; normal cleanup/restart and fresh retained sign-in verified. No destructive live cleanup fault injected. |
+| Memory-only storage activity and abandoned-read behavior | verified | Independent route, 10-second read wait, separate 5-second execution budget, queue/cancellation/write invariants passed Windows checks and runtime endpoint measurement. |
+| Five-minute independent storage observation | verified | 300.009 seconds, 29 usable/30 samples. R: queue max 11; R:/P: share devices. Historical and recurrent read delay cause remains unresolved; no OS/Syncthing settings changed. |
+| Numerical, simulation and reference-evaluator implementation | verified | Independent oracle and production integration tests, strict reference fixtures and offline CLI passed. Production model/defaults unchanged. |
+| Independent real reference available and admissible | not_run_missing_independent_reference | Autonomously selected live-channel proxy pilot produced zero fully observed usable comparisons and no absence labels. This does not supply independent membership truth. |
 | Combined independent review and local checks | verified | Independent Astra source review; 114 Node tests and PowerShell measurement fixtures passed. Native ledger-test assertion and injected-stall job-class mismatch corrected without changing production budgets or recovery assertions. Compiled acceptance remains separate. |
-| Hosted Windows MSVC checks/build and exact artifact | planned | One integrated candidate by default. |
-| Verified backup, same-path isolated rollout and migration | planned | Root only. |
-| Candidate 24-channel Community trial | planned | 18-minute cap; actual breadth and live status reported. |
-| Simulated/reference evaluation reports | planned | Separate implementation/simulation/real statuses. |
-| Original settings, credentials, history and production preserved | planned | Final restoration plus fresh original-channel receipts. |
-| Four-item final report and remaining-work update | planned | Do not close empirical calibration without qualifying evidence. |
+| Hosted Windows MSVC checks/build and exact artifact | verified | App CI `41321346204`, source `4ea5d9e`; native CI `41320991143` (76 tests, unchanged native source). Download digests/executable hashes verified. |
+| Verified backup, same-path isolated rollout and migration | verified | Old process exited 0, profile ownership clear, offline backup verified. Same approved test package migrated to v3 and retained credentials/sign-in. |
+| Candidate 24-channel Community trial | partial | 231.663 seconds; 4 successful / 6 initiated / 24 configured, one timeout and one cancelled attempt. Same 1 GiB resource trigger; original configuration restored. Idle memory ~840→156 MiB. |
+| Simulated/reference evaluation reports | verified | All nine scenarios × 200 trajectories × 120 observations completed in 6.663 seconds. Invented evaluator verified; stress errors retained. Real calibration remains separately unavailable. |
+| Original settings, credentials, history and production preserved | verified | All immutable pre-upgrade rows identical on byte-verified offline copy; integrity ok/pending 0; credentials unchanged. Final fresh durable receipts 322/323 for original channels; production identity unchanged. |
+| Four-item final report and remaining-work update | verified | See `completion-results-2026-11-01.md`, storage investigation and parent-workspace `outputs/completion-20261101/evidence/manifest.json`; partial/unavailable gates remain explicit. |
 
 Completion report format: one row per authorized item with implementation status, automated evidence, actual runtime/reference evidence, and the precise unresolved limitation. This lets the owner distinguish a fixed bug, a measured short performance result, an unresolved storage cause and a statistical claim that current access cannot establish.
