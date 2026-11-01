@@ -250,6 +250,24 @@ Source regressions cover the actual shared window-close handler for service,
 sign-in, standalone proof and pending shutdown; active admission and denial
 preservation; first-reason retention through cleanup and the guard; pump/startup
 paths; pending/idle run boundaries and retirement; and bounded durable diagnostic
-records, redaction and first-storage-failure isolation. Formatting and diff checks
-are complete. Windows CI and controlled test-instance acceptance remain pending
-for this candidate; these source changes alone do not establish runtime behavior.
+records, redaction and first-storage-failure isolation. Independent source review
+accepted the correction. Revision `08c1fa34` passed Windows application workflow
+[41303153994](https://github.com/Gevroska/veylurk/actions/runs/41303153994), including
+110 Node tests, and shared native workflow
+[41303153992](https://github.com/Gevroska/veylurk/actions/runs/41303153992) passed 66 tests.
+
+The test-only rollout reused the saved website session and API credentials and
+saved fresh samples for both selected channels without changing Adaptive/300.
+Explicit Disable confirmed real browser cleanup in 517 ms with no remaining
+profile process. Its `shutdown_requested` snapshot was verified in the existing
+on-disk journal with no first storage failure; the Community run ended as disabled.
+Collection was then re-enabled with its original settings. All 25,579 pre-update
+IRC observations, 201 Community attempts and 16,533 member receipts compared
+identically. Production port 8795 and its executable were not changed or restarted.
+
+The desktop tool could not activate either the old or restarted helper window;
+no physical Close-button input was sent. Old-behavior reproduction, the corrected
+native-button interaction and live sign-in Close/reopen remain pending desktop
+availability. The Windows tests execute the shared handler, but are distinct from
+those pending interactive checks. The original historical Close sender is still
+unrecorded and cannot be identified retrospectively from the available evidence.
