@@ -785,7 +785,7 @@ mod tests {
             Router::new(),
         );
         let (entered, received) = tokio::sync::oneshot::channel();
-        let (release, wait) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
         let blocked_store = store.clone();
         let blocked = tokio::spawn(async move {
             blocked_store

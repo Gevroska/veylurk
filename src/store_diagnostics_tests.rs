@@ -16,7 +16,7 @@ impl Drop for WorkerGate {
 
 async fn hold_worker(store: &Store) -> WorkerGate {
     let (entered, received) = oneshot::channel();
-    let (release, wait) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
     let store = store.clone();
     let task = tokio::spawn(async move {
         store
@@ -217,7 +217,7 @@ async fn timeout_during_active_read_does_not_interrupt_write_or_leak_query_callb
         .await
         .unwrap();
     let (entered, received) = oneshot::channel();
-    let (release, wait) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
     let reader = store.clone();
     let read = tokio::spawn(async move {
         reader
