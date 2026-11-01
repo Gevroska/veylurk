@@ -28,6 +28,7 @@ pub struct Status {
     pub settings: CommunitySettings,
     pub state: &'static str,
     pub paused: bool,
+    pub persisted_pause_reason: Option<CommunityPauseReason>,
     pub last_error: Option<&'static str>,
     pub active_channel: Option<String>,
     pub next_channel: Option<String>,
@@ -246,6 +247,7 @@ fn storage_error(e: StoreError) -> (StatusCode, Json<Value>) {
     match e {
         StoreError::Invalid => error(StatusCode::BAD_REQUEST, "invalid_query"),
         StoreError::NotFound => error(StatusCode::NOT_FOUND, "invalid_query"),
+        StoreError::ReadWaitTimeout => error(StatusCode::SERVICE_UNAVAILABLE, "read_wait_timeout"),
         _ => error(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable"),
     }
 }
@@ -267,6 +269,7 @@ impl Community {
                 "disabled"
             },
             paused: persisted_pause.is_some(),
+            persisted_pause_reason: persisted_pause,
             last_error: persisted_pause.map(|reason| reason.code()),
             active_channel: None,
             next_channel: None,
@@ -475,20 +478,42 @@ impl Coordinator {
     }
 
     async fn pause_source(&mut self, code: &'static str) -> Result<(), StoreError> {
-        let reason = match code {
+        let requested = match code {
             "authentication_denied" | "signed_in_ui_lost" => {
                 CommunityPauseReason::AuthenticationDenied
             }
             "integrity_denied" => CommunityPauseReason::IntegrityDenied,
             "challenge_denied" => CommunityPauseReason::ChallengeDenied,
             "rate_limited" => CommunityPauseReason::RateLimited,
+            "cleanup_unconfirmed" | "controller_cleanup_unconfirmed" | "operator_cancelled" => {
+                CommunityPauseReason::CleanupUnconfirmed
+            }
             _ => CommunityPauseReason::SourceDenied,
         };
+        // Retain the first source barrier, including historically ambiguous
+        // source_denied values. Cleanup has its own independent diagnostics.
+        let retained_source = self
+            .persisted_pause
+            .filter(|reason| *reason != CommunityPauseReason::CleanupUnconfirmed);
+        let reason = retained_source.unwrap_or(requested);
+        let pause_code = if let Some(retained) = retained_source {
+            retained.code()
+        } else if requested == CommunityPauseReason::CleanupUnconfirmed {
+            requested.code()
+        } else {
+            code
+        };
+        // Close admission even if the durable barrier cannot be committed.
+        // The caller propagates that storage failure and the coordinator stops.
+        if requested == CommunityPauseReason::CleanupUnconfirmed {
+            self.service.status.write().await.cleanup_confirmed = Some(false);
+        }
+        self.pause(pause_code).await;
         if self.persisted_pause != Some(reason) {
             self.service.store.set_community_pause(Some(reason)).await?;
             self.persisted_pause = Some(reason);
+            self.service.status.write().await.persisted_pause_reason = Some(reason);
         }
-        self.pause(code).await;
         Ok(())
     }
 
@@ -580,13 +605,14 @@ impl Coordinator {
                 }
                 self.retire(CommunityRunEndReason::Paused).await?;
                 if self.service.status.read().await.cleanup_confirmed == Some(false) {
-                    self.pause("cleanup_unconfirmed").await;
+                    self.pause_source("cleanup_unconfirmed").await?;
                     return Ok(ControlReply::Accepted);
                 }
-                self.paused = false;
                 self.service.store.set_community_pause(None).await?;
                 self.persisted_pause = None;
+                self.paused = false;
                 self.next_start = Instant::now().max(self.next_start);
+                self.service.status.write().await.persisted_pause_reason = None;
                 self.service.status.write().await.last_error = None;
                 self.service.status.write().await.state = "starting";
             }
@@ -703,7 +729,20 @@ impl Coordinator {
 
     async fn record_fault(&mut self, report: FaultReport) {
         let mut status = self.service.status.write().await;
-        if report.primary_failure.is_some() {
+        if report.primary_failure.is_some()
+            && !(status.primary_failure.is_some()
+                && (self
+                    .persisted_pause
+                    .is_some_and(|reason| reason != CommunityPauseReason::CleanupUnconfirmed)
+                    || report.primary_failure.as_ref().is_some_and(|failure| {
+                        matches!(
+                            failure.code,
+                            "cleanup_unconfirmed"
+                                | "controller_cleanup_unconfirmed"
+                                | "operator_cancelled"
+                        )
+                    })))
+        {
             status.primary_failure = report.primary_failure;
         }
         if report.cleanup_diagnostics.is_some() {
@@ -773,7 +812,9 @@ impl Coordinator {
                             failure.code == "operator_cancelled",
                         )
                         .await?;
-                        self.service.status.write().await.last_error = Some(failure.code);
+                        if self.persisted_pause.is_none() {
+                            self.service.status.write().await.last_error = Some(failure.code);
+                        }
                     }
                 }
             }
@@ -790,6 +831,10 @@ impl Coordinator {
                 self.host = None;
                 self.ready = false;
                 self.service.status.write().await.cleanup_confirmed = Some(cleanup_confirmed);
+                // Persist the cleanup barrier before attempt/run closure can fail.
+                if !cleanup_confirmed {
+                    self.pause_source("cleanup_unconfirmed").await?;
+                }
                 self.finish_failure(CommunityFailureCode::HostFailure, false)
                     .await?;
                 // An unsolicited terminal ends coverage now. Retirement already
@@ -797,17 +842,12 @@ impl Coordinator {
                 if !self.retiring {
                     self.end_run(CommunityRunEndReason::HostFailure).await?;
                 }
-                if !self.retiring || !cleanup_confirmed {
-                    let code = if cleanup_confirmed {
-                        "browser_closed"
-                    } else {
-                        "cleanup_unconfirmed"
-                    };
-                    if cleanup_confirmed {
-                        self.pause(code).await;
-                    } else {
-                        self.pause_source(code).await?;
-                    }
+                if !self.retiring && cleanup_confirmed {
+                    self.pause(
+                        self.persisted_pause
+                            .map_or("browser_closed", |reason| reason.code()),
+                    )
+                    .await;
                 }
             }
         }
@@ -857,7 +897,7 @@ impl Coordinator {
         status.last_received_at_utc = received_at_utc.clone();
         status.last_received_channel = Some(pending.channel.clone());
         status.last_returned_accounts = Some(count);
-        status.last_error = None;
+        status.last_error = self.persisted_pause.map(|reason| reason.code());
         if let Some(schedule) = self.schedule.get_mut(&pending.channel) {
             let now = Instant::now();
             status.achieved_interval_seconds = schedule
@@ -926,9 +966,18 @@ impl Coordinator {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        if self.host.take().is_some() {
+        let cleanup_timed_out = self.host.take().is_some();
+        self.finish_retirement(reason, cleanup_timed_out).await
+    }
+
+    async fn finish_retirement(
+        &mut self,
+        reason: CommunityRunEndReason,
+        cleanup_timed_out: bool,
+    ) -> Result<(), StoreError> {
+        if cleanup_timed_out {
             self.service.status.write().await.cleanup_confirmed = Some(false);
-            self.paused = true;
+            self.pause_source("cleanup_unconfirmed").await?;
         }
         self.ready = false;
         self.finish_failure(CommunityFailureCode::HostFailure, true)

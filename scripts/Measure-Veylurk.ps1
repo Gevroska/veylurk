@@ -137,7 +137,7 @@ function ConvertTo-VeylurkMeasurementAggregate {
         if ($null -eq $result[$name]) { $result.result = 'partial' }
     }
     $result.state = Get-VeylurkMeasurementState (Get-VeylurkMeasurementValue $Status 'state') @('starting', 'idle', 'collecting', 'membership_unavailable', 'joining', 'connecting', 'storage_error', 'backoff', 'stopped')
-    $result.storage_health = Get-VeylurkMeasurementState (Get-VeylurkMeasurementValue $Status 'storage_health') @('available', 'unavailable')
+    $result.storage_health = Get-VeylurkMeasurementState (Get-VeylurkMeasurementValue $Status 'storage_health') @('available', 'unavailable', 'read_wait_timeout')
     if ($result.state -eq 'unknown' -or $result.storage_health -eq 'unknown') { $result.result = 'partial' }
     return [pscustomobject]$result
 }

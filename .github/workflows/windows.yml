@@ -50,6 +50,33 @@ jobs:
         run: cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
       - name: Build release application and probes
         run: cargo build --release --locked
+      - name: Verify bounded offline presence validation and package its evidence tools
+        shell: pwsh
+        run: |
+          $validationDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-presence-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $validationDirectory | Out-Null
+          $binary = '.\target\release\veylurk-presence-validate.exe'
+          & $binary simulate --trajectories 2 --observations 12 --max-seconds 20 --output (Join-Path $validationDirectory 'simulation.json') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Offline simulation smoke failed.' }
+          & $binary reference --input fixtures/presence-validation/invented-reference.json --output (Join-Path $validationDirectory 'fixture.json') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Invented reference evaluator fixture failed.' }
+          & $binary reference --output (Join-Path $validationDirectory 'missing-reference.json') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Missing reference status could not be recorded.' }
+          $simulation = Get-Content -LiteralPath (Join-Path $validationDirectory 'simulation.json') -Raw | ConvertFrom-Json
+          $fixture = Get-Content -LiteralPath (Join-Path $validationDirectory 'fixture.json') -Raw | ConvertFrom-Json
+          $missing = Get-Content -LiteralPath (Join-Path $validationDirectory 'missing-reference.json') -Raw | ConvertFrom-Json
+          if (-not $simulation.complete -or $simulation.classification -ne 'simulation_only' -or $fixture.classification -ne 'reference_evaluator_verified' -or $missing.status -ne 'not_run_missing_independent_reference') { throw 'Validation proof categories were incorrect.' }
+          foreach ($report in @($simulation, $fixture, $missing)) {
+            if ($report.network_used -ne $false -or $report.database_used -ne $false -or $report.calibration_status -ne 'uncalibrated' -or $report.claims.empirically_calibrated -ne $false) { throw 'Offline validator overstated its evidence or used a live source.' }
+          }
+          $package = 'presence-validation-package'
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item -LiteralPath $binary -Destination $package
+          Copy-Item -LiteralPath 'docs/community-presence-validation.md' -Destination (Join-Path $package 'README.md')
+          Copy-Item -LiteralPath 'fixtures/presence-validation/reference.schema.json','fixtures/presence-validation/invented-reference.json' -Destination $package
+          $hash = (Get-FileHash -LiteralPath (Join-Path $package 'veylurk-presence-validate.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $package 'SHA256SUMS.txt'), $hash + '  veylurk-presence-validate.exe' + [Environment]::NewLine)
+          [IO.File]::WriteAllText((Join-Path $package 'SOURCE_REVISION.txt'), $env:GITHUB_SHA + [Environment]::NewLine)
       - name: Build isolated performance harness for diagnosis
         id: performance_build
         if: always() && !cancelled() && steps.lint.outcome == 'success'
@@ -193,6 +220,12 @@ jobs:
         with:
           name: veylurk-windows-x64
           path: app-package/
+          if-no-files-found: error
+      - name: Publish offline presence validator artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylurk-presence-validation-windows-x64
+          path: presence-validation-package/
           if-no-files-found: error
       - name: Upload Windows IRC probe
         uses: actions/upload-artifact@v4

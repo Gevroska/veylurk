@@ -135,7 +135,8 @@
       if (options.signal.aborted) controller.abort();
       else options.signal.addEventListener("abort", cancel, { once: true });
     }
-    const deadline = setTimeout(() => controller.abort(), 15000);
+    const requestTimeout = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.min(options.timeoutMs, 15000) : 15000;
+    const deadline = setTimeout(() => controller.abort(), requestTimeout);
     try {
       const response = await fetch(target.href, {
         method: options.method || "GET",
@@ -533,12 +534,13 @@
     const connected = Array.isArray(status.connected_channels) ? status.connected_channels.length : status.connected_channels;
     const enabled = Array.isArray(status.enabled_channels) ? status.enabled_channels.length : status.enabled_channels;
     const readiness = Number.isFinite(connected) && Number.isFinite(enabled) && connected < enabled ? `${count(enabled)} enabled; some channels are joining or unavailable. Check Channels for details.` : `${count(enabled)} enabled for tracking`;
-    grid.append(metric("Collector", label(status.state), "Chat collection status"), metric("Connected channels", count(connected), readiness), metric("Local storage", status.storage_health === "unavailable" ? "Unavailable" : bytes(status.storage_bytes), "SQLite database and reported storage"), metric("Stored events", count(status.observation_count), "Received protocol evidence"), metric("Collection sessions", count(status.session_count), "Sessions do not establish continuous presence"), metric("Retention", "Indefinite", "History survives pause and removal"));
+    const storageBusy = status.storage_health === "read_wait_timeout";
+    grid.append(metric("Collector", label(status.state), "Chat collection status"), metric("Connected channels", count(connected), readiness), metric("Local storage", storageBusy ? "Busy" : status.storage_health === "unavailable" ? "Unavailable" : bytes(status.storage_bytes), storageBusy ? "A database read response was delayed; check Database activity." : "SQLite database and reported storage"), metric("Stored events", count(status.observation_count), "Received protocol evidence"), metric("Collection sessions", count(status.session_count), "Sessions do not establish continuous presence"), metric("Retention", "Indefinite", "History survives pause and removal"));
     const details = node("dl", null, "card detail-list");
     detail(details, "App started", timestamp(status.started_at));
     detail(details, "Active session", status.active_session_id == null ? "None" : status.active_session_id);
     detail(details, "Database location", status.storage_path || "Unknown");
-    detail(details, "Storage health", badge(label(status.storage_health), status.storage_health === "unavailable" ? "bad" : status.storage_health === "available" ? "good" : "neutral"));
+    detail(details, "Storage health", badge(storageBusy ? "Read response delayed" : label(status.storage_health), storageBusy ? "warning" : status.storage_health === "unavailable" ? "bad" : status.storage_health === "available" ? "good" : "neutral"));
     detail(details, "Latest collector error", status.last_error || "None reported");
     detail(details, "Evidence scope", status.evidence_scope || "Chat membership observations only; completeness unknown.");
     detail(details, "Available disk space", bytes(status.disk_available_bytes));
@@ -555,6 +557,40 @@
     healthLoaded = true;
     $("health-results").classList.remove("stale");
     $("status-updated").textContent = "Updated " + clock.format(new Date());
+  }
+
+  let storageActivityLoaded = false;
+  async function refreshStorageActivity() {
+    const container = $("storage-activity");
+    try {
+      const data = await api("/api/storage/activity", { timeoutMs: 2000 });
+      const activity = data?.activity;
+      if (data.port !== Number(location.port) || !Number.isSafeInteger(data.process_id) || data.process_id <= 0 || activity?.schema_version !== 1) throw new Error("Invalid database activity response.");
+      const number = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+      const duration = (value) => number(value) === null ? "Unknown" : `${(value / 1000).toFixed(1)} seconds`;
+      const safeOperation = (value) => label(communityCode(value));
+      const details = node("dl", null, "detail-list");
+      const active = activity.active;
+      const state = active ? active.job_class === "durable_mutation" ? "Saving data" : active.job_class === "query" ? "Reading data" : "Operation in progress" : "No operation running";
+      detail(details, "Current work", state);
+      if (active) {
+        detail(details, "Operation", safeOperation(active.operation));
+        detail(details, "Running for", duration(active.active_age_ms));
+        detail(details, "Queue wait before start", duration(active.queue_wait_ms));
+      }
+      detail(details, "Waiting to start", count(number(activity.waiting_to_start)));
+      detail(details, "Waiting for a queue slot", count(number(activity.admission_waiting)));
+      detail(details, "Oldest queued work", duration(activity.oldest_queued_age_ms));
+      detail(details, "Completed operations", count(number(activity.totals?.succeeded)));
+      detail(details, "Timed-out read responses", count(number(activity.totals?.read_response_timeouts)));
+      detail(details, "Snapshot updated", clock.format(new Date()));
+      container.replaceChildren(details);
+      container.classList.remove("stale");
+      storageActivityLoaded = true;
+    } catch {
+      if (!storageActivityLoaded) container.replaceChildren(empty("Database activity is unavailable. Refresh status to try again."));
+      container.classList.add("stale");
+    }
   }
 
   function renderMetadata() {
@@ -595,6 +631,26 @@
     if (!Number.isSafeInteger(value) || value <= 0) return "Not reported";
     const date = new Date(value);
     return Number.isFinite(date.getTime()) ? timestamp(date.toISOString()) : "Not reported";
+  }
+
+  function communityPauseExplanation(data) {
+    const reason = data.persisted_pause_reason || (data.paused ? data.last_error : null);
+    switch (reason) {
+      case "cleanup_unconfirmed":
+      case "controller_cleanup_unconfirmed": return "Browser cleanup was not confirmed; automatic restart is paused.";
+      case "source_denied": return "A generic source pause was retained; its original cause was not recorded.";
+      case "authentication_denied": return "Authentication checks paused collection.";
+      case "integrity_denied": return "Source integrity checks paused collection.";
+      case "challenge_denied": return "A source challenge paused collection.";
+      case "rate_limited": return "A source rate limit paused collection.";
+      default: return null;
+    }
+  }
+
+  function communityReceiptAfterDiagnostic(data) {
+    const observed = data.primary_failure?.observed_at_unix_ms;
+    const received = Date.parse(data.last_received_at_utc);
+    return Number.isSafeInteger(observed) && observed > 0 && Number.isFinite(received) && received > observed;
   }
 
   function communityCadence() {
@@ -645,8 +701,13 @@
     $("community-login").disabled = communitySaving || stopping;
     $("community-resume").disabled = communitySaving || stopping || !data.paused || !communitySettings || !communitySettings.enabled;
     $("community-state").textContent = data.paused ? "Paused — explicit resume required" : label(communityCode(data.state));
-    $("community-state").className = "badge " + (data.last_error ? "warning" : data.paused ? "neutral" : data.settings && data.settings.enabled ? "good" : "neutral");
+    const recoveredDiagnostic = communityReceiptAfterDiagnostic(data);
+    const retainedError = !data.paused && recoveredDiagnostic && data.last_error === data.primary_failure?.code;
+    $("community-state").className = "badge " + (data.last_error && !retainedError ? "warning" : data.paused ? "neutral" : data.settings && data.settings.enabled ? "good" : "neutral");
     const summary = node("dl", null, "detail-list");
+    const pauseExplanation = communityPauseExplanation(data);
+    if (pauseExplanation) detail(summary, "Pause reason", pauseExplanation);
+    if (data.persisted_pause_reason) detail(summary, "Saved pause code", communityCode(data.persisted_pause_reason));
     detail(summary, "Selected channels", count(data.selected_channels));
     detail(summary, "Delayed channels", count(data.delayed_channels));
     detail(summary, "Active channel", data.active_channel || "None");
@@ -657,9 +718,11 @@
     detail(summary, "Global start gap", `${count(data.global_start_gap_seconds)} seconds minimum between job starts`);
     detail(summary, "Latest returned accounts", count(data.last_returned_accounts));
     detail(summary, "Browser shutdown confirmation", data.cleanup_confirmed === true ? "Confirmed" : data.cleanup_confirmed === false ? "Not confirmed" : "Not reported");
-    detail(summary, "Latest safe error code", data.last_error ? communityCode(data.last_error) : "None");
+    detail(summary, retainedError ? "Retained error code (later receipt succeeded)" : "Current error code", data.last_error ? communityCode(data.last_error) : "None");
     if (data.primary_failure) {
-      detail(summary, "Latest source failure in this run", `${communityCode(data.primary_failure.code)} · ${communityCode(data.primary_failure.stage)}`);
+      const diagnosticLabel = recoveredDiagnostic ? "Retained source diagnostic (later receipt succeeded)" : data.last_error === data.primary_failure.code ? "Current source diagnostic" : "Retained source diagnostic (current relevance unconfirmed)";
+      detail(summary, diagnosticLabel, `${communityCode(data.primary_failure.code)} · ${communityCode(data.primary_failure.stage)}`);
+      detail(summary, "Source diagnostic recorded", communityEventTime(data.primary_failure.observed_at_unix_ms));
     }
     if (data.cleanup_diagnostics) {
       detail(summary, "Latest browser cleanup in this run", data.cleanup_diagnostics.confirmed === true ? "Confirmed" : "Not confirmed");
@@ -719,6 +782,8 @@
     $("refresh-status").setAttribute("aria-busy", "true");
     const policyGeneration = settingsGeneration;
     const communityRequestGeneration = communityGeneration;
+    // This memory-only response renders independently of slower stored-history reads.
+    void refreshStorageActivity();
     const results = await Promise.allSettled([api("/api/status"), updateChannels(), api("/api/metadata/status"), api("/api/settings"), api("/api/community/status")]);
     const errors = [];
     if (results[0].status === "fulfilled") {

@@ -57,6 +57,11 @@ impl From<StoreError> for ApiError {
                 "not_found",
                 "Tracked channel not found.",
             ),
+            StoreError::ReadWaitTimeout => Self(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "read_wait_timeout",
+                "The read response wait expired. Storage work may still be finishing; check storage activity.",
+            ),
             _ => Self(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
@@ -100,6 +105,7 @@ pub fn router(state: AppState, additional: Router) -> Router {
             }),
         )
         .route("/api/status", get(status))
+        .route("/api/storage/activity", get(storage_activity))
         .route("/api/channels", get(channels).post(track))
         .route("/api/channels/{login}", patch(enable).delete(remove))
         .route("/api/channels/{login}/history", get(history))
@@ -195,8 +201,12 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
                     "Low disk space; retained history may stop growing when the disk is full."
                 }));
         }
-        Err(_) => {
-            value["storage_health"] = json!("unavailable");
+        Err(error) => {
+            if matches!(error, StoreError::ReadWaitTimeout) {
+                value["storage_health"] = json!("read_wait_timeout");
+            } else {
+                value["storage_health"] = json!("unavailable");
+            }
             value["storage_bytes"] = Value::Null;
             value["observation_count"] = Value::Null;
             value["session_count"] = Value::Null;
@@ -204,6 +214,16 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
     }
     value["diagnostics"] = json!(state.store.diagnostics());
     Ok(Json(value))
+}
+
+/// Deliberately bypasses aggregate status, disk free space, SQLite and diagnostic flushing.
+/// Clients bind process_id/port to a bracketed /api/runtime instance identity.
+async fn storage_activity(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "process_id": std::process::id(),
+        "port": state.port,
+        "activity": state.store.storage_activity(),
+    }))
 }
 async fn channels(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({"channels":state.store.channels().await?})))
@@ -744,6 +764,144 @@ mod tests {
         assert_eq!(first["progress_interrupt_requested"], false);
         assert!(first["sequence"].as_u64().unwrap() < latest["sequence"].as_u64().unwrap());
         assert!(value["diagnostics"]["persistence"]["state"].is_string());
+    }
+
+    #[tokio::test]
+    async fn storage_activity_responds_while_worker_is_held_without_enqueuing_storage_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("memory-activity.sqlite3"))
+            .await
+            .unwrap();
+        let status = crate::collector::status(&store);
+        let (channels, _) = watch::channel(Vec::new());
+        let app = router(
+            AppState {
+                store: store.clone(),
+                status,
+                channels,
+                port: 8794,
+                configuration: Arc::new(Mutex::new(())),
+            },
+            Router::new(),
+        );
+        let (entered, received) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let blocked_store = store.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .call_write(crate::diagnostics::Operation::Checkpoint, move |_| {
+                    let _ = entered.send(());
+                    let _ = wait.recv();
+                    Ok(())
+                })
+                .await
+        });
+        received.await.unwrap();
+        let before = store.storage_activity();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.clone().oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/storage/activity")
+                    .header("host", "127.0.0.1:8794")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("memory endpoint bypasses the held worker")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["process_id"], std::process::id());
+        assert_eq!(value["port"], 8794);
+        assert_eq!(value["activity"]["active"]["operation"], "checkpoint");
+        assert_eq!(value["activity"]["query_execution_budget_ms"], 5000);
+        assert_eq!(value["activity"]["read_response_budget_ms"], 10000);
+        assert_eq!(
+            value["activity"]["totals"]["requested"],
+            before.totals.requested
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("memory-activity.sqlite3"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("SELECT"));
+        assert_eq!(
+            store.storage_activity().totals.requested,
+            before.totals.requested
+        );
+        assert_eq!(
+            serde_json::to_value(store.work_snapshot_for_test()).unwrap()["stats"]
+                ["completed_executions"],
+            0
+        );
+        tokio::time::pause();
+        let status_app = app.clone();
+        let status_request = tokio::spawn(async move {
+            status_app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/status")
+                        .header("host", "127.0.0.1:8794")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store.storage_activity().waiting_to_start != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::advance(crate::diagnostics::READ_RESPONSE_BUDGET).await;
+        let status_response = status_request.await.unwrap();
+        tokio::time::resume();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(status_response.into_body(), 32768)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status_value["storage_health"], "read_wait_timeout");
+        assert!(status_value["storage_bytes"].is_null());
+        assert!(status_value["observation_count"].is_null());
+        assert!(status_value["diagnostics"]["first_failure"].is_null());
+        assert_eq!(store.storage_activity().totals.read_response_timeouts, 1);
+        let forbidden = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/storage/activity")
+                    .header("host", "foreign.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        drop(release);
+        blocked.await.unwrap().unwrap();
+        store
+            .call_write(crate::diagnostics::Operation::Checkpoint, |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(store.storage_activity().totals.canceled_before_start, 1);
+    }
+
+    #[tokio::test]
+    async fn read_wait_timeout_is_distinct_from_storage_failure_in_api_errors() {
+        let response = ApiError::from(StoreError::ReadWaitTimeout).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "read_wait_timeout");
     }
 
     #[tokio::test]

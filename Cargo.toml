@@ -25,6 +25,10 @@ path = "src/bin/veylurk.rs"
 name = "veylurk-perf-bench"
 path = "src/bin/perf_bench.rs"
 
+[[bin]]
+name = "veylurk-presence-validate"
+path = "src/bin/presence_validate.rs"
+
 [dependencies]
 community-source = { path = "crates/community-source" }
 clap = { version = "4.5", features = ["derive"] }

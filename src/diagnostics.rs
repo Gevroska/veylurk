@@ -1,4 +1,4 @@
-//! Bounded, typed failure evidence. Backend messages and inputs never enter this module's records.
+//! Bounded, typed storage activity and failure evidence. Backend messages and inputs never enter records.
 use crate::store::StoreError;
 use serde::Serialize;
 use std::{
@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const JOURNAL_BYTES: u64 = 64 * 1024;
@@ -40,6 +40,371 @@ pub enum Operation {
 pub enum JobClass {
     Query,
     DurableMutation,
+}
+
+pub(crate) const STORAGE_QUEUE_CAPACITY: usize = 64;
+pub(crate) const QUERY_EXECUTION_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const READ_RESPONSE_BUDGET: Duration = Duration::from_secs(10);
+// The serialized worker can hold one dequeued job in addition to the bounded channel.
+const STORAGE_ACTIVITY_SLOTS: usize = STORAGE_QUEUE_CAPACITY + 1;
+
+fn milliseconds(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct DurationSummary {
+    pub count: u64,
+    pub sum_ms: u64,
+    pub max_ms: u64,
+}
+
+impl DurationSummary {
+    fn observe(&mut self, elapsed: Duration) {
+        let elapsed = milliseconds(elapsed);
+        self.count = self.count.saturating_add(1);
+        self.sum_ms = self.sum_ms.saturating_add(elapsed);
+        self.max_ms = self.max_ms.max(elapsed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ActivityTotals {
+    pub requested: u64,
+    pub admitted: u64,
+    pub started: u64,
+    pub succeeded: u64,
+    /// Operations that returned an error, or an active job lost with the worker.
+    pub failed: u64,
+    pub canceled_before_start: u64,
+    /// Call futures dropped before they obtained an actor-channel permit.
+    pub abandoned_admission: u64,
+    pub admission_unavailable: u64,
+    pub worker_dropped_before_start: u64,
+    /// A response deadline is not a storage failure; execution may still be finishing.
+    pub read_response_timeouts: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityOutcome {
+    Succeeded,
+    Failed,
+    CanceledBeforeStart,
+    WorkerUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveStorageJob {
+    pub operation: Operation,
+    pub job_class: JobClass,
+    pub requested_at_ms: u64,
+    pub admitted_at_ms: u64,
+    pub started_at_ms: u64,
+    pub admission_wait_ms: u64,
+    pub queue_wait_ms: u64,
+    pub active_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletedStorageJob {
+    pub operation: Operation,
+    pub job_class: JobClass,
+    pub outcome: ActivityOutcome,
+    pub requested_at_ms: u64,
+    pub admitted_at_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: u64,
+    pub admission_wait_ms: u64,
+    pub queue_wait_ms: u64,
+    pub execution_ms: Option<u64>,
+}
+
+/// All stamps use this Store's monotonic origin, not UTC. All totals saturate at u64::MAX.
+/// This fixed-size snapshot contains no SQL, paths, arguments, backend messages or account data.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageActivitySnapshot {
+    pub schema_version: u8,
+    pub sampled_at_ms: u64,
+    pub actor_queue_capacity: usize,
+    pub admitted_job_capacity: usize,
+    pub query_execution_budget_ms: u64,
+    pub read_response_budget_ms: u64,
+    pub admission_waiting: u64,
+    /// Admitted jobs that have not started, including a synchronous dequeue/send handoff.
+    /// This can transiently exceed actor_queue_capacity by one, but never admitted_job_capacity.
+    pub waiting_to_start: usize,
+    pub oldest_queued_age_ms: Option<u64>,
+    pub active: Option<ActiveStorageJob>,
+    pub totals: ActivityTotals,
+    /// Successful admissions only; abandoned and unavailable admissions are counted separately.
+    pub admission_wait_ms: DurationSummary,
+    /// Started, canceled and worker-dropped queued jobs; excludes pending admissions.
+    pub queue_wait_ms: DurationSummary,
+    /// Returned operations only, including failures; excludes queue/admission and response delivery.
+    pub execution_ms: DurationSummary,
+    pub last_completed: Option<CompletedStorageJob>,
+}
+
+#[derive(Clone, Copy)]
+struct ActivityEntry {
+    operation: Operation,
+    job_class: JobClass,
+    requested: Instant,
+    admitted: Instant,
+    started: Option<Instant>,
+}
+
+struct ActivityState {
+    origin: Instant,
+    admission_waiting: u64,
+    entries: [Option<ActivityEntry>; STORAGE_ACTIVITY_SLOTS],
+    totals: ActivityTotals,
+    admission_wait_ms: DurationSummary,
+    queue_wait_ms: DurationSummary,
+    execution_ms: DurationSummary,
+    last_completed: Option<CompletedStorageJob>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StorageActivity(Arc<Mutex<ActivityState>>);
+
+impl StorageActivity {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(ActivityState {
+            origin: Instant::now(),
+            admission_waiting: 0,
+            entries: [None; STORAGE_ACTIVITY_SLOTS],
+            totals: ActivityTotals::default(),
+            admission_wait_ms: DurationSummary::default(),
+            queue_wait_ms: DurationSummary::default(),
+            execution_ms: DurationSummary::default(),
+            last_completed: None,
+        })))
+    }
+
+    pub(crate) fn request(&self) -> StorageAdmission {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.admission_waiting = state.admission_waiting.saturating_add(1);
+        state.totals.requested = state.totals.requested.saturating_add(1);
+        StorageAdmission {
+            activity: self.clone(),
+            requested: Instant::now(),
+            resolved: false,
+        }
+    }
+
+    pub(crate) fn read_response_timeout(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.totals.read_response_timeouts = state.totals.read_response_timeouts.saturating_add(1);
+    }
+
+    pub(crate) fn snapshot(&self) -> StorageActivitySnapshot {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let sampled = Instant::now();
+        let origin = state.origin;
+        let stamp = |at: Instant| milliseconds(at.duration_since(origin));
+        let waiting_to_start = state
+            .entries
+            .iter()
+            .flatten()
+            .filter(|job| job.started.is_none())
+            .count();
+        let oldest_queued_age_ms = state
+            .entries
+            .iter()
+            .flatten()
+            .filter(|job| job.started.is_none())
+            .map(|job| milliseconds(sampled.duration_since(job.admitted)))
+            .max();
+        let active = state.entries.iter().flatten().find_map(|job| {
+            job.started.map(|started| ActiveStorageJob {
+                operation: job.operation,
+                job_class: job.job_class,
+                requested_at_ms: stamp(job.requested),
+                admitted_at_ms: stamp(job.admitted),
+                started_at_ms: stamp(started),
+                admission_wait_ms: milliseconds(job.admitted.duration_since(job.requested)),
+                queue_wait_ms: milliseconds(started.duration_since(job.admitted)),
+                active_age_ms: milliseconds(sampled.duration_since(started)),
+            })
+        });
+        StorageActivitySnapshot {
+            schema_version: 1,
+            sampled_at_ms: stamp(sampled),
+            actor_queue_capacity: STORAGE_QUEUE_CAPACITY,
+            admitted_job_capacity: STORAGE_ACTIVITY_SLOTS,
+            query_execution_budget_ms: milliseconds(QUERY_EXECUTION_BUDGET),
+            read_response_budget_ms: milliseconds(READ_RESPONSE_BUDGET),
+            admission_waiting: state.admission_waiting,
+            waiting_to_start,
+            oldest_queued_age_ms,
+            active,
+            totals: state.totals,
+            admission_wait_ms: state.admission_wait_ms,
+            queue_wait_ms: state.queue_wait_ms,
+            execution_ms: state.execution_ms,
+            last_completed: state.last_completed.clone(),
+        }
+    }
+}
+
+pub(crate) struct StorageAdmission {
+    activity: StorageActivity,
+    requested: Instant,
+    resolved: bool,
+}
+
+impl StorageAdmission {
+    /// Called only with a reserved channel permit; the following send has no await point.
+    pub(crate) fn admit(mut self, operation: Operation, job_class: JobClass) -> StorageJobActivity {
+        let mut state = self
+            .activity
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let admitted = Instant::now();
+        // At most 64 reserved/enqueued jobs plus the worker's single dequeued job exist.
+        let slot = state
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .expect("bounded storage activity slots");
+        state.entries[slot] = Some(ActivityEntry {
+            operation,
+            job_class,
+            requested: self.requested,
+            admitted,
+            started: None,
+        });
+        state.admission_waiting = state.admission_waiting.saturating_sub(1);
+        state.totals.admitted = state.totals.admitted.saturating_add(1);
+        state
+            .admission_wait_ms
+            .observe(admitted.duration_since(self.requested));
+        self.resolved = true;
+        StorageJobActivity {
+            activity: self.activity.clone(),
+            slot,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn unavailable(mut self) {
+        let mut state = self
+            .activity
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.admission_waiting = state.admission_waiting.saturating_sub(1);
+        state.totals.admission_unavailable = state.totals.admission_unavailable.saturating_add(1);
+        self.resolved = true;
+    }
+}
+
+impl Drop for StorageAdmission {
+    fn drop(&mut self) {
+        if !self.resolved {
+            let mut state = self
+                .activity
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.admission_waiting = state.admission_waiting.saturating_sub(1);
+            state.totals.abandoned_admission = state.totals.abandoned_admission.saturating_add(1);
+        }
+    }
+}
+
+pub(crate) struct StorageJobActivity {
+    activity: StorageActivity,
+    slot: usize,
+    finished: bool,
+}
+
+impl StorageJobActivity {
+    pub(crate) fn start(&mut self) {
+        let mut state = self
+            .activity
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let started = Instant::now();
+        let entry = state.entries[self.slot]
+            .as_mut()
+            .expect("admitted storage job");
+        entry.started = Some(started);
+        let wait = started.duration_since(entry.admitted);
+        state.totals.started = state.totals.started.saturating_add(1);
+        state.queue_wait_ms.observe(wait);
+    }
+
+    pub(crate) fn finish(&mut self, outcome: ActivityOutcome) {
+        let mut state = self
+            .activity
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(entry) = state.entries[self.slot].take() else {
+            return;
+        };
+        let completed = Instant::now();
+        match outcome {
+            ActivityOutcome::Succeeded => {
+                state.totals.succeeded = state.totals.succeeded.saturating_add(1)
+            }
+            ActivityOutcome::Failed => state.totals.failed = state.totals.failed.saturating_add(1),
+            ActivityOutcome::CanceledBeforeStart => {
+                state.totals.canceled_before_start =
+                    state.totals.canceled_before_start.saturating_add(1)
+            }
+            ActivityOutcome::WorkerUnavailable if entry.started.is_some() => {
+                state.totals.failed = state.totals.failed.saturating_add(1)
+            }
+            ActivityOutcome::WorkerUnavailable => {
+                state.totals.worker_dropped_before_start =
+                    state.totals.worker_dropped_before_start.saturating_add(1)
+            }
+        }
+        let queue_wait = entry
+            .started
+            .unwrap_or(completed)
+            .duration_since(entry.admitted);
+        if let Some(started) = entry.started {
+            if outcome != ActivityOutcome::WorkerUnavailable {
+                state
+                    .execution_ms
+                    .observe(completed.duration_since(started));
+            }
+        } else {
+            state.queue_wait_ms.observe(queue_wait);
+        }
+        let origin = state.origin;
+        let stamp = |at: Instant| milliseconds(at.duration_since(origin));
+        state.last_completed = Some(CompletedStorageJob {
+            operation: entry.operation,
+            job_class: entry.job_class,
+            outcome,
+            requested_at_ms: stamp(entry.requested),
+            admitted_at_ms: stamp(entry.admitted),
+            started_at_ms: entry.started.map(stamp),
+            completed_at_ms: stamp(completed),
+            admission_wait_ms: milliseconds(entry.admitted.duration_since(entry.requested)),
+            queue_wait_ms: milliseconds(queue_wait),
+            execution_ms: entry
+                .started
+                .map(|started| milliseconds(completed.duration_since(started))),
+        });
+        self.finished = true;
+    }
+}
+
+impl Drop for StorageJobActivity {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(ActivityOutcome::WorkerUnavailable);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -256,6 +621,8 @@ impl Diagnostics {
             StoreError::NotFound => Category::NotFound,
             StoreError::Initialize => Category::Initialization,
             StoreError::CheckpointBusy => Category::CheckpointBusy,
+            // Response waiting is not an SQLite/durability failure and must never latch one.
+            StoreError::ReadWaitTimeout => return,
         };
         self.record(Record {
             schema_version: 1,
@@ -410,3 +777,48 @@ fn append_record(path: &Path, record: &Record) -> io::Result<()> {
 #[cfg(test)]
 #[path = "diagnostics_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn activity_summaries_and_totals_saturate_without_growing_records() {
+        let mut duration = DurationSummary {
+            count: u64::MAX,
+            sum_ms: u64::MAX - 1,
+            max_ms: 0,
+        };
+        duration.observe(Duration::from_secs(u64::MAX));
+        assert_eq!(duration.count, u64::MAX);
+        assert_eq!(duration.sum_ms, u64::MAX);
+        assert_eq!(duration.max_ms, u64::MAX);
+        let activity = StorageActivity::new();
+        {
+            let mut state = activity.0.lock().unwrap();
+            state.totals.requested = u64::MAX;
+            state.totals.admitted = u64::MAX;
+            state.totals.started = u64::MAX;
+            state.totals.succeeded = u64::MAX;
+            state.totals.read_response_timeouts = u64::MAX;
+        }
+        for _ in 0..128 {
+            let admission = activity.request();
+            let mut job = admission.admit(Operation::Query, JobClass::Query);
+            job.start();
+            job.finish(ActivityOutcome::Succeeded);
+            activity.read_response_timeout();
+        }
+        let snapshot = activity.snapshot();
+        assert_eq!(snapshot.totals.requested, u64::MAX);
+        assert_eq!(snapshot.totals.admitted, u64::MAX);
+        assert_eq!(snapshot.totals.started, u64::MAX);
+        assert_eq!(snapshot.totals.succeeded, u64::MAX);
+        assert_eq!(snapshot.totals.read_response_timeouts, u64::MAX);
+        assert_eq!(snapshot.admission_waiting, 0);
+        assert_eq!(snapshot.waiting_to_start, 0);
+        assert!(snapshot.active.is_none());
+        assert_eq!(snapshot.execution_ms.count, 128);
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() < 4096);
+    }
+}

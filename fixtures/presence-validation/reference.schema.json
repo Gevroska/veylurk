@@ -1,0 +1,369 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Frozen Community presence reference protocol v1",
+  "description": "Structural schema. Rust evaluator additionally validates UTC ordering, interval uncertainty, frozen identity, source eligibility, support, class thresholds, complete responses and whole-group split/dependence constraints.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "model_version",
+    "parameters",
+    "threshold",
+    "as_of",
+    "protocol_frozen_at",
+    "predictions_frozen_at",
+    "labels_unblinded_at",
+    "split_rule",
+    "trajectories"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "artifact_kind": {
+      "$ref": "#/$defs/kind"
+    },
+    "model_version": {
+      "const": "community_presence_v1"
+    },
+    "parameters": {
+      "$ref": "#/$defs/parameters"
+    },
+    "threshold": {
+      "const": 0.99
+    },
+    "as_of": {
+      "$ref": "#/$defs/utc"
+    },
+    "protocol_frozen_at": {
+      "$ref": "#/$defs/utc"
+    },
+    "predictions_frozen_at": {
+      "$ref": "#/$defs/utc"
+    },
+    "labels_unblinded_at": {
+      "$ref": "#/$defs/utc"
+    },
+    "split_rule": {
+      "const": "whole_account_session_and_dependency_group"
+    },
+    "trajectories": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/trajectory"
+      },
+      "minItems": 1,
+      "maxItems": 2000
+    }
+  },
+  "$defs": {
+    "utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "opaque": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "kind": {
+      "enum": [
+        "invented_fixture",
+        "independent_membership",
+        "client_session_proxy"
+      ]
+    },
+    "uncertainty": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 86400
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connected_minutes",
+        "disconnected_minutes",
+        "detection_scale",
+        "false_report_ratio",
+        "lag_seconds",
+        "max_gap_seconds"
+      ],
+      "properties": {
+        "connected_minutes": {
+          "const": 60
+        },
+        "disconnected_minutes": {
+          "const": 720
+        },
+        "detection_scale": {
+          "const": 0.5
+        },
+        "false_report_ratio": {
+          "const": 0.01
+        },
+        "lag_seconds": {
+          "const": 30
+        },
+        "max_gap_seconds": {
+          "const": 3600
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "evidence_id",
+        "independent_of_community",
+        "viewer_role_eligible",
+        "all_sessions_controlled",
+        "clock_uncertainty_seconds"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "evidence_id": {
+          "$ref": "#/$defs/opaque"
+        },
+        "independent_of_community": {
+          "const": true
+        },
+        "viewer_role_eligible": {
+          "type": "boolean"
+        },
+        "all_sessions_controlled": {
+          "type": "boolean"
+        },
+        "clock_uncertainty_seconds": {
+          "$ref": "#/$defs/uncertainty"
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to",
+        "present",
+        "entry_uncertainty_seconds",
+        "exit_uncertainty_seconds"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/utc"
+        },
+        "to": {
+          "$ref": "#/$defs/utc"
+        },
+        "present": {
+          "type": "boolean"
+        },
+        "entry_uncertainty_seconds": {
+          "$ref": "#/$defs/uncertainty"
+        },
+        "exit_uncertainty_seconds": {
+          "$ref": "#/$defs/uncertainty"
+        }
+      }
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to",
+        "evaluated_at",
+        "presence_probability",
+        "sensitivity_min",
+        "sensitivity_max",
+        "classification"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/utc"
+        },
+        "to": {
+          "$ref": "#/$defs/utc"
+        },
+        "evaluated_at": {
+          "$ref": "#/$defs/utc"
+        },
+        "presence_probability": {
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sensitivity_min": {
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sensitivity_max": {
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "classification": {
+          "enum": [
+            "estimated_present",
+            "estimated_absent",
+            "uncertain",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "prediction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_version",
+        "parameters",
+        "threshold",
+        "as_of",
+        "complete",
+        "status",
+        "source_eligibility_verified",
+        "first_positive_support_preserved",
+        "cells"
+      ],
+      "properties": {
+        "model_version": {
+          "const": "community_presence_v1"
+        },
+        "parameters": {
+          "$ref": "#/$defs/parameters"
+        },
+        "threshold": {
+          "const": 0.99
+        },
+        "as_of": {
+          "$ref": "#/$defs/utc"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "no_data",
+            "insufficient_data",
+            "role_unsupported",
+            "input_limit",
+            "analysis_busy",
+            "analysis_timeout"
+          ]
+        },
+        "source_eligibility_verified": {
+          "const": true
+        },
+        "first_positive_support_preserved": {
+          "const": true
+        },
+        "cells": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cell"
+          },
+          "minItems": 0,
+          "maxItems": 2048
+        }
+      }
+    },
+    "trajectory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trajectory_id",
+        "account_id",
+        "channel_id",
+        "session_id",
+        "dependency_group",
+        "split",
+        "provenance",
+        "from",
+        "to",
+        "intervals",
+        "evaluated_at",
+        "prediction"
+      ],
+      "properties": {
+        "trajectory_id": {
+          "$ref": "#/$defs/opaque"
+        },
+        "account_id": {
+          "$ref": "#/$defs/opaque"
+        },
+        "channel_id": {
+          "$ref": "#/$defs/opaque"
+        },
+        "session_id": {
+          "$ref": "#/$defs/opaque"
+        },
+        "dependency_group": {
+          "$ref": "#/$defs/opaque"
+        },
+        "split": {
+          "enum": [
+            "development",
+            "holdout"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        },
+        "from": {
+          "$ref": "#/$defs/utc"
+        },
+        "to": {
+          "$ref": "#/$defs/utc"
+        },
+        "intervals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/interval"
+          },
+          "minItems": 0,
+          "maxItems": 1000
+        },
+        "evaluated_at": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/utc"
+          },
+          "minItems": 1,
+          "maxItems": 2048
+        },
+        "prediction": {
+          "$ref": "#/$defs/prediction"
+        }
+      }
+    }
+  }
+}

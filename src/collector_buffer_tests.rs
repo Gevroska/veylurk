@@ -504,9 +504,11 @@ async fn fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls(
             let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
             let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
             let held_store = store.clone();
-            // Spawn so Store::call is actually polled and reaches the SQLite actor.
+            // Model a nonpreemptible durable append stall, so the injected hold uses
+            // write policy rather than a read caller's ten-second response budget.
+            // Real append/commit work counters still count only the collector's writes.
             let hold = tokio::spawn(async move {
-                held_store.call(move |_| {
+                held_store.call_write(crate::diagnostics::Operation::Append, move |_| {
                     actor_held.store(true, Ordering::SeqCst);
                     let _ = entered_tx.send(());
                     // A finite watchdog also releases the actor if a peer assertion fails.

@@ -10,6 +10,12 @@ The experimental inference layer is implemented. Candidate acceptance is
 recorded by the Windows workflow and finite application checks. Empirical
 calibration against independently known account sessions is not available.
 
+The separate [offline validation tool](community-presence-validation.md) now
+provides numerical oracle checks, constructed-truth simulations, stress cases
+and a strict held-out reference evaluator. These distinguish implementation
+correctness and proxy evidence from real membership calibration; the application
+retains its uncalibrated label until independent validation supports a claim.
+
 ## Meaning of the display
 
 The model reports a central probability of chat membership and a range across

@@ -3,6 +3,14 @@ use super::*;
 use axum::{body::Body, extract::Request, http::HeaderValue, response::Response};
 use std::{collections::VecDeque, sync::Mutex};
 
+#[test]
+fn read_response_deadline_is_distinct_from_a_metadata_storage_failure() {
+    let (status, Json(value)) = database_error(StoreError::ReadWaitTimeout);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(value["error"]["code"], "read_wait_timeout");
+    let (_, Json(failure)) = database_error(StoreError::Unavailable);
+    assert_eq!(failure["error"]["code"], "metadata_storage");
+}
 struct Reply {
     path: &'static str,
     status: StatusCode,

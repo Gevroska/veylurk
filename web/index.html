@@ -129,6 +129,11 @@
     <section id="section-health" aria-labelledby="health-title" hidden>
       <div class="section-heading"><div><h2 id="health-title">Collection health</h2><p>Connection health and local storage. Status refreshes every 15 seconds while this page is visible.</p></div><span id="status-updated" class="quiet">Not updated yet</span></div>
       <div id="health-results" aria-busy="true"><p class="empty">Loading collection health…</p></div>
+        <section class="card" aria-labelledby="storage-activity-title">
+          <h3 id="storage-activity-title">Database activity</h3>
+          <p class="help">A separate memory snapshot shows queued and running database work, including when a storage read is delayed.</p>
+          <div id="storage-activity"><p class="empty">Waiting for an activity snapshot…</p></div>
+        </section>
       <section class="card community-controls" aria-labelledby="community-title">
         <div class="section-heading"><div><h3 id="community-title">Optional autonomous Community collection</h3><p>Disabled by default. When enabled, Veylurk uses one minimized application-owned browser at a time. Selected channels are tracked, enabled, and allowed by the collection policy. In live-only mode, a current offline metadata report pauses that channel; unknown or stale live status keeps it eligible.</p></div><span id="community-state" class="badge neutral">Checking status</span></div>
         <form id="community-settings-form" class="collection-settings">

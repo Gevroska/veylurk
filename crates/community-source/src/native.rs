@@ -150,6 +150,20 @@ struct State {
     login_failure_reported: bool,
 }
 
+impl State {
+    fn reset_after_cleanup(&mut self) {
+        self.recycling_at = None;
+        self.browser = BrowserLifecycle::default();
+        self.navigation_gate = sampling::NavigationGate::default();
+        self.navigation_ready = false;
+        self.frame_id = None;
+        self.last_player_observation = None;
+        self.player_gate = sampling::PlayerGate::default();
+        self.selected_channel = None;
+        self.initializing_at = Some(Instant::now());
+    }
+}
+
 type PendingCompletion = (u64, std::result::Result<SourceSample, SourceFailure>);
 
 struct Service {
@@ -676,15 +690,7 @@ impl App {
                     self.finish_service(false);
                     return;
                 }
-                {
-                    let mut state = self.state.borrow_mut();
-                    state.recycling_at = None;
-                    state.browser = BrowserLifecycle::default();
-                    state.navigation_gate = sampling::NavigationGate::default();
-                    state.player_gate = sampling::PlayerGate::default();
-                    state.selected_channel = None;
-                    state.initializing_at = Some(Instant::now());
-                }
+                self.state.borrow_mut().reset_after_cleanup();
                 if let Some((ticket, outcome)) = service.pending_result.borrow_mut().take() {
                     service.bridge.control.complete(ticket, outcome);
                 }
@@ -1891,10 +1897,15 @@ impl App {
             self.disable_network();
             self.state.borrow_mut().auto_stage = None;
             if let Some(job) = active {
-                service.bridge.control.complete(
+                let accepted = service.bridge.control.complete(
                     job.ticket,
                     Ok(SourceSample::from_parsed(parsed, body, received_at_unix_ms)),
                 );
+                if accepted {
+                    // Retire the source page during the global completion gap.
+                    // Cleanup cannot replace the already accepted success.
+                    self.begin_recycle();
+                }
             }
             return;
         }
@@ -2840,6 +2851,318 @@ mod lifecycle_tests {
         let intent = state.navigation_gate.begin();
         assert!(state.navigation_gate.issue(intent));
         assert!(state.navigation_gate.started(50));
+    }
+
+    fn activate_sample(handle: &HostHandle, app: &App, job_id: u64) -> u64 {
+        handle.try_sample(job_id, "room").unwrap();
+        let service = app.service.as_ref().unwrap();
+        let QueuedCommand::Sample { job } = service.bridge.commands.try_recv().unwrap() else {
+            panic!("expected accepted sample");
+        };
+        let ticket = job.ticket;
+        *service.active.borrow_mut() = Some(job);
+        let mut state = app.state.borrow_mut();
+        state.browser.bind(3, 100);
+        state.selected_channel = Some("room".into());
+        state.auto_stage = Some(AutoStage::Sampling);
+        ticket
+    }
+
+    fn deliver_sample(app: &App) {
+        app.accept_sample(
+            crate::ParsedSample {
+                count: 2,
+                categories: Default::default(),
+                accounts: Default::default(),
+                roles: Default::default(),
+            },
+            &BodyRequest {
+                id: "fixture-request".into(),
+                selection: crate::Selection {
+                    index: 0,
+                    batch_len: 1,
+                    batched: false,
+                    operation: "CommunityTab",
+                },
+                status: 200,
+                provenance: sampling::Provenance {
+                    request_after_trigger_verified: true,
+                    ..Default::default()
+                },
+            },
+            12_345,
+        );
+    }
+
+    fn expect_success(handle: &HostHandle, expected_job: u64) {
+        let Ok(crate::host::HostEvent::SampleCompleted {
+            job_id,
+            channel,
+            outcome: Ok(sample),
+        }) = handle.try_event()
+        else {
+            panic!("expected successful receipt");
+        };
+        assert_eq!(job_id, expected_job);
+        assert_eq!(channel, "room");
+        assert_eq!(sample.received_at_unix_ms, 12_345);
+        assert_eq!(sample.reported_chatters, Some(2));
+        assert_eq!(sample.http_status, 200);
+        assert!(sample.provenance.request_after_trigger_verified);
+    }
+
+    #[test]
+    fn accepted_success_completes_once_and_immediately_retires_its_controller() {
+        let (handle, app) = fixture();
+        let ticket = activate_sample(&handle, &app, 45);
+        deliver_sample(&app);
+        let service = app.service.as_ref().unwrap();
+        let started = app.state.borrow().recycling_at.unwrap();
+        assert_eq!(app.epoch(), 4);
+        assert!(!app.controller_current(3));
+        assert!(!app.callback_current(3, 7));
+        assert!(!app.controller_current(4));
+        assert!(service.active.borrow().is_none());
+        assert!(service.pending_result.borrow().is_none());
+        assert!(!service.bridge.control.is_pending(ticket));
+        assert_eq!(
+            handle.try_sample(46, "room"),
+            Err(crate::host::CommandError::Busy)
+        );
+        expect_success(&handle, 45);
+        assert!(!service.bridge.control.is_pending(ticket));
+
+        // A late duplicate has no active job and cannot retire a second epoch.
+        deliver_sample(&app);
+        app.navigation_completed(3, 50, false, 14);
+        app.service_tick();
+        assert_eq!(app.epoch(), 4);
+        assert_eq!(app.state.borrow().recycling_at, Some(started));
+        assert!(app.state.borrow().initializing_at.is_none());
+        assert!(app.state.borrow().closing_at.is_none());
+        assert!(app.engine.borrow().is_none());
+        assert!(handle.fault_report().primary_failure.is_none());
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn sample_callback_without_active_job_does_not_recycle_or_complete_a_queued_job() {
+        let (handle, app) = fixture();
+        handle.try_sample(46, "room").unwrap();
+        let service = app.service.as_ref().unwrap();
+        let ticket = service.bridge.control.pending_job().unwrap().ticket;
+        deliver_sample(&app);
+        assert_eq!(app.epoch(), 3);
+        assert!(app.state.borrow().recycling_at.is_none());
+        assert!(service.bridge.control.is_pending(ticket));
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn failed_cleanup_after_success_preserves_receipt_and_stops_before_replacement() {
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 47);
+        deliver_sample(&app);
+        app.state.borrow_mut().recycling_at = Some(Instant::now() - FLUSH_TIME);
+        // No exit is observed and this fixture has no native engine. The real
+        // timer takes the unconfirmed cleanup path without initializing one.
+        app.service_tick();
+        assert!(app.engine.borrow().is_none());
+        assert!(app.state.borrow().initializing_at.is_none());
+        expect_success(&handle, 47);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::Paused {
+                code: "controller_cleanup_unconfirmed"
+            })
+        ));
+        let Ok(crate::host::HostEvent::Stopped {
+            cleanup_confirmed: false,
+            diagnostics,
+        }) = handle.try_event()
+        else {
+            panic!("expected unconfirmed terminal cleanup");
+        };
+        assert!(!diagnostics.cleanup_diagnostics.unwrap().confirmed);
+        assert_eq!(
+            diagnostics.host_termination.unwrap().reason,
+            HostTerminationReason::CleanupUnconfirmed
+        );
+        assert!(diagnostics.primary_failure.is_none());
+        assert!(handle.try_event().is_err());
+        assert_eq!(
+            handle.try_sample(48, "room"),
+            Err(crate::host::CommandError::Closed)
+        );
+    }
+
+    #[test]
+    fn cancel_and_owner_login_during_success_recycle_retain_pending_job_and_pause() {
+        for show_login in [false, true] {
+            let (handle, app) = fixture();
+            activate_sample(&handle, &app, 49);
+            deliver_sample(&app);
+            expect_success(&handle, 49);
+            handle.try_sample(50, "room").unwrap();
+            let service = app.service.as_ref().unwrap();
+            let job = service.bridge.control.pending_job().unwrap();
+            *service.pending_command.borrow_mut() =
+                Some(service.bridge.commands.try_recv().unwrap());
+            *service.login_visible.borrow_mut() = true;
+            app.state.borrow_mut().denied = true;
+            let started = app.state.borrow().recycling_at.unwrap();
+            if show_login {
+                handle.show_login().unwrap();
+            } else {
+                handle.cancel();
+            }
+            app.service_tick();
+            let current = service
+                .bridge
+                .control
+                .cancel_version
+                .load(Ordering::Acquire);
+            assert_eq!(*service.last_cancel.borrow(), current);
+            assert_ne!(job.cancel_version, current);
+            assert!(service.bridge.control.is_pending(job.ticket));
+            assert!(matches!(
+                &*service.pending_command.borrow(),
+                Some(QueuedCommand::Sample { job: retained }) if retained.ticket == job.ticket
+                    && retained.cancel_version == job.cancel_version
+            ));
+            assert_eq!(app.epoch(), 4);
+            assert_eq!(app.state.borrow().recycling_at, Some(started));
+            assert!(app.state.borrow().closing_at.is_none());
+            assert!(app.state.borrow().denied);
+            assert!(*service.login_visible.borrow());
+            assert!(handle.try_event().is_err());
+            if show_login {
+                let QueuedCommand::ShowLogin { publication } =
+                    service.bridge.commands.try_recv().unwrap()
+                else {
+                    panic!("expected retained owner login publication");
+                };
+                assert!(service.accept_login_publication(publication));
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_during_success_recycle_preserves_deadline_epoch_and_next_accepted_job() {
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 51);
+        deliver_sample(&app);
+        expect_success(&handle, 51);
+        handle.try_sample(52, "room").unwrap();
+        let service = app.service.as_ref().unwrap();
+        let job = service.bridge.control.pending_job().unwrap();
+        let started = app.state.borrow().recycling_at.unwrap();
+        handle.shutdown();
+        app.service_tick();
+        assert_eq!(app.epoch(), 4);
+        assert_eq!(app.state.borrow().closing_at, Some(started));
+        assert!(app.state.borrow().recycling_at.is_none());
+        assert!(service.bridge.control.is_pending(job.ticket));
+        assert!(app.state.borrow().initializing_at.is_none());
+        app.finish_service(false);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 52,
+                outcome: Err(SourceFailure {
+                    code: "operator_cancelled",
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::Stopped {
+                cleanup_confirmed: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            handle.fault_report().host_termination.unwrap().reason,
+            HostTerminationReason::ShutdownRequested
+        );
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn confirmed_cleanup_resets_source_state_and_requires_fresh_readiness() {
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 53);
+        let ready = sampling::PlayerObservation {
+            signed_in: true,
+            chat_ready: true,
+            community_ready: true,
+            video_present: true,
+            video_paused: Some(true),
+            ..Default::default()
+        };
+        {
+            let mut state = app.state.borrow_mut();
+            let intent = state.navigation_gate.begin();
+            assert!(state.navigation_gate.issue(intent));
+            assert!(state.navigation_gate.started(50));
+            state.navigation_ready = true;
+            state.frame_id = Some("old-frame".into());
+            state.last_player_observation = Some(ready.clone());
+            assert!(!state.player_gate.observe(0, &ready, true).unwrap());
+            assert!(state.player_gate.observe(2_000, &ready, true).unwrap());
+            state.tracker = Some(Tracker::new(7, "room".into(), "old-frame".into()));
+            state.trigger_deadline = sampling::TriggerDeadline::new(7, 0, 1_000.0, 25_000);
+            state.denied = true;
+        }
+        deliver_sample(&app);
+        {
+            let mut state = app.state.borrow_mut();
+            state.browser.observe_exit(3, 100, 0, true);
+            state.browser.diagnostics.close_hresult = Some(0);
+            // Substitute only the successful unsubscribe result. Invoke the
+            // production state reset directly so no WebView2 is initialized.
+            assert!(state.browser.finish(1, Some(0)).confirmed);
+            state.reset_after_cleanup();
+            assert_eq!(state.navigation_gate.retained_ids(), 0);
+            assert!(!state.navigation_ready);
+            assert!(state.frame_id.is_none());
+            assert!(state.last_player_observation.is_none());
+            assert!(state.selected_channel.is_none());
+            assert!(state.auto_stage.is_none());
+            assert!(state.tracker.is_none());
+            assert!(state.trigger_deadline.is_none());
+            assert!(!state.player_gate.pause_verified());
+            assert!(!state.player_gate.ready());
+            assert!(state.denied, "cleanup must preserve an owner pause");
+            assert!(state.initializing_at.is_some());
+        }
+        assert!(!app.trigger_dispatch_allowed(app.state.borrow().generation));
+        for missing in 0..6 {
+            let mut observation = ready.clone();
+            match missing {
+                0 => observation.signed_in = false,
+                1 => observation.chat_ready = false,
+                2 => observation.community_ready = false,
+                3 => observation.video_present = false,
+                4 => observation.video_paused = None,
+                _ => observation.video_paused = Some(false),
+            }
+            let mut state = app.state.borrow_mut();
+            state.reset_after_cleanup();
+            assert!(!state.player_gate.observe(0, &observation, true).unwrap());
+            assert!(!state
+                .player_gate
+                .observe(2_000, &observation, true)
+                .unwrap());
+            assert!(!state.player_gate.observe(4_000, &ready, true).unwrap());
+            assert!(!state.player_gate.observe(5_999, &ready, true).unwrap());
+            assert!(state.player_gate.observe(6_000, &ready, true).unwrap());
+        }
+        assert!(app.engine.borrow().is_none());
+        expect_success(&handle, 53);
+        assert!(handle.try_event().is_err());
     }
 
     #[test]

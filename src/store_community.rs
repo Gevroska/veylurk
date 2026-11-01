@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const COMMUNITY_SCHEMA_VERSION: i64 = 2;
+pub const COMMUNITY_SCHEMA_VERSION: i64 = 3;
 pub const COMMUNITY_MAX_MEMBERS: usize = 4096;
 pub const COMMUNITY_ROLE_BROADCASTER: u32 = 1;
 pub const COMMUNITY_ROLE_STAFF: u32 = 2;
@@ -67,6 +67,7 @@ pub enum CommunityPauseReason {
     ChallengeDenied,
     RateLimited,
     SourceDenied,
+    CleanupUnconfirmed,
 }
 
 impl CommunityPauseReason {
@@ -77,6 +78,7 @@ impl CommunityPauseReason {
             Self::ChallengeDenied => "challenge_denied",
             Self::RateLimited => "rate_limited",
             Self::SourceDenied => "source_denied",
+            Self::CleanupUnconfirmed => "cleanup_unconfirmed",
         }
     }
 
@@ -87,6 +89,7 @@ impl CommunityPauseReason {
             "challenge_denied" => Ok(Self::ChallengeDenied),
             "rate_limited" => Ok(Self::RateLimited),
             "source_denied" => Ok(Self::SourceDenied),
+            "cleanup_unconfirmed" => Ok(Self::CleanupUnconfirmed),
             _ => Err(StoreError::Invalid),
         }
     }
@@ -428,6 +431,37 @@ ALTER TABLE community_settings ADD COLUMN cadence_mode TEXT NOT NULL DEFAULT 'fi
 UPDATE community_schema_version SET version=2 WHERE id=1;
 ";
 
+// Preserve released reason values verbatim. A legacy generic pause has no
+// recoverable causal detail and must never be inferred to mean cleanup failure.
+const MIGRATE_V3: &str = "
+CREATE TABLE community_pause_v3(id INTEGER PRIMARY KEY CHECK(id=1),reason TEXT CHECK(reason IS NULL OR reason IN('authentication_denied','integrity_denied','challenge_denied','rate_limited','source_denied','cleanup_unconfirmed')));
+INSERT INTO community_pause_v3(id,reason) SELECT id,reason FROM community_pause;
+DROP TABLE community_pause;
+ALTER TABLE community_pause_v3 RENAME TO community_pause;
+UPDATE community_schema_version SET version=3 WHERE id=1;
+";
+
+fn validate_v3_pause_schema(conn: &Connection) -> Result<(), StoreError> {
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM main.sqlite_schema WHERE type='table' AND name='community_pause'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| StoreError::Initialize)?;
+    let normalize = |sql: &str| {
+        sql.chars()
+            .filter(|ch| !ch.is_ascii_whitespace() && *ch != '"')
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let expected = "CREATE TABLE community_pause(id INTEGER PRIMARY KEY CHECK(id=1),reason TEXT CHECK(reason IS NULL OR reason IN('authentication_denied','integrity_denied','challenge_denied','rate_limited','source_denied','cleanup_unconfirmed')))";
+    if normalize(&sql) != normalize(expected) {
+        return Err(StoreError::Initialize);
+    }
+    Ok(())
+}
+
 // Only the released layout and its compatible covering extension are ours to evolve.
 // Validate metadata rather than SQL spelling, including auxiliary rowid information.
 fn sample_member_index_needs_covering(conn: &Connection) -> Result<bool, StoreError> {
@@ -501,7 +535,9 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
         })()
         .map_err(|_| StoreError::Initialize)?;
         match versions.as_slice() {
-            [(1, version)] if matches!(*version, 1 | COMMUNITY_SCHEMA_VERSION) => Some(*version),
+            [(1, version)] if matches!(*version, 1 | 2 | COMMUNITY_SCHEMA_VERSION) => {
+                Some(*version)
+            }
             _ => return Err(StoreError::Initialize),
         }
     } else {
@@ -534,6 +570,12 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
     // or perform recovery. A failure rolls back schema and version changes as well.
     read_community_settings(&tx).map_err(|_| StoreError::Initialize)?;
     read_community_pause(&tx).map_err(|_| StoreError::Initialize)?;
+    if version.is_none_or(|version| version < 3) {
+        tx.execute_batch(MIGRATE_V3)?;
+        read_community_settings(&tx).map_err(|_| StoreError::Initialize)?;
+        read_community_pause(&tx).map_err(|_| StoreError::Initialize)?;
+    }
+    validate_v3_pause_schema(&tx)?;
     if extend_sample_member_index {
         // The key prefix and index name remain compatible with existing readers.
         tx.execute_batch(
@@ -542,7 +584,7 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
         )?;
     }
     // This non-unique access path changes no retained data or logical schema contract.
-    // Add it atomically for fresh, v1 and v2 databases without rewriting released DDL.
+    // Add it atomically for fresh and retained databases without rewriting released DDL.
     tx.execute_batch("CREATE INDEX IF NOT EXISTS community_members_account_channel_member_sample ON community_members(account,channel,id,sample_id);")?;
     let at = now();
     tx.execute("UPDATE community_samples SET outcome='interrupted',failure_code='process_interrupted',completed_at_utc=?1 WHERE outcome='pending'", [&at])?;

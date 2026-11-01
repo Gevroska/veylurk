@@ -504,6 +504,50 @@ test("fault details preserve the first cause, distinguish callback interruption,
   assert.doesNotMatch(health.textContent, /successfully recovered|rolled back/);
 });
 
+test("memory-only database activity renders while aggregate status is still waiting", async () => {
+  const slow = deferred();
+  const app = createApp((target) => {
+    if (target.pathname === "/api/status") return slow.promise;
+    if (target.pathname === "/api/storage/activity") return { process_id: 42, port: 3131, activity: {
+      schema_version: 1, admission_waiting: 1, waiting_to_start: 4, oldest_queued_age_ms: 5000,
+      active: { operation: "append", job_class: "durable_mutation", active_age_ms: 32000, queue_wait_ms: 0 },
+      totals: { succeeded: 7, read_response_timeouts: 2 },
+    } };
+  });
+  await settle();
+  const activity = app.get("storage-activity");
+  assert.match(activity.textContent, /Saving data/);
+  assert.match(activity.textContent, /Running for32\.0 seconds/);
+  assert.match(activity.textContent, /Waiting to start4/);
+  assert.match(activity.textContent, /Timed-out read responses2/);
+  assert.doesNotMatch(app.get("health-results").textContent, /Stored events/);
+  slow.resolve({ state: "collecting", storage_health: "read_wait_timeout", observation_count: null, storage_bytes: null });
+  await settle();
+  assert.match(app.get("health-results").textContent, /Local storageBusy/);
+  assert.match(app.get("health-results").textContent, /Read response delayed/);
+  assert.match(activity.textContent, /Saving data/);
+});
+
+test("failed activity refresh retains its last snapshot as stale and rejects unsafe fields", async () => {
+  let unavailable = false;
+  const app = createApp((target) => {
+    if (target.pathname === "/api/storage/activity") return unavailable ? new TypeError("unreachable") : {
+      process_id: 42, port: 3131, activity: { schema_version: 1, admission_waiting: 0, waiting_to_start: 3,
+        oldest_queued_age_ms: null, active: { operation: "<img src=x>", job_class: "query", active_age_ms: 1000, queue_wait_ms: 0 },
+        totals: { succeeded: 5, read_response_timeouts: 0 } },
+    };
+  });
+  await settle();
+  const activity = app.get("storage-activity");
+  assert.match(activity.textContent, /OperationUnknown/);
+  assert.match(activity.textContent, /Waiting to start3/);
+  assert.doesNotMatch(activity.textContent, /img src/);
+  unavailable = true;
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.equal(activity.classList.contains("stale"), true);
+  assert.match(activity.textContent, /Waiting to start3/);
+});
+
 test("normal Community shutdown is a lifecycle diagnostic and never a storage fault", async () => {
   const app = createApp((target) => target.pathname === "/api/status" ? {
     state: "collecting", diagnostics: { first_failure: null,
@@ -600,7 +644,7 @@ test("Community starts disabled without browser actions and reports scheduling l
   assert.ok(app.get("community-status").textContent.includes(new Intl.NumberFormat().format(1600) + " seconds"));
   assert.match(app.get("community-status").textContent, /30 seconds minimum between job starts/);
   assert.match(app.get("community-status").textContent, /Browser shutdown confirmationNot confirmed/);
-  assert.match(app.get("community-status").textContent, /Latest safe error codeunknown/);
+  assert.match(app.get("community-status").textContent, /Current error codeunknown/);
   assert.doesNotMatch(app.get("community-status").textContent, /<img/);
   assert.match(html, /50 selected channels therefore need at least 25 minutes/);
   assert.equal(/type="password"/.test(html), false);
@@ -612,17 +656,56 @@ test("Community shows the source failure separately from cleanup and safely hand
     cleanup_diagnostics: { confirmed: false } });
   const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
   await settle();
-  assert.match(app.get("community-status").textContent, /Latest safe error codecleanup_unconfirmed/);
-  assert.match(app.get("community-status").textContent, /Latest source failure in this runnavigation_ui_deadline · preparing/);
+  assert.match(app.get("community-status").textContent, /Current error codecleanup_unconfirmed/);
+  assert.match(app.get("community-status").textContent, /Retained source diagnostic \(current relevance unconfirmed\)navigation_ui_deadline · preparing/);
   assert.match(app.get("community-status").textContent, /Latest browser cleanup in this runNot confirmed/);
   status = communityState({ primary_failure: { code: '<img src=x>', stage: 'unsafe code' }, cleanup_diagnostics: { confirmed: true } });
   await app.get("refresh-status").dispatch("click"); await settle();
-  assert.match(app.get("community-status").textContent, /Latest source failure in this rununknown · unknown/);
+  assert.match(app.get("community-status").textContent, /Retained source diagnostic \(current relevance unconfirmed\)unknown · unknown/);
   assert.match(app.get("community-status").textContent, /Latest browser cleanup in this runConfirmed/);
   assert.doesNotMatch(app.get("community-status").textContent, /<img|unsafe code/);
   status = communityState();
   await app.get("refresh-status").dispatch("click"); await settle();
-  assert.doesNotMatch(app.get("community-status").textContent, /Latest source failure in this run|Latest browser cleanup in this run/);
+  assert.doesNotMatch(app.get("community-status").textContent, /source diagnostic|Latest browser cleanup in this run/);
+});
+
+test("Community explains saved cleanup and ambiguous legacy pauses without attributing a Twitch denial", async () => {
+  let status = communityState({ paused: true, last_error: "cleanup_unconfirmed", persisted_pause_reason: "cleanup_unconfirmed" });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  assert.match(app.get("community-status").textContent, /Browser cleanup was not confirmed; automatic restart is paused/);
+  assert.match(app.get("community-status").textContent, /Saved pause codecleanup_unconfirmed/);
+  assert.match(app.get("community-status").textContent, /Browser shutdown confirmationNot reported/);
+  assert.doesNotMatch(app.get("community-status").textContent, /Twitch.*denied|Twitch.*reject/i);
+  status = communityState({ paused: true, last_error: "source_denied" });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /A generic source pause was retained; its original cause was not recorded/);
+  assert.doesNotMatch(app.get("community-status").textContent, /Browser cleanup was not confirmed|Twitch.*denied|Twitch.*reject/i);
+  status = communityState({ paused: true, last_error: "authentication_denied", persisted_pause_reason: "authentication_denied", cleanup_confirmed: false });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /Authentication checks paused collection/);
+  assert.match(app.get("community-status").textContent, /Browser shutdown confirmationNot confirmed/);
+});
+
+test("Community separates recovered source diagnostics from current errors and retains safe raw codes", async () => {
+  const failure = { code: "verified_player_pause_lost", stage: "waiting_for_response", observed_at_unix_ms: Date.parse(received) - 1000 };
+  let status = communityState({ settings: { enabled: true, target_interval_seconds: 300 }, state: "collecting", last_error: failure.code,
+    last_received_at_utc: received, primary_failure: failure });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  assert.match(app.get("community-status").textContent, /Retained source diagnostic \(later receipt succeeded\)verified_player_pause_lost · waiting_for_response/);
+  assert.match(app.get("community-status").textContent, /Retained error code \(later receipt succeeded\)verified_player_pause_lost/);
+  assert.equal(app.get("community-state").className, "badge good");
+  assert.doesNotMatch(app.get("community-status").textContent, /Current source diagnostic/);
+  status = communityState({ state: "collecting", last_error: null, last_received_at_utc: received, primary_failure: failure });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /Current error codeNone/);
+  assert.match(app.get("community-status").textContent, /Retained source diagnostic \(later receipt succeeded\)/);
+  status = communityState({ paused: true, last_error: failure.code, primary_failure: { ...failure, observed_at_unix_ms: Date.parse(received) + 1000 }, last_received_at_utc: received });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /Current source diagnosticverified_player_pause_lost/);
+  assert.match(app.get("community-status").textContent, /Current error codeverified_player_pause_lost/);
+  assert.equal(app.get("community-state").className, "badge warning");
 });
 
 test("Community distinguishes browser termination from window minimization without clearing a sign-in pause", async () => {

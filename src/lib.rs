@@ -12,6 +12,7 @@ pub mod history;
 pub mod irc;
 pub mod metadata;
 pub mod presence_model;
+pub mod presence_validation;
 pub mod runtime;
 pub mod shutdown;
 pub mod store;

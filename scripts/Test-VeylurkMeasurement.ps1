@@ -141,6 +141,8 @@ $bad = ConvertTo-VeylurkMeasurementAggregate ([pscustomobject]@{ state = 'secret
 Assert-MeasurementFixture ($bad.result -eq 'partial' -and $bad.state -eq 'unknown' -and $null -eq $bad.observation_count -and $null -eq $bad.connected_channels) 'Untrusted metric strings or negative counts passed through.'
 $missing = ConvertTo-VeylurkMeasurementAggregate ([pscustomobject]@{})
 Assert-MeasurementFixture ($missing.result -eq 'partial' -and $missing.state -eq 'unknown' -and $missing.storage_health -eq 'unknown' -and $null -eq $missing.observation_count) 'Absent state or numeric fields were silently treated as valid.'
+$readWait = ConvertTo-VeylurkMeasurementAggregate ([pscustomobject]@{ state = 'collecting'; storage_health = 'read_wait_timeout' })
+Assert-MeasurementFixture ($readWait.storage_health -eq 'read_wait_timeout' -and $readWait.result -eq 'partial' -and $null -eq $readWait.observation_count) 'A bounded read wait was reclassified as storage failure or zero activity.'
 Assert-MeasurementFixture ((Get-VeylurkMeasurementState $null @('collecting')) -eq 'unknown') 'A null state did not have an explicit unknown result.'
 Assert-MeasurementFixture ((ConvertTo-VeylurkMeasurementNumber 9007199254740993L) -eq 9007199254740993L) 'Large integer counters lost precision.'
 Assert-MeasurementFixture ((Get-FileHash -LiteralPath $database -Algorithm SHA256).Hash -ceq $databaseHash) 'Measurement changed invented database bytes.'

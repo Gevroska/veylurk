@@ -1,0 +1,379 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "invented_fixture",
+  "model_version": "community_presence_v1",
+  "parameters": {
+    "connected_minutes": 60,
+    "disconnected_minutes": 720,
+    "detection_scale": 0.5,
+    "false_report_ratio": 0.01,
+    "lag_seconds": 30,
+    "max_gap_seconds": 3600
+  },
+  "threshold": 0.99,
+  "as_of": "2024-01-01T00:02:00.000Z",
+  "protocol_frozen_at": "2024-01-01T00:02:10.000Z",
+  "predictions_frozen_at": "2024-01-01T00:02:20.000Z",
+  "labels_unblinded_at": "2024-01-01T00:02:30.000Z",
+  "split_rule": "whole_account_session_and_dependency_group",
+  "trajectories": [
+    {
+      "trajectory_id": "trajectory_1",
+      "account_id": "account_1",
+      "channel_id": "channel_1",
+      "session_id": "session_1",
+      "dependency_group": "development_group_1",
+      "split": "development",
+      "provenance": {
+        "kind": "invented_fixture",
+        "evidence_id": "invented_evidence_1",
+        "independent_of_community": true,
+        "viewer_role_eligible": true,
+        "all_sessions_controlled": true,
+        "clock_uncertainty_seconds": 2
+      },
+      "from": "2024-01-01T00:00:00.000Z",
+      "to": "2024-01-01T00:02:00.000Z",
+      "intervals": [
+        {
+          "from": "2024-01-01T00:00:00.000Z",
+          "to": "2024-01-01T00:01:00.000Z",
+          "present": true,
+          "entry_uncertainty_seconds": 14,
+          "exit_uncertainty_seconds": 10
+        },
+        {
+          "from": "2024-01-01T00:01:00.000Z",
+          "to": "2024-01-01T00:02:00.000Z",
+          "present": false,
+          "entry_uncertainty_seconds": 10,
+          "exit_uncertainty_seconds": 0
+        }
+      ],
+      "evaluated_at": [
+        "2024-01-01T00:00:15.000Z",
+        "2024-01-01T00:00:45.000Z",
+        "2024-01-01T00:00:59.000Z",
+        "2024-01-01T00:01:15.000Z",
+        "2024-01-01T00:01:45.000Z"
+      ],
+      "prediction": {
+        "model_version": "community_presence_v1",
+        "parameters": {
+          "connected_minutes": 60,
+          "disconnected_minutes": 720,
+          "detection_scale": 0.5,
+          "false_report_ratio": 0.01,
+          "lag_seconds": 30,
+          "max_gap_seconds": 3600
+        },
+        "threshold": 0.99,
+        "as_of": "2024-01-01T00:02:00.000Z",
+        "complete": true,
+        "status": "ok",
+        "source_eligibility_verified": true,
+        "first_positive_support_preserved": true,
+        "cells": [
+          {
+            "from": "2024-01-01T00:00:00.000Z",
+            "to": "2024-01-01T00:00:30.000Z",
+            "evaluated_at": "2024-01-01T00:00:15.000Z",
+            "presence_probability": 0.8,
+            "sensitivity_min": 0.8,
+            "sensitivity_max": 0.8,
+            "classification": "uncertain"
+          },
+          {
+            "from": "2024-01-01T00:00:30.000Z",
+            "to": "2024-01-01T00:01:00.000Z",
+            "evaluated_at": "2024-01-01T00:00:45.000Z",
+            "presence_probability": 0.99,
+            "sensitivity_min": 0.99,
+            "sensitivity_max": 0.99,
+            "classification": "estimated_present"
+          },
+          {
+            "from": "2024-01-01T00:01:00.000Z",
+            "to": "2024-01-01T00:01:30.000Z",
+            "evaluated_at": "2024-01-01T00:01:15.000Z",
+            "presence_probability": 0.001,
+            "sensitivity_min": 0.001,
+            "sensitivity_max": 0.001,
+            "classification": "estimated_absent"
+          },
+          {
+            "from": "2024-01-01T00:01:30.000Z",
+            "to": "2024-01-01T00:02:00.000Z",
+            "evaluated_at": "2024-01-01T00:01:45.000Z",
+            "presence_probability": null,
+            "sensitivity_min": null,
+            "sensitivity_max": null,
+            "classification": "unknown"
+          }
+        ]
+      }
+    },
+    {
+      "trajectory_id": "trajectory_2",
+      "account_id": "account_2",
+      "channel_id": "channel_2",
+      "session_id": "session_2",
+      "dependency_group": "development_group_2",
+      "split": "development",
+      "provenance": {
+        "kind": "invented_fixture",
+        "evidence_id": "invented_evidence_2",
+        "independent_of_community": true,
+        "viewer_role_eligible": true,
+        "all_sessions_controlled": true,
+        "clock_uncertainty_seconds": 0
+      },
+      "from": "2024-01-01T00:00:00.000Z",
+      "to": "2024-01-01T00:02:00.000Z",
+      "intervals": [
+        {
+          "from": "2024-01-01T00:00:00.000Z",
+          "to": "2024-01-01T00:02:00.000Z",
+          "present": true,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        }
+      ],
+      "evaluated_at": [
+        "2024-01-01T00:00:15.000Z",
+        "2024-01-01T00:00:45.000Z",
+        "2024-01-01T00:01:15.000Z",
+        "2024-01-01T00:01:45.000Z"
+      ],
+      "prediction": {
+        "model_version": "community_presence_v1",
+        "parameters": {
+          "connected_minutes": 60,
+          "disconnected_minutes": 720,
+          "detection_scale": 0.5,
+          "false_report_ratio": 0.01,
+          "lag_seconds": 30,
+          "max_gap_seconds": 3600
+        },
+        "threshold": 0.99,
+        "as_of": "2024-01-01T00:02:00.000Z",
+        "complete": true,
+        "status": "insufficient_data",
+        "source_eligibility_verified": true,
+        "first_positive_support_preserved": true,
+        "cells": []
+      }
+    },
+    {
+      "trajectory_id": "trajectory_3",
+      "account_id": "account_3",
+      "channel_id": "channel_3",
+      "session_id": "session_3",
+      "dependency_group": "holdout_group_1",
+      "split": "holdout",
+      "provenance": {
+        "kind": "invented_fixture",
+        "evidence_id": "invented_evidence_3",
+        "independent_of_community": true,
+        "viewer_role_eligible": true,
+        "all_sessions_controlled": true,
+        "clock_uncertainty_seconds": 0
+      },
+      "from": "2024-01-01T00:00:00.000Z",
+      "to": "2024-01-01T00:02:00.000Z",
+      "intervals": [
+        {
+          "from": "2024-01-01T00:00:00.000Z",
+          "to": "2024-01-01T00:01:00.000Z",
+          "present": true,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        },
+        {
+          "from": "2024-01-01T00:01:00.000Z",
+          "to": "2024-01-01T00:02:00.000Z",
+          "present": false,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        }
+      ],
+      "evaluated_at": [
+        "2024-01-01T00:00:15.000Z",
+        "2024-01-01T00:00:45.000Z",
+        "2024-01-01T00:01:15.000Z",
+        "2024-01-01T00:01:45.000Z"
+      ],
+      "prediction": {
+        "model_version": "community_presence_v1",
+        "parameters": {
+          "connected_minutes": 60,
+          "disconnected_minutes": 720,
+          "detection_scale": 0.5,
+          "false_report_ratio": 0.01,
+          "lag_seconds": 30,
+          "max_gap_seconds": 3600
+        },
+        "threshold": 0.99,
+        "as_of": "2024-01-01T00:02:00.000Z",
+        "complete": true,
+        "status": "ok",
+        "source_eligibility_verified": true,
+        "first_positive_support_preserved": true,
+        "cells": [
+          {
+            "from": "2024-01-01T00:00:00.000Z",
+            "to": "2024-01-01T00:00:30.000Z",
+            "evaluated_at": "2024-01-01T00:00:15.000Z",
+            "presence_probability": 0.8,
+            "sensitivity_min": 0.8,
+            "sensitivity_max": 0.8,
+            "classification": "uncertain"
+          },
+          {
+            "from": "2024-01-01T00:00:30.000Z",
+            "to": "2024-01-01T00:01:00.000Z",
+            "evaluated_at": "2024-01-01T00:00:45.000Z",
+            "presence_probability": 0.2,
+            "sensitivity_min": 0.2,
+            "sensitivity_max": 0.2,
+            "classification": "uncertain"
+          },
+          {
+            "from": "2024-01-01T00:01:00.000Z",
+            "to": "2024-01-01T00:01:30.000Z",
+            "evaluated_at": "2024-01-01T00:01:15.000Z",
+            "presence_probability": null,
+            "sensitivity_min": null,
+            "sensitivity_max": null,
+            "classification": "unknown"
+          },
+          {
+            "from": "2024-01-01T00:01:30.000Z",
+            "to": "2024-01-01T00:02:00.000Z",
+            "evaluated_at": "2024-01-01T00:01:45.000Z",
+            "presence_probability": 0.999,
+            "sensitivity_min": 0.999,
+            "sensitivity_max": 0.999,
+            "classification": "estimated_present"
+          }
+        ]
+      }
+    },
+    {
+      "trajectory_id": "trajectory_4",
+      "account_id": "account_4",
+      "channel_id": "channel_4",
+      "session_id": "session_4",
+      "dependency_group": "holdout_group_2",
+      "split": "holdout",
+      "provenance": {
+        "kind": "invented_fixture",
+        "evidence_id": "invented_evidence_4",
+        "independent_of_community": true,
+        "viewer_role_eligible": false,
+        "all_sessions_controlled": true,
+        "clock_uncertainty_seconds": 0
+      },
+      "from": "2024-01-01T00:00:00.000Z",
+      "to": "2024-01-01T00:02:00.000Z",
+      "intervals": [
+        {
+          "from": "2024-01-01T00:00:00.000Z",
+          "to": "2024-01-01T00:01:00.000Z",
+          "present": true,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        },
+        {
+          "from": "2024-01-01T00:01:00.000Z",
+          "to": "2024-01-01T00:02:00.000Z",
+          "present": false,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        }
+      ],
+      "evaluated_at": [
+        "2024-01-01T00:00:15.000Z",
+        "2024-01-01T00:00:45.000Z",
+        "2024-01-01T00:01:15.000Z",
+        "2024-01-01T00:01:45.000Z"
+      ],
+      "prediction": {
+        "model_version": "community_presence_v1",
+        "parameters": {
+          "connected_minutes": 60,
+          "disconnected_minutes": 720,
+          "detection_scale": 0.5,
+          "false_report_ratio": 0.01,
+          "lag_seconds": 30,
+          "max_gap_seconds": 3600
+        },
+        "threshold": 0.99,
+        "as_of": "2024-01-01T00:02:00.000Z",
+        "complete": true,
+        "status": "role_unsupported",
+        "source_eligibility_verified": true,
+        "first_positive_support_preserved": true,
+        "cells": []
+      }
+    },
+    {
+      "trajectory_id": "trajectory_5",
+      "account_id": "account_5",
+      "channel_id": "channel_5",
+      "session_id": "session_5",
+      "dependency_group": "holdout_group_1",
+      "split": "holdout",
+      "provenance": {
+        "kind": "invented_fixture",
+        "evidence_id": "invented_evidence_5",
+        "independent_of_community": true,
+        "viewer_role_eligible": true,
+        "all_sessions_controlled": true,
+        "clock_uncertainty_seconds": 0
+      },
+      "from": "2024-01-01T00:00:00.000Z",
+      "to": "2024-01-01T00:02:00.000Z",
+      "intervals": [
+        {
+          "from": "2024-01-01T00:00:00.000Z",
+          "to": "2024-01-01T00:01:00.000Z",
+          "present": true,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        },
+        {
+          "from": "2024-01-01T00:01:00.000Z",
+          "to": "2024-01-01T00:02:00.000Z",
+          "present": false,
+          "entry_uncertainty_seconds": 0,
+          "exit_uncertainty_seconds": 0
+        }
+      ],
+      "evaluated_at": [
+        "2024-01-01T00:00:15.000Z",
+        "2024-01-01T00:00:45.000Z",
+        "2024-01-01T00:01:15.000Z",
+        "2024-01-01T00:01:45.000Z"
+      ],
+      "prediction": {
+        "model_version": "community_presence_v1",
+        "parameters": {
+          "connected_minutes": 60,
+          "disconnected_minutes": 720,
+          "detection_scale": 0.5,
+          "false_report_ratio": 0.01,
+          "lag_seconds": 30,
+          "max_gap_seconds": 3600
+        },
+        "threshold": 0.99,
+        "as_of": "2024-01-01T00:02:00.000Z",
+        "complete": true,
+        "status": "no_data",
+        "source_eligibility_verified": true,
+        "first_positive_support_preserved": true,
+        "cells": []
+      }
+    }
+  ]
+}

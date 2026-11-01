@@ -140,6 +140,226 @@ fn component_schema(conn: &Connection) -> Vec<(String, Option<String>)> {
 }
 
 #[test]
+fn v1_and_v2_pause_migration_preserves_each_legacy_reason_and_unrelated_state() {
+    for version in [1, 2] {
+        for reason in [
+            None,
+            Some("authentication_denied"),
+            Some("integrity_denied"),
+            Some("challenge_denied"),
+            Some("rate_limited"),
+            Some("source_denied"),
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            v1_fixture(&mut conn, true, 777);
+            if version == 2 {
+                conn.execute_batch(MIGRATE_V2).unwrap();
+                conn.execute("UPDATE community_settings SET cadence_mode='adaptive'", [])
+                    .unwrap();
+            }
+            conn.execute("UPDATE community_pause SET reason=?1", [reason])
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE credential_fixture(id INTEGER PRIMARY KEY,opaque BLOB NOT NULL);
+                INSERT INTO credential_fixture VALUES(1,x'001122ff');
+                PRAGMA user_version=37;",
+            )
+            .unwrap();
+            let preserved = [
+                "community_pause",
+                "community_runs",
+                "community_samples",
+                "community_members",
+                "sqlite_sequence",
+                "credential_fixture",
+            ];
+            let before = snapshot(&conn, &preserved);
+            let history_schema: Vec<_> = component_schema(&conn)
+                .into_iter()
+                .filter(|(name, _)| {
+                    !matches!(name.as_str(), "community_pause" | "community_settings")
+                })
+                .filter(|(name, _)| name != "community_members_sample_member")
+                .collect();
+            initialize(&mut conn).unwrap();
+            assert_eq!(snapshot(&conn, &preserved), before, "v{version} {reason:?}");
+            assert_eq!(
+                read_community_pause(&conn)
+                    .unwrap()
+                    .map(|reason| reason.code()),
+                reason
+            );
+            let settings = read_community_settings(&conn).unwrap();
+            assert!(settings.enabled);
+            assert_eq!(settings.target_interval_seconds, 777);
+            assert_eq!(
+                settings.cadence_mode,
+                if version == 2 {
+                    CommunityCadenceMode::Adaptive
+                } else {
+                    CommunityCadenceMode::Fixed
+                }
+            );
+            assert_eq!(
+                conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                37
+            );
+            // The only history access-path changes are the already approved indexes.
+            let after_schema: Vec<_> = component_schema(&conn)
+                .into_iter()
+                .filter(|(name, _)| {
+                    !matches!(
+                        name.as_str(),
+                        "community_pause"
+                            | "community_settings"
+                            | "community_members_account_channel_member_sample"
+                            | "community_members_sample_member"
+                    )
+                })
+                .collect();
+            assert_eq!(after_schema, history_schema);
+            conn.execute(
+                "UPDATE community_pause SET reason='cleanup_unconfirmed'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                read_community_pause(&conn).unwrap(),
+                Some(CommunityPauseReason::CleanupUnconfirmed)
+            );
+            assert!(conn
+                .execute("UPDATE community_pause SET reason='unknown'", [])
+                .is_err());
+            let retained = snapshot(&conn, &preserved);
+            let schema = component_schema(&conn);
+            initialize(&mut conn).unwrap();
+            assert_eq!(snapshot(&conn, &preserved), retained);
+            assert_eq!(component_schema(&conn), schema);
+        }
+    }
+}
+
+#[test]
+fn pause_v3_migration_and_pending_recovery_roll_back_as_one_transaction() {
+    for version in [1, 2] {
+        for failed_stage in ["version", "recovery"] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            v1_fixture(&mut conn, true, 777);
+            if version == 2 {
+                conn.execute_batch(MIGRATE_V2).unwrap();
+            }
+            conn.execute_batch("UPDATE community_runs SET ended_at_utc=NULL,end_reason=NULL;
+                UPDATE community_pause SET reason='source_denied';
+                INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,4,'room','2020-01-01T00:00:01.000Z','pending');").unwrap();
+            if failed_stage == "version" {
+                conn.execute_batch("CREATE TRIGGER community_fail_v3 BEFORE UPDATE ON community_schema_version WHEN NEW.version=3 BEGIN SELECT RAISE(ABORT,'fixture v3 version failure'); END;").unwrap();
+            } else {
+                conn.execute_batch("CREATE TRIGGER community_fail_v3_recovery BEFORE UPDATE OF outcome ON community_samples BEGIN SELECT RAISE(ABORT,'fixture v3 recovery failure'); END;").unwrap();
+            }
+            let tables = [
+                "community_schema_version",
+                "community_settings",
+                "community_pause",
+                "community_runs",
+                "community_samples",
+                "community_members",
+                "sqlite_sequence",
+            ];
+            let before = snapshot(&conn, &tables);
+            let schema = component_schema(&conn);
+            assert!(initialize(&mut conn).is_err(), "v{version} {failed_stage}");
+            assert_eq!(snapshot(&conn, &tables), before);
+            assert_eq!(component_schema(&conn), schema);
+            assert!(conn.is_autocommit());
+            assert!(
+                conn.execute(
+                    "UPDATE community_pause SET reason='cleanup_unconfirmed'",
+                    []
+                )
+                .is_err(),
+                "old CHECK constraint must survive rollback"
+            );
+        }
+    }
+}
+
+#[test]
+fn v1_and_v2_pending_recovery_preserves_original_history_and_every_pause() {
+    for version in [1, 2] {
+        for reason in [
+            None,
+            Some("authentication_denied"),
+            Some("integrity_denied"),
+            Some("challenge_denied"),
+            Some("rate_limited"),
+            Some("source_denied"),
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            v1_fixture(&mut conn, true, 777);
+            if version == 2 {
+                conn.execute_batch(MIGRATE_V2).unwrap();
+            }
+            conn.execute("UPDATE community_pause SET reason=?1", [reason])
+                .unwrap();
+            let before = snapshot(
+                &conn,
+                &["community_runs", "community_samples", "community_members"],
+            );
+            conn.execute_batch("INSERT INTO community_runs(id,started_at_utc,build_identity) VALUES(2,'2020-01-01T00:00:00.000Z','pending-fixture');
+                INSERT INTO community_samples(id,run_id,job_id,channel,started_at_utc,outcome) VALUES(4,2,1,'room','2020-01-01T00:00:01.000Z','pending');").unwrap();
+            let sequences = snapshot(&conn, &["sqlite_sequence"]);
+            initialize(&mut conn).unwrap();
+            let after = snapshot(
+                &conn,
+                &["community_runs", "community_samples", "community_members"],
+            );
+            assert_eq!(&after[0][..1], &before[0]);
+            assert_eq!(&after[1][..3], &before[1]);
+            assert_eq!(after[2], before[2]);
+            assert_eq!(snapshot(&conn, &["sqlite_sequence"]), sequences);
+            let recovered: (String, String, String) = conn.query_row("SELECT r.end_reason,s.outcome,s.failure_code FROM community_samples s JOIN community_runs r ON r.id=s.run_id WHERE s.id=4", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(
+                recovered,
+                (
+                    "process_interrupted".into(),
+                    "interrupted".into(),
+                    "process_interrupted".into()
+                )
+            );
+            assert_eq!(
+                read_community_pause(&conn)
+                    .unwrap()
+                    .map(|reason| reason.code()),
+                reason
+            );
+        }
+    }
+}
+
+#[test]
+fn false_v3_declaration_cannot_skip_the_pause_constraint_migration() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    v1_fixture(&mut conn, true, 777);
+    conn.execute_batch(MIGRATE_V2).unwrap();
+    conn.execute_batch("UPDATE community_schema_version SET version=3;
+        INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,4,'room','2020-01-01T00:00:01.000Z','pending');").unwrap();
+    let tables = [
+        "community_schema_version",
+        "community_settings",
+        "community_pause",
+        "community_runs",
+        "community_samples",
+        "community_members",
+    ];
+    let before = snapshot(&conn, &tables);
+    let schema = component_schema(&conn);
+    assert!(matches!(initialize(&mut conn), Err(StoreError::Initialize)));
+    assert_eq!(snapshot(&conn, &tables), before);
+    assert_eq!(component_schema(&conn), schema);
+}
+
+#[test]
 fn receipt_pair_index_is_additive_for_fresh_v1_and_v2_and_reopen_is_idempotent() {
     for version in [None, Some(1), Some(2)] {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -186,7 +406,7 @@ fn receipt_pair_index_is_additive_for_fresh_v1_and_v2_and_reopen_is_idempotent()
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-            2
+            COMMUNITY_SCHEMA_VERSION
         );
         let schema = component_schema(&conn);
         let retained = snapshot(&conn, &history);
@@ -276,7 +496,7 @@ fn sample_member_covering_upgrade_preserves_history_and_reopen_performs_no_ddl()
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-            2
+            COMMUNITY_SCHEMA_VERSION
         );
     }
 }
@@ -355,7 +575,10 @@ async fn actual_v1_migration_preserves_preferences_pause_and_history_and_reopen_
             store.community_pause().await.unwrap(),
             Some(CommunityPauseReason::IntegrityDenied)
         );
-        assert_eq!(store.community_stats().await.unwrap().schema_version, 2);
+        assert_eq!(
+            store.community_stats().await.unwrap().schema_version,
+            COMMUNITY_SCHEMA_VERSION
+        );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(
             settings_columns(&conn),
@@ -436,7 +659,7 @@ async fn fresh_install_is_disabled_adaptive_and_typed_modes_round_trip_without_c
 fn malformed_version_and_false_v2_declarations_are_rejected_without_mutation() {
     for values in [
         "",
-        "(1,3)",
+        "(1,4)",
         "(1,0)",
         "(1,-1)",
         "(1,NULL)",
@@ -638,7 +861,7 @@ fn unknown_component_version_is_rejected_before_component_creation_or_recovery()
     initialize(&mut conn).unwrap();
     conn.execute_batch("INSERT INTO community_runs VALUES(1,'2024-01-01T00:00:00Z',NULL,NULL,'fixture');
         INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,1,'room','2024-01-01T00:00:00Z','pending');
-        UPDATE community_schema_version SET version=3;").unwrap();
+        UPDATE community_schema_version SET version=4;").unwrap();
     let tables = [
         "community_schema_version",
         "community_settings",
@@ -692,6 +915,7 @@ async fn durable_pause_survives_recovery_and_preference_changes_until_explicit_c
         CommunityPauseReason::ChallengeDenied,
         CommunityPauseReason::RateLimited,
         CommunityPauseReason::SourceDenied,
+        CommunityPauseReason::CleanupUnconfirmed,
     ] {
         store.set_community_pause(Some(reason)).await.unwrap();
         assert_eq!(store.community_pause().await.unwrap(), Some(reason));
@@ -1541,7 +1765,7 @@ async fn initialization_failure_is_classified_as_community_initialization() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("future.sqlite3");
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("CREATE TABLE community_schema_version(id INTEGER PRIMARY KEY,version INTEGER);INSERT INTO community_schema_version VALUES(1,3);").unwrap();
+    conn.execute_batch("CREATE TABLE community_schema_version(id INTEGER PRIMARY KEY,version INTEGER);INSERT INTO community_schema_version VALUES(1,4);").unwrap();
     drop(conn);
     let diagnostics = crate::diagnostics::Diagnostics::new(&path);
     assert!(Store::open_with_diagnostics(&path, diagnostics.clone())

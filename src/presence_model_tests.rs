@@ -115,6 +115,117 @@ fn exhaustive(obs: &[Observation], scenario: Scenario, at: f64) -> f64 {
     present / total
 }
 
+// Independent oracle: deliberately do not call production transition, likelihood,
+// forward/backward or normalization. Enumerate every binary hidden-state path.
+fn independent_oracle(obs: &[Observation], s: Scenario, at: f64) -> f64 {
+    let mut times: Vec<f64> = obs.iter().map(|o| o.at).chain([at]).collect();
+    times.sort_by(f64::total_cmp);
+    times.dedup();
+    let target = times.iter().position(|t| *t == at).unwrap();
+    let stationary = s.connected / (s.connected + s.disconnected);
+    let mut total = 0.;
+    let mut present = 0.;
+    for path in 0..(1_usize << times.len()) {
+        let first = path & 1;
+        let mut weight = if first == 1 { s.prior } else { 1. - s.prior };
+        for (i, time) in times.iter().enumerate() {
+            let state = (path >> i) & 1;
+            if i > 0 {
+                let previous = (path >> (i - 1)) & 1;
+                let persistence =
+                    (-(1. / s.connected + 1. / s.disconnected) * (time - times[i - 1])).exp();
+                let p1 = stationary + (previous as f64 - stationary) * persistence;
+                weight *= if state == 1 { p1 } else { 1. - p1 };
+            }
+            for o in obs.iter().filter(|o| o.at == *time) {
+                let detect = (s.detection * o.k / o.n).clamp(1e-6, 1. - 1e-6);
+                let positive = if state == 1 { detect } else { detect * s.ratio };
+                weight *= if o.positive { positive } else { 1. - positive };
+            }
+        }
+        total += weight;
+        if (path >> target) & 1 == 1 {
+            present += weight;
+        }
+    }
+    present / total
+}
+
+#[test]
+fn independent_exhaustive_oracle_covers_patterns_irregular_counts_and_parameter_corners() {
+    let mut cases = scenarios(parameters());
+    cases.push(Scenario {
+        connected: 300.,
+        disconnected: 604800.,
+        detection: 0.05,
+        ratio: 0.0001,
+        prior: 0.1,
+        lag: 0.,
+    });
+    for scenario in cases {
+        for pattern in 0..16 {
+            let obs: Vec<_> = [
+                (0., 1., 10000.),
+                (0.001, 90., 100.),
+                (137., 8., 500.),
+                (790., 100., 100.),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (at, k, n))| Observation {
+                at,
+                positive: pattern & (1 << i) != 0,
+                k,
+                n,
+            })
+            .collect();
+            let smoother = Smoother::new(&obs, scenario, &control()).unwrap();
+            for at in [0., 0.0005, 0.001, 10., 137., 500., 790.] {
+                let expected = independent_oracle(&obs, scenario, at);
+                let actual = smoother.at(&obs, scenario, at).unwrap();
+                assert!(
+                    (expected - actual).abs() < 2e-10,
+                    "pattern {pattern} at {at}: {expected} != {actual}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn production_grid_central_probabilities_match_independent_oracle_after_lag_and_censoring() {
+    let mut rows = vec![
+        sample(0, false),
+        sample(1, true),
+        sample(2, false),
+        sample(3, true),
+    ];
+    rows[2].reported = Some(700);
+    rows[3].viewer_only = 1;
+    let out = analyze(response(0., 240.), input(rows.clone()), control());
+    assert_eq!(out.status, PresenceStatus::Ok);
+    assert!(out.left_censored);
+    let obs: Vec<_> = rows[1..]
+        .iter()
+        .map(|s| eligibility(s, BASE - 1., BASE + 241.).unwrap())
+        .collect();
+    let central = scenarios(parameters())[0];
+    let mut checked = 0;
+    for cell in &out.cells {
+        if let Some(actual) = cell.presence_probability {
+            let at = parse_time(&cell.evaluated_at).unwrap() + central.lag;
+            let expected = independent_oracle(&obs, central, at);
+            assert!((expected - actual).abs() < 2e-10);
+            checked += 1;
+        }
+    }
+    assert!(checked > 100);
+    assert!(out
+        .cells
+        .iter()
+        .any(|c| c.classification == PresenceClassification::Unknown));
+}
+
 #[test]
 fn forward_backward_and_between_observation_estimates_match_exhaustive_paths() {
     let scenario = scenarios(parameters())[0];

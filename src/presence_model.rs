@@ -36,7 +36,8 @@ pub struct PresenceModelQuery {
     pub max_gap_seconds: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PresenceParameters {
     pub connected_minutes: f64,
     pub disconnected_minutes: f64,

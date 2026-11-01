@@ -333,3 +333,29 @@ process had exited and no process used its dedicated browser profile, one
 explicit API Resume restored collection. No SQL edit or automatic retry was used.
 A remaining classification improvement is to distinguish cleanup uncertainty
 from source rejection while preserving the persisted restart barrier.
+
+## Current four-item completion increment
+
+The owner authorized the written [completion plan](completion-plan-2026-11-01.md).
+Its ledger separates source implementation, hosted checks, live measurements and
+statistical proof. The current candidate implements the cleanup pause distinction
+and atomic Community v3 migration, persist-first retirement barriers, independent
+memory-only storage activity and bounded read waits, and the offline numerical,
+simulation and reference-evaluation tool. Source review and 114 local Node tests
+passed; hosted Windows and candidate runtime acceptance remain pending.
+
+The first fixed 24-channel baseline stopped at its predeclared 1 GiB private-memory
+investigation trigger after 60.7 seconds and two durable successes. The first
+channel peaked near 879 MiB, its retained idle page remained near 833–938 MiB,
+and the second channel reached 1,418 MiB across the app and browser descendants.
+This is partial breadth evidence, not 24-channel acceptance. Exact original
+settings and tracking state were restored. The candidate now releases a retained
+source page after an accepted success through its existing confirmed-cleanup and
+same-profile recycle path. Native tests and a matched runtime comparison must
+establish its effect; no memory reduction is claimed from source changes alone.
+
+The empirical 99% claim remains separate from simulated and proxy agreement.
+Choosing live channels supplies real observations but does not create independent
+membership/absence truth. The agent will run feasible tests autonomously without
+asking the owner to supply a dataset again; unavailable reference evidence must
+remain explicit in the final report.

@@ -1,5 +1,8 @@
 //! Serialized SQLite access. Account logins are observations, not permanent account IDs.
-use crate::diagnostics::{Diagnostics, JobClass, Operation};
+use crate::diagnostics::{
+    ActivityOutcome, Diagnostics, JobClass, Operation, StorageActivity, QUERY_EXECUTION_BUDGET,
+    READ_RESPONSE_BUDGET, STORAGE_QUEUE_CAPACITY,
+};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -53,6 +56,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("storage worker is unavailable")]
     Unavailable,
+    #[error("read response wait expired; storage work may still be finishing")]
+    ReadWaitTimeout,
     #[error("invalid channel or query configuration")]
     Invalid,
     #[error("at most 50 channels can be tracked")]
@@ -71,6 +76,7 @@ pub struct Store {
     sender: mpsc::Sender<Job>,
     path: Arc<PathBuf>,
     diagnostics: Diagnostics,
+    activity: StorageActivity,
     #[cfg(test)]
     append_expiry: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
     #[cfg(test)]
@@ -312,7 +318,7 @@ impl Store {
         diagnostics: Diagnostics,
     ) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
-        let (sender, mut receiver) = mpsc::channel::<Job>(64);
+        let (sender, mut receiver) = mpsc::channel::<Job>(STORAGE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
         let worker_path = path.clone();
         let worker_diagnostics = diagnostics.clone();
@@ -375,6 +381,7 @@ impl Store {
             sender,
             path: Arc::new(path),
             diagnostics,
+            activity: StorageActivity::new(),
             #[cfg(test)]
             append_expiry: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -392,6 +399,12 @@ impl Store {
 
     pub fn diagnostics(&self) -> crate::diagnostics::Snapshot {
         self.diagnostics.snapshot()
+    }
+
+    /// Independent of the SQLite actor, journal writer and filesystem. The brief activity
+    /// lock protects fixed-size memory only and is never held across storage work.
+    pub fn storage_activity(&self) -> crate::diagnostics::StorageActivitySnapshot {
+        self.activity.snapshot()
     }
 
     pub(crate) fn record_community_host_termination(
@@ -449,13 +462,26 @@ impl Store {
         self.call_read(Operation::Query, operation).await
     }
 
-    /// A cancellable query, with a fresh five-second execution budget after dequeue.
+    /// Reads have a ten-second admission/queue/response wait and a separate, fresh five-second
+    /// SQLite execution budget after dequeue. Dropping a queued reader lets the worker skip it;
+    /// neither deadline can preempt blocked OS I/O. Durable mutations use neither read deadline.
     pub async fn call_read<T, F>(&self, name: Operation, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
-        self.call_named(name, JobClass::Query, operation).await
+        let response = tokio::time::timeout(
+            READ_RESPONSE_BUDGET,
+            self.call_named(name, JobClass::Query, operation),
+        )
+        .await;
+        match response {
+            Ok(result) => result,
+            Err(_) => {
+                self.activity.read_response_timeout();
+                Err(StoreError::ReadWaitTimeout)
+            }
+        }
     }
 
     /// Durable mutations retain SQLite's own errors and busy timeout, but are never aborted
@@ -483,6 +509,25 @@ impl Store {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
+        let admission = self.activity.request();
+        // reserve is cancellation-safe: a dropped admission future never delivers a job.
+        // Updating activity and permit.send below have no intervening await/cancellation point.
+        let permit = match self.sender.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                admission.unavailable();
+                self.diagnostics.storage_failure(
+                    name,
+                    class,
+                    &StoreError::Unavailable,
+                    Duration::ZERO,
+                    false,
+                    None,
+                );
+                return Err(StoreError::Unavailable);
+            }
+        };
+        let mut activity = admission.admit(name, class);
         let (tx, rx) = oneshot::channel();
         let diagnostics = self.diagnostics.clone();
         #[cfg(test)]
@@ -493,58 +538,56 @@ impl Store {
         } else {
             None
         };
-        let sent = self
-            .sender
-            .send(Box::new(move |conn| {
-                let started = std::time::Instant::now();
-                let deadline = started + Duration::from_secs(5);
-                let interrupted = Arc::new(AtomicBool::new(false));
-                let callback_interrupted = interrupted.clone();
-                conn.progress_handler(0, None::<fn() -> bool>);
-                if class == JobClass::Query {
-                    conn.progress_handler(
-                        10_000,
-                        Some(move || {
-                            let expired = std::time::Instant::now() >= deadline;
-                            #[cfg(test)]
-                            let expired = expired
-                                || fake_expiry
-                                    .as_ref()
-                                    .is_some_and(|clock| clock.load(Ordering::Relaxed));
-                            if expired {
-                                callback_interrupted.store(true, Ordering::Relaxed);
-                            }
-                            expired
-                        }),
-                    );
-                }
-                let result = operation(conn);
-                conn.progress_handler(0, None::<fn() -> bool>);
-                if let Err(error) = &result {
-                    diagnostics.storage_failure(
-                        name,
-                        class,
-                        error,
-                        started.elapsed(),
-                        interrupted.load(Ordering::Relaxed),
-                        Some(conn.is_autocommit()),
-                    );
-                }
-                // Publish failure evidence before the collector can react to this result.
-                let _ = tx.send(result);
-            }))
-            .await;
-        if sent.is_err() {
-            self.diagnostics.storage_failure(
-                name,
-                class,
-                &StoreError::Unavailable,
-                Duration::ZERO,
-                false,
-                None,
-            );
-            return Err(StoreError::Unavailable);
-        }
+        permit.send(Box::new(move |conn| {
+            // Receiver abandonment is meaningful only for reads. An admitted mutation
+            // remains owned by the storage worker even after its HTTP caller disappears.
+            if class == JobClass::Query && tx.is_closed() {
+                activity.finish(ActivityOutcome::CanceledBeforeStart);
+                return;
+            }
+            activity.start();
+            let started = std::time::Instant::now();
+            let deadline = started + QUERY_EXECUTION_BUDGET;
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let callback_interrupted = interrupted.clone();
+            conn.progress_handler(0, None::<fn() -> bool>);
+            if class == JobClass::Query {
+                conn.progress_handler(
+                    10_000,
+                    Some(move || {
+                        let expired = std::time::Instant::now() >= deadline;
+                        #[cfg(test)]
+                        let expired = expired
+                            || fake_expiry
+                                .as_ref()
+                                .is_some_and(|clock| clock.load(Ordering::Relaxed));
+                        if expired {
+                            callback_interrupted.store(true, Ordering::Relaxed);
+                        }
+                        expired
+                    }),
+                );
+            }
+            let result = operation(conn);
+            conn.progress_handler(0, None::<fn() -> bool>);
+            if let Err(error) = &result {
+                diagnostics.storage_failure(
+                    name,
+                    class,
+                    error,
+                    started.elapsed(),
+                    interrupted.load(Ordering::Relaxed),
+                    Some(conn.is_autocommit()),
+                );
+            }
+            activity.finish(if result.is_ok() {
+                ActivityOutcome::Succeeded
+            } else {
+                ActivityOutcome::Failed
+            });
+            // Publish failure evidence before the collector can react to this result.
+            let _ = tx.send(result);
+        }));
         rx.await.map_err(|_| {
             self.diagnostics.storage_failure(
                 name,

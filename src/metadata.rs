@@ -104,7 +104,15 @@ pub async fn initialize(store: Store) -> Result<Metadata, StoreError> {
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
-fn database_error(_: StoreError) -> (StatusCode, Json<Value>) {
+fn database_error(error: StoreError) -> (StatusCode, Json<Value>) {
+    if matches!(error, StoreError::ReadWaitTimeout) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"error":{"code":"read_wait_timeout","message":"The read response wait expired. Storage work may still be finishing; check storage activity."}}),
+            ),
+        );
+    }
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(
