@@ -10,6 +10,8 @@ Popout readiness requires the exact page, positive signed-in controls, usable ch
 
 The ordinary Community click and native observed-response path remain in use. Generation/controller epoch, navigation/top-frame identity, operation/channel matching, trigger deadlines, cache checks, denial handling and response bounds retain their existing roles. Network receipt still does not establish server freshness, independent random samples, complete viewing coverage or calibrated probabilities.
 
+After an acknowledged Community click, the composer can disappear briefly before the panel mounts. Only that opening phase can wait with authentication unobservable: the exact composer structure must remain, both positive controls must be hidden, the opener must remain usable, and no visible malformed panel, Login, challenge or video may appear. This waiting state cannot advance the phase, freeze or accept a body, or renew the original deadline. A confirmed panel and fresh positive post-close authentication remain mandatory.
+
 The actual popout layout lacks the full page's User Avatar control. Its positive identity control is checked together with editable chat and absence of a login control. Opening Community hides these controls: authentication is explicitly unobservable during that bounded panel phase, never cached as true. The collector freezes a fully validated response, disables observation, closes the observed panel through its ordinary Close control, and re-establishes visible positive authentication for two seconds before publishing the original receipt. Route, media, denial, epoch and original deadline checks continue throughout; failed restoration produces no sample. Before qualifying that predicate, a fresh anonymous profile must reach the chat UI without satisfying authentication or producing a sample; incomplete page loading is inconclusive. The signed-in profile must subsequently produce successful samples. Passwords, cookies, tokens and account-name text are not extracted for this check.
 
 ## Dormant lifecycle
@@ -39,9 +41,9 @@ Previously recorded full-page measurements are comparison evidence, not a new ma
 | --- | --- | --- |
 | Astra design and scope | Verified | Explicit popout mode and dormant lifecycle; no further owner decision needed. |
 | Implementation and independent review | Verified source | Strict route/readiness, unobservable panel phase, frozen receipt and dormant lifecycle reviewed; 124 local Node tests passed. Post-close Login and dormant disconnect findings corrected. |
-| Exact Windows CI and artifact | In progress | Native source `ef085ddf` passed 94 tests. App checks passed ordinary tests but encountered a 146.697-second scale-cap failure, then a recovery helper that treated the new 10-second read wait as failed storage before its 30-second acceptance deadline. A reviewed test-only compatibility correction preserves all deadlines/assertions. Any diagnostic artifact remains explicitly unqualified and cannot turn a failed workflow green. |
-| Anonymous negative and signed-in positive checks | Pending | Original profile remains preserved. |
-| Resource gains and breadth | Pending | No new savings claimed before measurement. |
+| Exact Windows CI and artifact | Correction pending CI | Native source `ef085ddf` passed 94 tests; complete app source `c426879` passed all Windows checks after the reviewed test-helper correction. The later opening-transition correction requires a new exact artifact. Any diagnostic artifact remains explicitly unqualified and cannot turn a failed workflow green. |
+| Anonymous negative and signed-in positive checks | Partial; correction pending | Fresh anonymous chat loaded with signed-in false and no accepted sample. Two signed-in receipts succeeded before a false-denial-compatible opening race stopped the third attempt. Failure evidence and the pause barrier were retained. The reproduced source path is corrected; the corrected build still needs requalification. |
+| Resource gains and breadth | Preliminary only | The interrupted run recorded about 427 MiB peak private memory, 11 MiB app-only waiting memory and repeated roughly 30-second gaps without browser descendants. These do not qualify the corrected build or many-channel breadth. |
 | History, credentials, settings and production preserved | Pending | Final independent verification required. |
 
 

@@ -48,7 +48,8 @@ const COMMUNITY_UI: &str = r#"(() => {
       video_present:false, video_ready:false, video_paused:null, play_control:false,
       pause_clicked:false, trigger_unix_ms:null, observed_unix_ms:null};
   const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
-  const buttons = [...document.querySelectorAll('button,[role="tab"]')].filter(visible);
+  const controls = [...document.querySelectorAll('button,[role="tab"]')];
+  const buttons = controls.filter(visible);
   const label = e => (e.getAttribute('aria-label') || '').trim();
   const target = buttons.find(e => e.getAttribute('data-test-selector') === 'chat-viewer-list')
     || buttons.find(e => e.getAttribute('data-a-target') === 'chat-viewers')
@@ -56,9 +57,11 @@ const COMMUNITY_UI: &str = r#"(() => {
     || buttons.find(e => (e.textContent || '').trim() === 'Community');
   const player = buttons.find(e => e.getAttribute('data-a-target') === 'player-play-pause-button')
     || buttons.find(e => /^(Pause|Play) \(space\/k\)$/.test(label(e)));
-  const identity = buttons.find(e => label(e) === 'ChatBadgeCarousel'
+  const is_identity = e => label(e) === 'ChatBadgeCarousel'
     && e.getAttribute('data-a-target') === 'chat-badge-carousel-badge-icon'
-    && !e.disabled && e.closest('[data-a-target="chat-badge-carousel"]'));
+    && !e.disabled && e.closest('[data-a-target="chat-badge-carousel"]');
+  const identity_control = controls.find(is_identity);
+  const identity = buttons.find(is_identity);
   const signed_in = (__POPOUT__ ? !!identity
     : buttons.some(e => label(e) === 'User Avatar' || e.querySelector('img[alt="User Avatar"]')))
     && !buttons.some(e => e.getAttribute('data-a-target') === 'login-button');
@@ -103,6 +106,12 @@ const COMMUNITY_UI: &str = r#"(() => {
     }
     if (__POPOUT__ && __PANEL_EXPECTED__) {
       if (expected_panel && panels.length === 1) return result('community_panel_open');
+      // During the acknowledged opener's animation, the exact composer may
+      // hide before the panel mounts. Presence here is continuity, not auth.
+      if (__PANEL_OPENING__ && !panels.length && !before.signed_in && !before.chat_ready
+          && identity_control && chat_input && chat_input.isContentEditable
+          && chat_input.getAttribute('aria-label') === 'Send a message' && before.community_ready)
+        return result('community_panel_transition');
       if (panels.length || !before.signed_in || !before.chat_ready) return result('community_panel_unverified');
       return result('community_panel_waiting');
     }
@@ -1616,6 +1625,35 @@ impl App {
                 .is_some_and(|deadline| deadline.allows_dispatch(generation, self.elapsed_ms()))
     }
 
+    fn panel_transition_allowed(&self, generation: u64) -> bool {
+        let state = self.state.borrow();
+        state.source_page == SourcePage::PopoutChat
+            && state.popout_phase == PopoutPhase::AwaitingPanel
+            && !state.trigger_pending
+            && self.is_active(generation)
+    }
+
+    fn reject_terminal_ui_result(&self, code: &str) -> bool {
+        match code {
+            "challenge_denied" => self.sample_failure(Failure::ChallengeDenied),
+            "wrong_page" | "authentication_denied" => {
+                self.sample_failure(Failure::AuthenticationDenied)
+            }
+            "community_restore_deadline" => {
+                self.end_auto_attempt("source_reverification_deadline", false)
+            }
+            "community_panel_unverified"
+            | "unexpected_community_panel"
+            | "community_restore_panel_mismatch"
+            | "community_restore_control_unavailable" => self.fail(
+                "community_panel_unverified",
+                "The expected ordinary Community panel or restore control could not be verified.",
+            ),
+            _ => return false,
+        }
+        true
+    }
+
     fn expire_trigger(&self) {
         if self.automatic() {
             self.end_auto_attempt("community_trigger_deadline", false);
@@ -1687,6 +1725,14 @@ impl App {
             .replace(
                 "__AUTH_REQUIRED__",
                 if popout_phase != PopoutPhase::Chat {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
+            .replace(
+                "__PANEL_OPENING__",
+                if popout_phase == PopoutPhase::AwaitingPanel {
                     "true"
                 } else {
                     "false"
@@ -1802,14 +1848,9 @@ impl App {
                     attempt.last_player_observation = Some(ui.player.clone());
                 }
             }
-            // Observed denials take precedence over an occluded composer.
-            let denial = match ui.code.as_str() {
-                "challenge_denied" => Some(Failure::ChallengeDenied),
-                "wrong_page" | "authentication_denied" => Some(Failure::AuthenticationDenied),
-                _ => None,
-            };
-            if let Some(denial) = denial {
-                app.sample_failure(denial);
+            // Explicit denials, deadlines and structural failures must retain
+            // their own meaning while the ordinary panel hides the composer.
+            if app.reject_terminal_ui_result(&ui.code) {
                 return Ok(());
             }
             // The panel hides positive identity controls. This branch records
@@ -1819,6 +1860,7 @@ impl App {
                     ui.code.as_str(),
                     "community_panel_open"
                         | "community_panel_waiting"
+                        | "community_panel_transition"
                         | "community_restore_clicked"
                 )
             {
@@ -1840,6 +1882,11 @@ impl App {
                         }
                     }
                     (PopoutPhase::AwaitingPanel, "community_panel_waiting") => (),
+                    (PopoutPhase::AwaitingPanel, "community_panel_transition")
+                        if app.panel_transition_allowed(generation) =>
+                    {
+                        ()
+                    }
                     (PopoutPhase::Restoring, "community_restore_clicked") => {
                         app.state.borrow_mut().begin_popout_revalidation();
                     }
@@ -1880,8 +1927,6 @@ impl App {
                 false
             };
             match ui.code.as_str() {
-                "community_restore_deadline" => app.end_auto_attempt("source_reverification_deadline", false),
-                "community_panel_unverified" | "unexpected_community_panel" | "community_restore_panel_mismatch" | "community_restore_control_unavailable" => app.fail("community_panel_unverified", "The expected ordinary Community panel or restore control could not be verified."),
                 "unexpected_popout_video" => app.fail(
                     "unexpected_popout_video",
                     "The chat-only page unexpectedly contains video. Collection is stopped.",
@@ -1967,7 +2012,9 @@ impl App {
                     match outcome {
                         Ok(()) => {
                             app.state.borrow_mut().trigger_pending = false;
-                            if popout { app.state.borrow_mut().popout_phase = PopoutPhase::AwaitingPanel; }
+                            if popout {
+                                app.state.borrow_mut().popout_phase = PopoutPhase::AwaitingPanel;
+                            }
                             app.try_body();
                         }
                         Err(code) => {
@@ -3611,6 +3658,83 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn opening_gap_cannot_accept_early_body_or_renew_the_round_if_the_panel_never_mounts() {
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 65);
+        let generation = app.state.borrow().generation;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        {
+            let mut state = app.state.borrow_mut();
+            state.source_page = SourcePage::PopoutChat;
+            state.player_gate = sampling::PlayerGate::for_page(SourcePage::PopoutChat);
+            state.popout_phase = PopoutPhase::AwaitingPanel;
+            state.armed_until = Some(deadline);
+            // A body callback can beat panel mounting. Its presence cannot
+            // turn an unobservable opening transition into acceptance.
+            state.pending_sample = Some((
+                crate::ParsedSample {
+                    count: 2,
+                    categories: Default::default(),
+                    accounts: Default::default(),
+                    roles: Default::default(),
+                },
+                BodyRequest {
+                    id: "early-body".into(),
+                    selection: crate::Selection {
+                        index: 0,
+                        batch_len: 1,
+                        batched: false,
+                        operation: "CommunityTab",
+                    },
+                    status: 200,
+                    provenance: sampling::Provenance::default(),
+                },
+                12_345,
+            ));
+        }
+        for _ in 0..3 {
+            assert!(app.panel_transition_allowed(generation));
+            assert!(!app.state.borrow().source_acceptance_ready());
+            assert_eq!(app.state.borrow().armed_until, Some(deadline));
+            assert_eq!(app.state.borrow().popout_phase, PopoutPhase::AwaitingPanel);
+            assert_eq!(
+                app.state.borrow().pending_sample.as_ref().unwrap().2,
+                12_345
+            );
+        }
+        for phase in [
+            PopoutPhase::Chat,
+            PopoutPhase::AwaitingBody,
+            PopoutPhase::Restoring,
+            PopoutPhase::Revalidating,
+        ] {
+            app.state.borrow_mut().popout_phase = phase;
+            assert!(!app.panel_transition_allowed(generation));
+        }
+        app.state.borrow_mut().popout_phase = PopoutPhase::AwaitingPanel;
+        app.state.borrow_mut().trigger_pending = true;
+        assert!(!app.panel_transition_allowed(generation));
+        app.state.borrow_mut().trigger_pending = false;
+        app.state.borrow_mut().armed_until = Some(Instant::now() - Duration::from_millis(1));
+        assert!(!app.panel_transition_allowed(generation));
+        app.tick();
+        assert!(app.state.borrow().pending_sample.is_none());
+        assert!(!app.is_active(generation));
+        app.finish_service(false);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 65,
+                outcome: Err(SourceFailure {
+                    code: "player_reverification_deadline",
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn hidden_panel_auth_cannot_accept_and_restoration_requires_new_stability_without_a_new_deadline(
     ) {
         let (_handle, app) = fixture();
@@ -3653,6 +3777,51 @@ mod lifecycle_tests {
             state.network_pending = !busy;
             assert!(!state.source_acceptance_ready());
         }
+    }
+
+    #[test]
+    fn expired_restore_is_a_deadline_failure_before_hidden_auth_is_evaluated() {
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 66);
+        {
+            let mut state = app.state.borrow_mut();
+            state.source_page = SourcePage::PopoutChat;
+            state.popout_phase = PopoutPhase::Restoring;
+            state.player_gate = sampling::PlayerGate::for_page(SourcePage::PopoutChat);
+            let ready = sampling::PlayerObservation {
+                signed_in: true,
+                chat_ready: true,
+                community_ready: true,
+                ..Default::default()
+            };
+            state.player_gate.observe(0, &ready, true).unwrap();
+            assert!(state.player_gate.observe(2_000, &ready, true).unwrap());
+            state.last_player_observation = Some(sampling::PlayerObservation {
+                community_ready: true,
+                ..Default::default()
+            });
+        }
+        assert!(app.reject_terminal_ui_result("community_restore_deadline"));
+        assert_eq!(
+            handle.fault_report().primary_failure.unwrap().code,
+            "source_reverification_deadline"
+        );
+        assert!(
+            !app.state.borrow().denied,
+            "A late restore is not an observed authentication denial."
+        );
+        app.finish_service(false);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted {
+                job_id: 66,
+                outcome: Err(SourceFailure {
+                    code: "source_reverification_deadline",
+                    pauses_community: false
+                }),
+                ..
+            })
+        ));
     }
 
     #[test]

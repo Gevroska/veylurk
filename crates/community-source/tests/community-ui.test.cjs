@@ -29,6 +29,7 @@ function fixture({
   editableChat = true,
   loginButton = false,
   panelOpen = false,
+  panelVisible = true,
   panelHeader = true,
   closeControl = true,
   closeDisabled = false,
@@ -78,7 +79,7 @@ function fixture({
     querySelectorAll(selector) {
       domReads++;
       if (selector === 'button,[role="tab"]') return buttons;
-      if (selector === "section.chat-viewers__container") return panelOpen ? [{
+      if (selector === "section.chat-viewers__container") return panelOpen && panelVisible ? [{
         getBoundingClientRect: () => ({ width: 200, height: 300 }),
         querySelector: selector => {
           assert.equal(selector, '[data-test-selector="chat-viewers__header"]');
@@ -104,13 +105,14 @@ function fixture({
       return challengeFrame ? {} : null;
     },
   };
-  function run({ click = true, allowPause = false, deadline = 2_000, panelExpected = false, restore = false, authRequired = panelExpected || restore } = {}) {
+  function run({ click = true, allowPause = false, deadline = 2_000, panelExpected = false, panelOpening = false, restore = false, authRequired = panelExpected || restore } = {}) {
     const script = source
       .replaceAll("__POPOUT__", String(popout))
       .replaceAll("__CHANNEL__", "strano")
       .replaceAll("__AUTOMATIC__", "true")
       .replaceAll("__AUTH_REQUIRED__", String(authRequired))
       .replaceAll("__PANEL_EXPECTED__", String(panelExpected))
+      .replaceAll("__PANEL_OPENING__", String(panelOpening))
       .replaceAll("__RESTORE_COMMUNITY__", String(restore))
       .replaceAll("__ALLOW_PAUSE__", String(allowPause))
       .replaceAll("__CLICK__", String(click))
@@ -124,6 +126,7 @@ function fixture({
   }
   return {
     run, clicks, domReads: () => domReads, panelOpen: () => panelOpen,
+    setPanelVisible(visible) { panelVisible = visible; },
     setLoginVisible(visible) {
       const index = buttons.indexOf(loginControl);
       if (visible && index < 0) buttons.push(loginControl);
@@ -210,6 +213,47 @@ test("actual Community panel hides authentication until one ordinary close resto
   assert.deepEqual(page.clicks, ["community", "close"]);
 });
 
+test("an acknowledged opener may hide the exact composer before the panel mounts without claiming auth", () => {
+  const page = popoutFixture({ signedIn: false, identity: true, panelVisible: false });
+  assert.equal(page.run().code, "native_community_clicked");
+  const opening = page.run({ click: false, panelExpected: true, panelOpening: true });
+  assert.equal(opening.code, "community_panel_transition");
+  assert.equal(opening.signed_in, false);
+  assert.equal(opening.chat_ready, false);
+  assert.deepEqual(page.clicks, ["community"]);
+  page.setPanelVisible(true);
+  assert.equal(page.run({ click: false, panelExpected: true }).code, "community_panel_open");
+  assert.equal(page.run({ click: false, restore: true }).code, "community_restore_clicked");
+  assert.equal(page.run({ click: false, authRequired: true }).signed_in, true);
+  assert.deepEqual(page.clicks, ["community", "close"]);
+});
+
+test("opening transition is rejected outside AwaitingPanel or without exact hidden continuity", () => {
+  const opening = { panelOpen: true, panelVisible: false };
+  assert.equal(popoutFixture(opening).run({ click: false, panelExpected: true }).code, "community_panel_unverified");
+  for (const missing of [{ identity: false }, { identityParent: false }, { identityDisabled: true }, { chatReady: false }, { editableChat: false }, { communityReady: false }]) {
+    const page = popoutFixture({ ...opening, ...missing });
+    assert.equal(page.run({ click: false, panelExpected: true, panelOpening: true }).code, "community_panel_unverified");
+    assert.deepEqual(page.clicks, []);
+  }
+  const malformed = popoutFixture({ panelOpen: true, panelHeader: false });
+  assert.equal(malformed.run({ click: false, panelExpected: true, panelOpening: true }).code, "community_panel_unverified");
+});
+
+test("explicit denial, wrong source or any video still fails during an opening gap", () => {
+  for (const [options, code] of [
+    [{ loginButton: true }, "authentication_denied"],
+    [{ challenge: true }, "challenge_denied"],
+    [{ challengeFrame: true }, "challenge_denied"],
+    [{ videos: [{ paused: true }] }, "unexpected_popout_video"],
+    [{ pathname: "/other" }, "wrong_page"],
+  ]) {
+    const page = popoutFixture({ panelOpen: true, panelVisible: false, ...options });
+    assert.equal(page.run({ click: false, panelExpected: true, panelOpening: true }).code, code);
+    assert.deepEqual(page.clicks, []);
+  }
+});
+
 test("an explicit Login immediately after ordinary close remains an authentication denial", () => {
   const page = popoutFixture({ signedIn: false, identity: true });
   assert.equal(page.run().code, "native_community_clicked");
@@ -257,7 +301,10 @@ test("panel denial, video, absent close control and failed restore cannot author
   assert.deepEqual(stuck.clicks, ["close"]);
   for (const deadline of [1_010, 1_009, NaN, Infinity]) {
     const expired = popoutFixture({ panelOpen: true });
-    assert.equal(expired.run({ click: false, restore: true, deadline }).code, "community_restore_deadline");
+    const result = expired.run({ click: false, restore: true, deadline });
+    assert.equal(result.code, "community_restore_deadline");
+    assert.equal(result.signed_in, false, "An expired restore reports the hidden composer without asserting auth loss.");
+    assert.equal(result.chat_ready, false);
     assert.deepEqual(expired.clicks, []);
   }
 });
