@@ -2,6 +2,57 @@
 
 The owner requests short, intensive measurements with many channels, followed by optimization of the largest measured costs. Long reliability trials are owner-managed and are not a delivery gate for this performance work.
 
+## Community query and chart optimization
+
+Account-and-channel receipt searches use a dedicated non-unique index on
+`(account,channel,id,sample_id)`. Account-only and channel-only searches retain
+their existing access paths. The combined query seeks both logins and the
+exclusive member cursor before applying the original sample/time predicates.
+Ordering, lookahead and returned evidence are unchanged.
+
+The sample-member index retains its name and `(sample_id,id)` ordering prefix,
+with `roles` appended for covering reads. Model counts still use actual member
+rows and exact `roles=32`; declared sample totals or cached aggregates do not
+replace validation. Initialization accepts only the known old/covering index
+definitions, checking ownership, flags, columns, direction, collation and
+auxiliary rowid. Index replacement and recovery share one transaction. Unknown
+definitions fail before retained changes; reopening the covering layout needs
+no index DDL. These compatible access paths retain logical Community schema v2
+and the released v1/v2 definitions.
+
+Each model lane retains all of its exact point records but paints at most four
+classification paths. Every original cell remains a separate clipped rectangle
+subpath, including unknown regions. Numeric timestamps are cached after full
+response validation; keyboard/pointer inspection and historical-title lookup
+retain the original evaluation timestamps. This reduces chart elements without
+reducing model resolution or changing the meaning of a colored cell.
+
+Lag variants with identical transition/detection/prior parameters reuse one
+segment smoother. Each lag keeps separate support, boundary and probability
+workspaces and its original scenario identity. Processing one group at a time
+retains at most two cell workspaces and one segment smoother, rather than
+caching every scenario/segment. The 65-scenario default, pointwise thresholds,
+unknown periods, cancellation, deadlines and input limits remain unchanged.
+
+Candidate performance acceptance uses independent byte-identical copies of the
+same closed synthetic database: 50 tracked channels, four untracked historical
+diagnostic channels, 37,000 samples and 4,101,000 member rows. No collection or
+credentials are enabled. Compare release binaries on the same host with one
+HTTP warmup and five measured requests per case (three for 25,000 samples).
+Report medians/ranges, actual process CPU, memory and response bytes separately.
+Compare complete historical responses after excluding only `generated_at`;
+probabilities, classes, bounds, counts and pagination must remain identical.
+
+Browser measurements compare one and eight model lanes using the same ten-minute
+query and three cached zoom/reset cycles. Page task/script metrics include
+automation and layout work; they exclude the later accessibility snapshot and
+GPU paint. Count painted model elements and retain inspection/geometry checks.
+Record index space and a separately labelled completion-write SQL proxy as
+tradeoffs. SQL-stage timings and shared-runner checks are not full-application
+speedups. Native results and artifact identifiers belong to the candidate's
+verification record; source changes alone do not establish a gain. Production
+databases and running production processes are outside these measurements.
+
 ## Local measurement harness
 
 The `veylurk-perf-bench-windows-x64` Windows artifact contains an offline executable. It opens no network connection, reads no Twitch credentials, and refuses every existing output directory. Its parent directory must already exist.

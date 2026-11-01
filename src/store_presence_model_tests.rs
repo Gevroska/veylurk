@@ -172,15 +172,70 @@ async fn sql_plans_seek_time_primary_key_and_sample_member_indexes() {
                 .query_map([1], |r| r.get::<_, String>(3))?
                 .collect::<Result<Vec<_>, _>>()?;
             assert!(
-                plans
-                    .iter()
-                    .any(|p| p.contains("community_members_sample_member (sample_id=?)")),
+                plans.iter().any(|p| p.contains(
+                    "USING COVERING INDEX community_members_sample_member (sample_id=?)"
+                )),
+                "{plans:?}"
+            );
+            assert!(
+                plans.iter().all(|p| !p.contains("TEMP B-TREE")),
                 "{plans:?}"
             );
             Ok(())
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn covering_member_counts_remain_exact_and_sample_cursor_pages_need_no_sort() {
+    let _serial = test_serial_guard().await;
+    let (_directory, store) = fixture().await;
+    store.call_write(Operation::CommunityAppend, |conn| {
+        conn.execute_batch("UPDATE community_members SET roles=4 WHERE sample_id=2 AND account='bob';
+            UPDATE community_members SET roles=CASE account WHEN 'carol' THEN 36 ELSE 4 END WHERE sample_id=3;
+            UPDATE community_members SET roles=CASE account WHEN 'alice' THEN 63 ELSE 1 END WHERE sample_id=4;
+            DELETE FROM community_members WHERE sample_id=5;
+            DELETE FROM community_members WHERE sample_id=6 AND account='bob';")?;
+        // Appending a covering key must not weaken the independent sample/account uniqueness.
+        assert!(conn.execute("INSERT INTO community_members(sample_id,channel,account,roles) VALUES(1,'room','alice',4)", []).is_err());
+        Ok(())
+    }).await.unwrap();
+    store.call_read(Operation::Query, |conn| {
+        let expected = [(2_i64, 2_i64), (2, 1), (2, 0), (2, 0), (0, 0), (1, 1)];
+        let mut counts = conn.prepare(MEMBER_COUNTS_SQL)?;
+        for (offset, expected) in expected.iter().enumerate() {
+            let actual = counts.query_row([offset as i64 + 1], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            assert_eq!(actual, *expected);
+        }
+        drop(counts);
+        let input = extract(
+            conn,
+            "room",
+            "alice",
+            "2024-01-01T00:00:00.000Z",
+            "2024-01-01T00:06:00.000Z",
+            &AtomicBool::new(false),
+        )?;
+        assert_eq!(input.samples.iter().map(|sample| (sample.unique_members, sample.viewer_only)).collect::<Vec<_>>(), expected);
+
+        // The added roles column follows the existing pagination keys, preserving their order.
+        let sql = "SELECT id,roles FROM community_members INDEXED BY community_members_sample_member WHERE sample_id=?1 AND id<?2 ORDER BY id DESC LIMIT 1";
+        let mut statement = conn.prepare(sql)?;
+        let first: (i64, i64) = statement.query_row(params![1, i64::MAX], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let second: (i64, i64) = statement.query_row(params![1, first.0], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        assert_eq!((first, second), ((2, 32), (1, 32)));
+        assert_eq!(statement.get_status(rusqlite::StatementStatus::Sort), 0);
+        assert_eq!(statement.get_status(rusqlite::StatementStatus::FullscanStep), 0);
+        let plans = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+            .query_map(params![1, i64::MAX], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(plans.iter().any(|plan| plan.contains("USING COVERING INDEX community_members_sample_member (sample_id=? AND id<?)")), "{plans:?}");
+        assert!(plans.iter().all(|plan| !plan.contains("TEMP B-TREE")), "{plans:?}");
+        Ok(())
+    }).await.unwrap();
 }
 
 fn capped_fixture(conn: &mut Connection, count: i64, returned: i64) -> Result<(), StoreError> {

@@ -430,3 +430,347 @@ async fn admission_remains_held_by_actual_work_after_request_cancellation() {
     drop(held_by_job);
     assert!(try_permit().is_some());
 }
+
+fn assert_lag_reuse_equivalent(expected: &PresenceModelResponse, actual: &PresenceModelResponse) {
+    assert_eq!(actual.status, expected.status);
+    assert_eq!(actual.complete, expected.complete);
+    assert_eq!(actual.sensitivity_scenarios, expected.sensitivity_scenarios);
+    assert_eq!(
+        actual.cell_width_seconds.to_bits(),
+        expected.cell_width_seconds.to_bits()
+    );
+    assert_eq!(actual.cells.len(), expected.cells.len());
+    for (index, (actual, expected)) in actual.cells.iter().zip(&expected.cells).enumerate() {
+        assert_eq!(
+            actual.classification, expected.classification,
+            "cell {index}"
+        );
+        assert_eq!(
+            actual.unknown_reason, expected.unknown_reason,
+            "cell {index}"
+        );
+        for (actual, expected) in [
+            (actual.presence_probability, expected.presence_probability),
+            (actual.sensitivity_min, expected.sensitivity_min),
+            (actual.sensitivity_max, expected.sensitivity_max),
+        ] {
+            assert_eq!(
+                actual.map(f64::to_bits),
+                expected.map(f64::to_bits),
+                "cell {index}"
+            );
+        }
+    }
+    assert!(
+        serde_json::to_value(actual).unwrap() == serde_json::to_value(expected).unwrap(),
+        "full response differs from the frozen scenario-by-scenario algorithm"
+    );
+}
+
+#[test]
+fn lag_reuse_matches_frozen_passes_bit_for_bit_across_counts_gaps_and_clock_overlap() {
+    for complex in [false, true] {
+        let times: Vec<(f64, i64)> = if complex {
+            vec![
+                (-180., 1),
+                (-120., 1),
+                (-60., 1),
+                (0., 1),
+                (60., 1),
+                (120., 1),
+                (180., 1),
+                (240., 1),
+                (300., 1),
+                (360., 1),
+                (420., 1),
+                (300., 1),
+                (360., 1),
+                (420., 1),
+                (480., 1),
+                (5000., 1),
+                (5060., 1),
+                (5120., 1),
+                (5180., 2),
+                (5240., 2),
+                (5300., 2),
+            ]
+        } else {
+            (0..20).map(|i| (i as f64 * 60., 1)).collect()
+        };
+        let samples: Vec<_> = times
+            .into_iter()
+            .enumerate()
+            .map(|(i, (at, run))| {
+                let mut row = sample(i as i64, complex || !(4..14).contains(&i));
+                let stamp = format_time(BASE + at + 0.125).unwrap();
+                row.started = stamp.clone();
+                row.completed = Some(stamp.clone());
+                row.received = Some(stamp);
+                row.run_id = run;
+                row.reported = Some(50 + i as i64 * 37);
+                let viewers = 1 + (i % 5) as i64;
+                row.returned = Some(viewers);
+                row.unique_members = viewers;
+                row.viewer_only = viewers;
+                row.categories[5] = Some(viewers);
+                if complex && i == 6 {
+                    row.outcome = "failed".into();
+                    row.received = None;
+                    row.target_roles = None;
+                }
+                row
+            })
+            .collect();
+        for lag in [0., 30., 17.125, 300.] {
+            let make_response = || {
+                let mut result = response(-240.25, if complex { 5400.125 } else { 1200.125 });
+                result.parameters.lag_seconds = lag;
+                if complex {
+                    // Clipped sensitivity corners still retain every distinct scenario.
+                    result.parameters.detection_scale = 0.05;
+                    result.parameters.false_report_ratio = 0.1;
+                }
+                result
+            };
+            let expected =
+                analyze_before_lag_reuse(make_response(), input(samples.clone()), control());
+            let actual = analyze(make_response(), input(samples.clone()), control());
+            assert_eq!(actual.status, PresenceStatus::Ok);
+            if !complex || lag <= 30. {
+                assert!(actual
+                    .cells
+                    .iter()
+                    .any(|cell| cell.presence_probability.is_some()));
+            }
+            assert!(actual
+                .cells
+                .iter()
+                .any(|cell| cell.classification == PresenceClassification::Unknown));
+            assert_lag_reuse_equivalent(&expected, &actual);
+        }
+    }
+}
+
+#[test]
+fn lag_reuse_preserves_early_outcomes_boundary_cells_and_numerical_non_support() {
+    for case in 0..7 {
+        let make_response = || {
+            let mut result = if case == 4 {
+                response(-30., -29.999)
+            } else {
+                response(-60., 360.)
+            };
+            if case == 5 {
+                // The public query rejects this value; exercise the internal numerical failure path.
+                result.parameters.false_report_ratio = f64::MAX;
+            }
+            result
+        };
+        let make_input = || {
+            let mut rows: Vec<_> = (0..6).map(|i| sample(i, i != 2)).collect();
+            match case {
+                0 => rows.clear(),
+                1 => rows.truncate(2),
+                2 => rows[1].target_roles = Some(36),
+                4 => rows = (-3..0).map(|i| sample(i, true)).collect(),
+                _ => {}
+            }
+            let mut result = input(rows);
+            result.limit = case == 3;
+            result.cancelled = case == 6;
+            result
+        };
+        let expected = analyze_before_lag_reuse(make_response(), make_input(), control());
+        let actual = analyze(make_response(), make_input(), control());
+        if case == 5 {
+            assert_eq!(actual.status, PresenceStatus::Ok);
+            assert!(actual
+                .cells
+                .iter()
+                .all(|cell| cell.classification == PresenceClassification::Unknown));
+        }
+        assert_lag_reuse_equivalent(&expected, &actual);
+    }
+}
+
+#[test]
+fn lag_reuse_builds_one_smoother_per_model_without_dropping_scenarios() {
+    for lag in [0., 30., 17.125] {
+        let make_response = || {
+            let mut result = response(60., 241.);
+            result.parameters.lag_seconds = lag;
+            result
+        };
+        let make_input = || input((0..5).map(|i| sample(i, true)).collect());
+        SMOOTHER_BUILDS.with(|count| count.set(0));
+        let expected = analyze_before_lag_reuse(make_response(), make_input(), control());
+        let old_builds = SMOOTHER_BUILDS.with(|count| count.get());
+        SMOOTHER_BUILDS.with(|count| count.set(0));
+        let actual = analyze(make_response(), make_input(), control());
+        let new_builds = SMOOTHER_BUILDS.with(|count| count.get());
+        assert_eq!(old_builds, if lag == 0. { 33 } else { 65 });
+        assert_eq!(new_builds, 33);
+        assert_eq!(actual.sensitivity_scenarios, old_builds);
+        assert_lag_reuse_equivalent(&expected, &actual);
+    }
+    let stop = Control {
+        cancelled: Arc::new(AtomicBool::new(true)),
+        deadline: Instant::now() + StdDuration::from_secs(2),
+    };
+    assert!(group_scenarios(&scenarios(parameters()), &stop).is_err());
+}
+
+// Frozen pre-optimization algorithm from dd81ebea: keep scenario passes independent here.
+fn analyze_before_lag_reuse(
+    mut response: PresenceModelResponse,
+    input: Extraction,
+    control: Control,
+) -> PresenceModelResponse {
+    response.sensitivity_scenarios = 0;
+    response.sample_counts.successful_in_context = input.successful;
+    response.sample_counts.attempts_in_id_span = input.samples.len();
+    if input.limit {
+        return response.incomplete(PresenceStatus::InputLimit);
+    }
+    if input.cancelled || control.stopped() {
+        return response.incomplete(PresenceStatus::AnalysisTimeout);
+    }
+    let segments = match segments(&input, &mut response, &control) {
+        Ok(value) => value,
+        Err(()) => return response.incomplete(PresenceStatus::AnalysisTimeout),
+    };
+    if response.status == PresenceStatus::RoleUnsupported {
+        return response;
+    }
+    if input.successful == 0 {
+        return response;
+    }
+    if segments.is_empty() {
+        response.status = PresenceStatus::InsufficientData;
+        return response;
+    }
+    let (Ok(from), Ok(to)) = (
+        parse_time(&response.effective_range.from),
+        parse_time(&response.effective_range.to),
+    ) else {
+        return response.incomplete(PresenceStatus::AnalysisTimeout);
+    };
+    if from >= to {
+        return response;
+    }
+    // Millisecond input bounds need no finer cell density; microsecond output keeps
+    // every midpoint distinct from its edges even for the shortest valid viewport.
+    let count = MAX_CELLS.min(((to - from) * 1_000.).floor().max(1.) as usize);
+    let width = (to - from) / count as f64;
+    response.cell_width_seconds = width;
+    let mut central = vec![None; count];
+    let mut minimum = vec![1_f64; count];
+    let mut maximum = vec![0_f64; count];
+    let mut supported = vec![true; count];
+    let scenarios = scenarios(response.parameters);
+    let scenario_count = scenarios.len();
+    for (scenario_index, scenario) in scenarios.into_iter().enumerate() {
+        if control.stopped() {
+            return response.incomplete(PresenceStatus::AnalysisTimeout);
+        }
+        let mut probabilities = vec![None; count];
+        let mut matches = vec![0_u8; count];
+        let mut boundary = vec![false; count];
+        for observations in &segments {
+            if control.stopped() {
+                return response.incomplete(PresenceStatus::AnalysisTimeout);
+            }
+            let start = observations[0].at - scenario.lag;
+            let end = observations.last().unwrap().at - scenario.lag;
+            for edge in [start, end] {
+                if edge > from && edge < to {
+                    let index = ((edge - from) / width).floor().min((count - 1) as f64) as usize;
+                    if from + index as f64 * width < edge
+                        && edge < from + (index + 1) as f64 * width
+                    {
+                        boundary[index] = true;
+                    }
+                }
+            }
+            let first = ((start - from) / width).ceil().clamp(0., count as f64) as usize;
+            let last = ((end - from) / width).floor().clamp(0., count as f64) as usize;
+            if first >= last {
+                continue;
+            }
+            let Some(smoother) = Smoother::new(observations, scenario, &control) else {
+                if control.stopped() {
+                    return response.incomplete(PresenceStatus::AnalysisTimeout);
+                }
+                // Unsupported numerical scenarios never contribute an invented probability.
+                continue;
+            };
+            for index in first..last {
+                if index.is_multiple_of(64) && control.stopped() {
+                    return response.incomplete(PresenceStatus::AnalysisTimeout);
+                }
+                let left = from + index as f64 * width;
+                let right = from + (index + 1) as f64 * width;
+                if left < start || right > end {
+                    continue;
+                }
+                matches[index] = matches[index].saturating_add(1);
+                probabilities[index] = smoother.at(
+                    observations,
+                    scenario,
+                    from + (index as f64 + 0.5) * width + scenario.lag,
+                );
+            }
+        }
+        for index in 0..count {
+            if matches[index] != 1 || boundary[index] {
+                supported[index] = false;
+                continue;
+            }
+            let Some(probability) = probabilities[index] else {
+                supported[index] = false;
+                continue;
+            };
+            if scenario_index == 0 {
+                central[index] = Some(probability);
+            }
+            minimum[index] = minimum[index].min(probability);
+            maximum[index] = maximum[index].max(probability);
+        }
+    }
+    response.sensitivity_scenarios = scenario_count;
+    for index in 0..count {
+        if control.stopped() {
+            return response.incomplete(PresenceStatus::AnalysisTimeout);
+        }
+        let fields = [
+            from + index as f64 * width,
+            from + (index + 1) as f64 * width,
+            from + (index as f64 + 0.5) * width,
+        ]
+        .map(format_time);
+        let [Ok(from), Ok(to), Ok(evaluated_at)] = fields else {
+            return response.incomplete(PresenceStatus::AnalysisTimeout);
+        };
+        let valid = supported[index] && central[index].is_some();
+        response.cells.push(PresenceCell {
+            from,
+            to,
+            evaluated_at,
+            presence_probability: if valid { central[index] } else { None },
+            sensitivity_min: valid.then_some(minimum[index]),
+            sensitivity_max: valid.then_some(maximum[index]),
+            classification: if !valid {
+                PresenceClassification::Unknown
+            } else if minimum[index] >= 0.99 {
+                PresenceClassification::EstimatedPresent
+            } else if maximum[index] <= 0.01 {
+                PresenceClassification::EstimatedAbsent
+            } else {
+                PresenceClassification::Uncertain
+            },
+            unknown_reason: (!valid).then_some("outside_support_or_segment_boundary"),
+        });
+    }
+    response.status = PresenceStatus::Ok;
+    response
+}

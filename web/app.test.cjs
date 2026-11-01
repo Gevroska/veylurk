@@ -73,7 +73,7 @@ async function settle() { for (let i = 0; i < 5; i += 1) await new Promise(setIm
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
 function event(id, account = "sample_account") { return { id, session_id: 1, account, channel: "sample_channel", kind: "join", received_at: received, source: "twitch_irc" }; }
 
-function createApp(override, origin = "http://127.0.0.1:3131") {
+function createApp(override, origin = "http://127.0.0.1:3131", date = Date) {
   const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)].map((match) => {
     const element = new Element(match[1]); element.id = match[2];
     for (const attribute of match[0].matchAll(/\s([a-z][a-z0-9-]*)(?:="([^"]*)")?/g)) {
@@ -122,7 +122,7 @@ function createApp(override, origin = "http://127.0.0.1:3131") {
     return { observations: [], next_before: null };
   };
   const context = vm.createContext({
-    document, location, Node: Element, URL, URLSearchParams, Intl, Date, Set, Number, Error, TypeError, AbortController,
+    document, location, Node: Element, URL, URLSearchParams, Intl, Date: date, Set, Number, Error, TypeError, AbortController,
     window: { addEventListener(name, callback) { windowListeners.set(name, [...(windowListeners.get(name) || []), callback]); } },
     setInterval() { return 1; },
     setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, at: now + delay }); return id; },
@@ -1750,7 +1750,18 @@ function communityModel(target, extra = {}) {
   };
 }
 const modelCalls = (app) => app.calls.filter((call) => call.target.pathname === "/api/community/presence");
-const modelCells = (app, prefix = "timeline") => descendants(app.get(prefix + "-results")).filter((item) => item.classList.contains("timeline-model-cell"));
+const modelShapes = (app, prefix = "timeline") => descendants(app.get(prefix + "-results")).filter((item) => item.classList.contains("timeline-model-cell"));
+// Decode the painted rectangle subpaths so existing cell-count and clipping checks
+// still assert every original display cell, rather than only the grouped DOM count.
+const modelCells = (app, prefix = "timeline") => modelShapes(app, prefix).flatMap((shape) => {
+  const commands = [...shape.attributes.d.matchAll(/M([^,]+),([^H]+)H([^V]+)V([^H]+)H([^Z]+)Z/g)];
+  assert.equal(commands.map((command) => command[0]).join(""), shape.attributes.d);
+  return commands.map(([, left, top, right, bottom, close]) => {
+    const [x, y, end, lower, closedX] = [left, top, right, bottom, close].map(Number);
+    assert.ok([x, y, end, lower, closedX].every(Number.isFinite)); assert.equal(closedX, x);
+    return { classList: shape.classList, listeners: shape.listeners, attributes: { ...shape.attributes, x, y, width: end - x, height: lower - y } };
+  });
+});
 const modelControl = (app, key, prefix = "timeline") => descendants(app.get(prefix + "-results")).find((item) => item.id === prefix + "-model-" + key);
 async function searchModel(app, channel = "", source = "all") {
   await settle(); app.navigate("history"); app.get("search-account").value = "sample_account"; app.get("search-channel").value = channel; app.get("search-source").value = source;
@@ -1917,20 +1928,95 @@ test("Community model selected-broadcast request uses the resolved half-open bou
   assert.equal(title.target.searchParams.get("broadcast_id"), "9"); assert.equal(title.target.searchParams.get("at"), communityModel(target).cells[0].evaluated_at);
 });
 
-test("Community model 2048-cell rendering keeps one inspector and no per-cell listeners or tables, using theme tokens and distinct patterns", async () => {
+test("Community model paints 2048 exact cells in four paths with one inspector, using theme tokens and distinct patterns", async () => {
+  let returned;
   const app = createApp((target) => {
     if (target.pathname !== "/api/community/presence") return;
     const result = communityModel(target), from = Date.parse(result.effective_range.from), to = Date.parse(result.effective_range.to);
-    result.cells = Array.from({ length: 2048 }, (_, index) => { const left = Math.round(from + (to - from) * index / 2048), right = Math.round(from + (to - from) * (index + 1) / 2048); return { ...result.cells[2], from: new Date(left).toISOString(), to: new Date(right).toISOString(), evaluated_at: new Date(Math.floor(left + (right - left) / 2)).toISOString() }; });
-    result.cell_width_seconds = (to - from) / 2048000; return result;
+    result.cells = Array.from({ length: 2048 }, (_, index) => { const left = Math.round(from + (to - from) * index / 2048), right = Math.round(from + (to - from) * (index + 1) / 2048); return { ...result.cells[index % 4], from: new Date(left).toISOString(), to: new Date(right).toISOString(), evaluated_at: new Date(Math.floor(left + (right - left) / 2)).toISOString() }; });
+    result.cell_width_seconds = (to - from) / 2048000; returned = result; return result;
   });
   await searchModel(app, "sample_channel"); assert.equal(modelCells(app).length, 2048);
+  assert.equal(modelShapes(app).length, 4);
   assert.equal(descendants(timelineChart(app)).filter((item) => item.classList.contains("timeline-model-inspector")).length, 1);
   assert.ok(modelCells(app).every((item) => item.listeners.size === 0 && item.attributes.tabindex === undefined));
+  const painted = modelCells(app).sort((left, right) => left.attributes.x - right.attributes.x);
+  for (const [index, cell] of returned.cells.entries()) {
+    assert.ok(painted[index].classList.contains(cell.classification));
+    assert.ok(Math.abs(painted[index].attributes.x - (180 + 790 * (Date.parse(cell.from) - Date.parse(timelineFrom)) / (Date.parse(timelineTo) - Date.parse(timelineFrom)))) < 1e-9);
+  }
+  const inspector = timelineElement(app, "timeline-model-inspector");
+  for (const key of ["End", "ArrowLeft", "Home"]) {
+    await inspector.dispatch("keydown", { key }); await app.advance(180);
+    const index = key === "End" ? 2047 : key === "ArrowLeft" ? 2046 : 0;
+    assert.equal(app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1).target.searchParams.get("at"), returned.cells[index].evaluated_at);
+  }
+  await inspector.dispatch("pointermove", mouseAt(180 + 790 * 1024.25 / 2048, 114)); await app.advance(180);
+  assert.equal(app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1).target.searchParams.get("at"), returned.cells[1024].evaluated_at);
   const patterns = descendants(timelineChart(app)).filter((item) => item.tagName === "PATTERN"); assert.equal(patterns.length, 5);
   assert.match(stylesheet, /\.model-pattern-background\.estimated_present\s*\{\s*fill: var\(--good\)/);
   assert.match(stylesheet, /\.model-pattern-background\.estimated_absent\s*\{\s*fill: var\(--bad\)/);
   assert.match(stylesheet, /@media \(max-width: 600px\)[\s\S]*?\.model-assumptions-form\s*\{\s*grid-template-columns: minmax\(0, 1fr\)/);
+});
+
+test("Community grouped paths preserve clipped microsecond geometry and unknown gaps without reparsing cached cell times", async () => {
+  const parsed = new Map();
+  class CountingDate extends Date {
+    static parse(value) { parsed.set(value, (parsed.get(value) || 0) + 1); return Date.parse(value); }
+  }
+  const base = Date.parse(timelineFrom), duration = Date.parse(timelineTo) - base;
+  const micros = (offset) => new Date(base + Math.floor(offset / 1000)).toISOString().slice(0, -1) + String(offset % 1000).padStart(3, "0") + "Z";
+  let original, numeric;
+  const app = createApp((target) => {
+    if (target.pathname !== "/api/community/presence") return;
+    const result = communityModel(target), order = [0, 3, 0, 1, 3, 2, 0];
+    numeric = order.map((_, index) => {
+      const from = Math.floor(duration * 1000 * index / order.length), to = Math.floor(duration * 1000 * (index + 1) / order.length);
+      return { from, to, at: Math.floor(from + (to - from) / 2) };
+    });
+    result.cells = order.map((state, index) => ({ ...result.cells[state], from: micros(numeric[index].from), to: micros(numeric[index].to), evaluated_at: micros(numeric[index].at) }));
+    result.cell_width_seconds = duration / order.length / 1000; original = result.cells; return result;
+  }, undefined, CountingDate);
+  await searchModel(app, "sample_channel");
+  const times = new Set(original.flatMap((point) => [point.from, point.to, point.evaluated_at]));
+  const reads = [...times].map((time) => [time, parsed.get(time)]);
+  for (const point of original) assert.equal(parsed.get(point.evaluated_at), 1);
+  function geometry(from, to) {
+    const painted = modelCells(app).sort((left, right) => left.attributes.x - right.attributes.x);
+    const expected = numeric.map((point, index) => ({ point, index, left: Math.max(from, base + point.from / 1000), right: Math.min(to, base + point.to / 1000) })).filter((point) => point.right > point.left);
+    assert.equal(painted.length, expected.length); assert.ok(modelShapes(app).length <= 4);
+    for (const [index, value] of expected.entries()) {
+      const cell = painted[index], left = 180 + 790 * (value.left - from) / (to - from), right = 180 + 790 * (value.right - from) / (to - from);
+      assert.ok(cell.classList.contains(original[value.index].classification));
+      assert.ok(Math.abs(cell.attributes.x - left) < 1e-7); assert.ok(Math.abs(cell.attributes.width - (right - left)) < 1e-7);
+      assert.equal(cell.attributes.height, 24); assert.ok(cell.attributes.x >= 180 && cell.attributes.x + cell.attributes.width <= 970.000001);
+    }
+    return expected;
+  }
+  geometry(base, base + duration);
+  assert.equal(modelCells(app).filter((cell) => cell.classList.contains("estimated_present")).length, 3);
+  assert.equal(modelCells(app).filter((cell) => cell.classList.contains("unknown")).length, 2);
+  await timelineButton(app, "Zoom in").dispatch("click");
+  const from = base + duration / 4, to = base + duration * 3 / 4, visible = geometry(from, to);
+  assert.equal(visible.length, 5); // Both viewport edges cut through original cells.
+  let inspector = timelineElement(app, "timeline-model-inspector");
+  for (const value of visible) {
+    const at = value.left + (value.right - value.left) / 2;
+    await inspector.dispatch("pointermove", mouseAt(180 + 790 * (at - from) / (to - from), 114)); await app.advance(180);
+    const point = original[value.index];
+    assert.equal(app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1).target.searchParams.get("at"), point.evaluated_at);
+    assert.match(inspector.attributes["aria-label"], new RegExp(point.classification === "unknown" ? "No supported probability" : `P\\(present\\)=${point.presence_probability}`));
+    const cursor = timelineElement(app, "timeline-model-midpoint"), evaluated = base + value.point.at / 1000;
+    assert.ok(Math.abs(Number(cursor.attributes.x1) - (180 + 790 * (evaluated - from) / (to - from))) < 1e-7);
+    assert.equal(cursor.attributes.visibility, evaluated >= from && evaluated < to ? "visible" : "hidden");
+  }
+  await inspector.dispatch("keydown", { key: "Home" }); await app.advance(180);
+  assert.equal(app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1).target.searchParams.get("at"), original[visible[0].index].evaluated_at);
+  await timelineButton(app, "Reset zoom").dispatch("click"); geometry(base, base + duration);
+  inspector = timelineElement(app, "timeline-model-inspector"); await inspector.dispatch("keydown", { key: "End" }); await app.advance(180);
+  assert.equal(app.calls.filter((call) => call.target.pathname.endsWith("/metadata/at")).at(-1).target.searchParams.get("at"), original.at(-1).evaluated_at);
+  assert.deepEqual([...times].map((time) => [time, parsed.get(time)]), reads);
+  assert.equal(modelCalls(app).length, 1);
 });
 
 

@@ -993,17 +993,19 @@
   function validateCommunityModel(data, query, channel, parameters) {
     const invalid = () => { throw new Error("The local app returned an invalid or mismatched Community model response. No estimates are drawn."); };
     const range = data.effective_range;
-    if (data.model_version !== "community_presence_v1" || data.calibration_status !== "uncalibrated" || data.probability_kind !== "model_based_pointwise" || data.inference !== "historical_smoother" || data.threshold !== 0.99 || data.left_censored !== true || data.account !== query.account || data.channel !== channel || (query.broadcast_id != null && data.broadcast_id !== query.broadcast_id) || !range || modelInstant(range.from) !== modelInstant(query.from) || modelInstant(range.to) !== modelInstant(query.to)) invalid();
+    const rangeStart = modelInstant(query.from), rangeEnd = modelInstant(query.to);
+    if (data.model_version !== "community_presence_v1" || data.calibration_status !== "uncalibrated" || data.probability_kind !== "model_based_pointwise" || data.inference !== "historical_smoother" || data.threshold !== 0.99 || data.left_censored !== true || data.account !== query.account || data.channel !== channel || (query.broadcast_id != null && data.broadcast_id !== query.broadcast_id) || !range || modelInstant(range.from) !== rangeStart || modelInstant(range.to) !== rangeEnd) invalid();
     if (!data.context_range || !Number.isFinite(Date.parse(data.context_range.from)) || !Number.isFinite(Date.parse(data.context_range.to)) || !Number.isFinite(Date.parse(data.as_of)) || !Number.isFinite(Date.parse(data.generated_at))) invalid();
     if (typeof data.complete !== "boolean" || !Object.hasOwn(modelStatuses, data.status) || !Array.isArray(data.cells) || data.cells.length > 2048 || !Number.isInteger(data.sensitivity_scenarios) || data.sensitivity_scenarios < 0 || data.sensitivity_scenarios > 65) invalid();
     if (!data.parameters || modelFields.some(([key]) => data.parameters[key] !== parameters[key])) invalid();
     if (!data.sample_counts || modelCounters.some(([key]) => !Number.isSafeInteger(data.sample_counts[key]) || data.sample_counts[key] < 0)) invalid();
     if (!data.excluded_reason_counts || Array.isArray(data.excluded_reason_counts) || Object.entries(data.excluded_reason_counts).length > 32 || Object.entries(data.excluded_reason_counts).some(([key, value]) => !/^[a-z][a-z0-9_]{0,80}$/.test(key) || !Number.isSafeInteger(value) || value < 0)) invalid();
-    if (!data.complete || data.status !== "ok") { if (data.cells.length || data.status === "ok") invalid(); return data; }
-    let previous = modelInstant(query.from);
+    if (!data.complete || data.status !== "ok") { if (data.cells.length || data.status === "ok") invalid(); return { data, points: [] }; }
+    const points = [];
+    let previous = rangeStart;
     for (const cell of data.cells) {
       const from = modelInstant(cell.from), to = modelInstant(cell.to), at = modelInstant(cell.evaluated_at);
-      if (!Number.isFinite(from) || !Number.isFinite(to) || !Number.isFinite(at) || from !== previous || to <= from || to > modelInstant(query.to) || at < from || at >= to || Math.abs(at - (from + (to - from) / 2)) > 1 || !Object.hasOwn(modelClasses, cell.classification)) invalid();
+      if (!Number.isFinite(from) || !Number.isFinite(to) || !Number.isFinite(at) || from !== previous || to <= from || to > rangeEnd || at < from || at >= to || Math.abs(at - (from + (to - from) / 2)) > 1 || !Object.hasOwn(modelClasses, cell.classification)) invalid();
       const values = [cell.presence_probability, cell.sensitivity_min, cell.sensitivity_max];
       if (cell.classification === "unknown") { if (values.some((value) => value !== null)) invalid(); }
       else {
@@ -1011,10 +1013,12 @@
         if (cell.classification === "estimated_present" && cell.sensitivity_min < 0.99 - 1e-12 || cell.classification === "estimated_absent" && cell.sensitivity_max > 0.01 + 1e-12) invalid();
       }
       if (cell.unknown_reason != null && (typeof cell.unknown_reason !== "string" || cell.unknown_reason.length > 100)) invalid();
+      points.push({ cell, from, to, at });
       previous = to;
     }
-    if (!data.cells.length || data.sensitivity_scenarios < 1 || previous !== modelInstant(query.to) || !Number.isFinite(data.cell_width_seconds) || data.cell_width_seconds <= 0) invalid();
-    return data;
+    if (!data.cells.length || data.sensitivity_scenarios < 1 || previous !== rangeEnd || !Number.isFinite(data.cell_width_seconds) || data.cell_width_seconds <= 0) invalid();
+    // Publish parsed times only after the entire response passes validation.
+    return { data, points };
   }
 
   function modelPointText(channel, point) {
@@ -1147,7 +1151,7 @@
           try {
             const response = await api(url("/api/community/presence", { account: query.account, channel: query.broadcast_id ? undefined : channel, broadcast_id: query.broadcast_id, from: query.from, to: query.to, ...query.modelParameters }), { signal: controller.signal });
             if (!currentModel(generation)) return;
-            cache.results.set(channel, { data: validateCommunityModel(response, query, channel, query.modelParameters) });
+            cache.results.set(channel, validateCommunityModel(response, query, channel, query.modelParameters));
           } catch (error) {
             if (!currentModel(generation)) return;
             cache.results.set(channel, { error: failure(error) });
@@ -1399,30 +1403,36 @@
           const model = entry && entry.data;
           if (!model || !model.complete || model.status !== "ok") continue;
           const points = [];
-          for (const point of model.cells) {
-            const left = Math.max(start, modelInstant(point.from)), right = Math.min(end, modelInstant(point.to));
+          const paths = new Map();
+          for (const point of entry.points) {
+            const left = Math.max(start, point.from), right = Math.min(end, point.to);
             if (right <= left) continue;
             points.push(point);
-            group.append(svgElement("rect", { x: x(left), y, width: x(right) - x(left), height: 24, fill: `url(#${prefix}-model-${point.classification})`, class: "timeline-model-cell " + point.classification, "data-evaluated-at": point.evaluated_at }));
+            const classification = point.cell.classification;
+            if (!paths.has(classification)) paths.set(classification, []);
+            // Separate closed subpaths retain every cell edge, including unknown gaps.
+            const leftX = x(left), rightX = x(right);
+            paths.get(classification).push(`M${leftX},${y}H${rightX}V${y + 24}H${leftX}Z`);
           }
+          for (const [classification, subpaths] of paths) group.append(svgElement("path", { d: subpaths.join(""), fill: `url(#${prefix}-model-${classification})`, class: "timeline-model-cell " + classification, "aria-hidden": "true", "pointer-events": "none" }));
           if (!points.length) continue;
           let selected = 0;
           const cursor = svgElement("line", { y1: y + 3, y2: y + 21, class: "timeline-model-midpoint", "pointer-events": "none", "aria-hidden": "true", visibility: "hidden" });
           const inspector = svgElement("rect", { x: 180, y, width: 790, height: 24, class: "timeline-model-inspector", tabindex: 0, "aria-describedby": hover.id });
           function inspectPoint(index, lookup = true) {
             selected = Math.max(0, Math.min(points.length - 1, index));
-            const point = points[selected], at = modelInstant(point.evaluated_at), evidence = modelPointText(channel, point);
+            const { cell, at } = points[selected], evidence = modelPointText(channel, cell);
             inspector.setAttribute("aria-label", evidence + " Use Left/Right or Home/End to inspect other model points in this channel.");
             inspector.replaceChildren(svgElement("title", {}, evidence));
             cursor.setAttribute("x1", x(at)); cursor.setAttribute("x2", x(at)); cursor.setAttribute("visibility", at >= start && at < end ? "visible" : "hidden");
-            if (lookup) scheduleHover(channel, at, evidence, point.evaluated_at);
+            if (lookup) scheduleHover(channel, at, evidence, cell.evaluated_at);
           }
           function inspectPointer(event) {
             if (drag || event.pointerType === "touch") return;
             const position = plotPosition(event); if (!position) return;
             const at = start + (end - start) * (Math.max(180, Math.min(970, position.x)) - 180) / 790;
             let low = 0, high = points.length - 1;
-            while (low < high) { const middle = Math.floor((low + high) / 2); if (at < modelInstant(points[middle].to)) high = middle; else low = middle + 1; }
+            while (low < high) { const middle = Math.floor((low + high) / 2); if (at < points[middle].to) high = middle; else low = middle + 1; }
             inspectPoint(low);
           }
           inspector.addEventListener("pointerenter", inspectPointer); inspector.addEventListener("pointermove", inspectPointer);

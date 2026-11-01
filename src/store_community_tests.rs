@@ -139,6 +139,194 @@ fn component_schema(conn: &Connection) -> Vec<(String, Option<String>)> {
         .unwrap()
 }
 
+#[test]
+fn receipt_pair_index_is_additive_for_fresh_v1_and_v2_and_reopen_is_idempotent() {
+    for version in [None, Some(1), Some(2)] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        if let Some(version) = version {
+            v1_fixture(&mut conn, true, 777);
+            if version == 2 {
+                conn.execute_batch(MIGRATE_V2).unwrap();
+            }
+        }
+        let history = [
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let retained = version.map(|_| snapshot(&conn, &history));
+        initialize(&mut conn).unwrap();
+        if let Some(retained) = retained {
+            assert_eq!(snapshot(&conn, &history), retained);
+            assert_eq!(
+                read_community_settings(&conn).unwrap(),
+                CommunitySettings {
+                    enabled: true,
+                    target_interval_seconds: 777,
+                    cadence_mode: CommunityCadenceMode::Fixed,
+                }
+            );
+        } else {
+            assert_eq!(
+                read_community_settings(&conn).unwrap(),
+                CommunitySettings::default()
+            );
+        }
+        let columns = conn
+            .prepare("PRAGMA index_info(community_members_account_channel_member_sample)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, ["account", "channel", "id", "sample_id"]);
+        assert_eq!(
+            conn.query_row("SELECT version FROM community_schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+        let schema = component_schema(&conn);
+        let retained = snapshot(&conn, &history);
+        initialize(&mut conn).unwrap();
+        assert_eq!(component_schema(&conn), schema);
+        assert_eq!(snapshot(&conn, &history), retained);
+    }
+}
+
+#[test]
+fn receipt_pair_index_creation_rolls_back_with_failed_recovery() {
+    for version in [1, 2] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        v1_fixture(&mut conn, true, 777);
+        if version == 2 {
+            conn.execute_batch(MIGRATE_V2).unwrap();
+        }
+        assert!(sample_member_index_needs_covering(&conn).unwrap());
+        conn.execute_batch("UPDATE community_runs SET ended_at_utc=NULL,end_reason=NULL;
+            INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,4,'room','2020-01-01T00:00:01.000Z','pending');
+            CREATE TRIGGER community_fail_recovery BEFORE UPDATE OF outcome ON community_samples BEGIN SELECT RAISE(ABORT,'fixture recovery failure'); END;").unwrap();
+        let tables = [
+            "community_schema_version",
+            "community_settings",
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let before = snapshot(&conn, &tables);
+        let schema = component_schema(&conn);
+        assert!(initialize(&mut conn).is_err());
+        assert_eq!(snapshot(&conn, &tables), before);
+        assert_eq!(component_schema(&conn), schema);
+        assert!(sample_member_index_needs_covering(&conn).unwrap());
+        assert!(conn.is_autocommit());
+    }
+}
+
+#[test]
+fn sample_member_covering_upgrade_preserves_history_and_reopen_performs_no_ddl() {
+    for version in [None, Some(1), Some(2)] {
+        let mut conn = Connection::open_in_memory().unwrap();
+        if let Some(version) = version {
+            v1_fixture(&mut conn, true, 777);
+            if version == 2 {
+                conn.execute_batch(MIGRATE_V2).unwrap();
+            }
+            assert!(sample_member_index_needs_covering(&conn).unwrap());
+        }
+        let history = [
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let retained = version.map(|_| snapshot(&conn, &history));
+        initialize(&mut conn).unwrap();
+        assert!(!sample_member_index_needs_covering(&conn).unwrap());
+        if let Some(retained) = retained {
+            assert_eq!(snapshot(&conn, &history), retained);
+        }
+        let all = [
+            "community_schema_version",
+            "community_settings",
+            "community_pause",
+            "community_runs",
+            "community_samples",
+            "community_members",
+        ];
+        let retained = snapshot(&conn, &all);
+        let schema = component_schema(&conn);
+        let schema_cookie: i64 = conn
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        initialize(&mut conn).unwrap();
+        assert_eq!(snapshot(&conn, &all), retained);
+        assert_eq!(component_schema(&conn), schema);
+        assert_eq!(
+            conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_cookie,
+            "known covering index was rebuilt on reopen"
+        );
+        assert_eq!(
+            conn.query_row("SELECT version FROM community_schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+    }
+}
+
+#[test]
+fn unexpected_sample_member_index_definitions_fail_before_schema_or_recovery_changes() {
+    for definition in [
+        "",
+        "CREATE TABLE community_members_sample_member(value INTEGER)",
+        "CREATE INDEX community_members_sample_member ON community_runs(id,started_at_utc)",
+        "CREATE UNIQUE INDEX community_members_sample_member ON community_members(sample_id,id)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id,id) WHERE roles=32",
+        "CREATE INDEX community_members_sample_member ON community_members(id,sample_id)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id DESC,id)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id COLLATE NOCASE,id)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id+0,id)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id,id,account)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id,id,roles,account)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id,id,roles DESC)",
+        "CREATE INDEX community_members_sample_member ON community_members(sample_id,id,roles COLLATE NOCASE)",
+    ] {
+        for version in [1, 2] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            v1_fixture(&mut conn, true, 777);
+            if version == 2 {
+                conn.execute_batch(MIGRATE_V2).unwrap();
+            }
+            conn.execute_batch("DROP INDEX community_members_sample_member;
+                UPDATE community_runs SET ended_at_utc=NULL,end_reason=NULL;
+                INSERT INTO community_samples(run_id,job_id,channel,started_at_utc,outcome) VALUES(1,4,'room','2020-01-01T00:00:01.000Z','pending');").unwrap();
+            conn.execute_batch(definition).unwrap();
+            let tables = [
+                "community_schema_version",
+                "community_settings",
+                "community_pause",
+                "community_runs",
+                "community_samples",
+                "community_members",
+            ];
+            let before = snapshot(&conn, &tables);
+            let schema = component_schema(&conn);
+            assert!(matches!(initialize(&mut conn), Err(StoreError::Initialize)), "v{version}: {definition}");
+            assert_eq!(snapshot(&conn, &tables), before, "v{version}: {definition}");
+            assert_eq!(component_schema(&conn), schema, "v{version}: {definition}");
+            assert!(conn.is_autocommit());
+        }
+    }
+}
+
 #[tokio::test]
 async fn actual_v1_migration_preserves_preferences_pause_and_history_and_reopen_is_idempotent() {
     let directory = tempfile::tempdir().unwrap();
@@ -1026,6 +1214,7 @@ async fn retained_account_and_channel_queries_use_component_indexes_and_query_ca
             [
                 receipt_sql(true, true, true, true),
                 receipt_sql(false, true, true, true),
+                receipt_sql(true, false, true, true),
             ]
             .iter()
             .map(|sql| {
@@ -1037,7 +1226,11 @@ async fn retained_account_and_channel_queries_use_component_indexes_and_query_ca
                         } else {
                             None
                         },
-                        "room",
+                        if sql.contains("m.channel=?2") {
+                            Some("room")
+                        } else {
+                            None
+                        },
                         "2020-01-01T00:00:00.000Z",
                         "2020-01-02T00:00:00.000Z",
                         i64::MAX,
@@ -1053,7 +1246,7 @@ async fn retained_account_and_channel_queries_use_component_indexes_and_query_ca
         .unwrap();
     assert!(
         plans[0].iter().any(|plan| plan.contains(
-            "SEARCH m USING INDEX community_members_account_member_sample (account=? AND id<?)"
+            "SEARCH m USING INDEX community_members_account_channel_member_sample (account=? AND channel=? AND id<?)"
         )),
         "{:?}",
         plans[0]
@@ -1064,6 +1257,13 @@ async fn retained_account_and_channel_queries_use_component_indexes_and_query_ca
         )),
         "{:?}",
         plans[1]
+    );
+    assert!(
+        plans[2].iter().any(|plan| plan.contains(
+            "SEARCH m USING INDEX community_members_account_member_sample (account=? AND id<?)"
+        )),
+        "{:?}",
+        plans[2]
     );
     assert!(plans
         .iter()
@@ -1125,6 +1325,120 @@ async fn retained_account_and_channel_queries_use_component_indexes_and_query_ca
             .unwrap()
             .progress_interrupt_requested
     );
+}
+
+#[test]
+fn receipt_pair_seek_preserves_pages_and_ranges_without_scanning_unrelated_memberships() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize(&mut conn).unwrap();
+    insert_retained_community_rows(&mut conn, 1000, 1199);
+    conn.execute(
+        "UPDATE community_samples SET received_at_utc='2020-01-01T00:00:02.000Z' WHERE id%12=0",
+        [],
+    )
+    .unwrap();
+    let read_page = |conn: &Connection, sql: &str, before: i64, ranged: bool| {
+        let mut statement = conn.prepare(sql).unwrap();
+        let rows = statement
+            .query_map(
+                params![
+                    "alice",
+                    "room",
+                    ranged.then_some("2020-01-01T00:00:01.000Z"),
+                    ranged.then_some("2020-01-01T00:00:02.000Z"),
+                    before,
+                    11
+                ],
+                receipt_row,
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(statement.get_status(StatementStatus::FullscanStep), 0);
+        assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+        (rows, statement.get_status(StatementStatus::VmStep))
+    };
+    let mut cases = Vec::new();
+    for ranged in [false, true] {
+        let sql = receipt_sql(true, true, ranged, ranged);
+        let expected: Vec<i64> = (0_usize..33)
+            .filter(|offset| !ranged || offset.is_multiple_of(2))
+            .map(|offset| 1194 - 6 * offset as i64)
+            .collect();
+        let (first, first_steps) = read_page(&conn, &sql, i64::MAX, ranged);
+        assert_eq!(
+            first.iter().map(|row| row.member_id).collect::<Vec<_>>(),
+            expected[..11]
+        );
+        let cursor = first[9].member_id;
+        let (second, second_steps) = read_page(&conn, &sql, cursor, ranged);
+        assert_eq!(
+            second.iter().map(|row| row.member_id).collect::<Vec<_>>(),
+            expected[10..expected.len().min(21)]
+        );
+        for (before, rows, steps) in [
+            (i64::MAX, first, first_steps),
+            (cursor, second, second_steps),
+        ] {
+            cases.push((
+                sql.clone(),
+                ranged,
+                before,
+                serde_json::to_value(rows).unwrap(),
+                steps,
+            ));
+        }
+    }
+    // High IDs for the same account on another channel and another account on the
+    // selected channel must not add filtering work to either cursor page.
+    insert_retained_community_rows(&mut conn, 1, 999);
+    insert_retained_community_rows(&mut conn, 1200, 30000);
+    conn.execute("UPDATE community_members SET account=CASE WHEN channel='room' THEN 'noise' ELSE 'alice' END WHERE id<1000 OR id>=1200", []).unwrap();
+    for (sql, ranged, before, expected, steps_before) in cases {
+        let (rows, steps_after) = read_page(&conn, &sql, before, ranged);
+        assert_eq!(serde_json::to_value(&rows).unwrap(), expected);
+        assert!(steps_before > 0);
+        assert_eq!(
+            steps_after, steps_before,
+            "unrelated memberships increased pair seek work"
+        );
+        let legacy = sql.replace(
+            "community_members_account_channel_member_sample",
+            "community_members_account_member_sample",
+        );
+        let (legacy_rows, legacy_steps) = read_page(&conn, &legacy, before, ranged);
+        assert_eq!(serde_json::to_value(legacy_rows).unwrap(), expected);
+        if before == i64::MAX {
+            assert!(
+                legacy_steps > steps_after * 10,
+                "fixture must expose account-only filtering work"
+            );
+        }
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(
+                params![
+                    "alice",
+                    "room",
+                    ranged.then_some("2020-01-01T00:00:01.000Z"),
+                    ranged.then_some("2020-01-01T00:00:02.000Z"),
+                    before,
+                    11
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|line| line.contains(
+            "SEARCH m USING INDEX community_members_account_channel_member_sample (account=? AND channel=? AND id<?)"
+        )), "{plan:?}");
+        assert!(
+            plan.iter().all(|line| !line.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
 }
 
 #[test]

@@ -465,6 +465,46 @@ fn scenarios(p: PresenceParameters) -> Vec<Scenario> {
     values
 }
 
+struct ScenarioGroup {
+    model: Scenario,
+    variants: Vec<(usize, Scenario)>,
+}
+
+fn group_scenarios(values: &[Scenario], control: &Control) -> Result<Vec<ScenarioGroup>, ()> {
+    let key = |s: Scenario| [s.connected, s.disconnected, s.detection, s.ratio, s.prior];
+    let mut groups: Vec<ScenarioGroup> = Vec::new();
+    for (index, &scenario) in values.iter().enumerate() {
+        if control.stopped() {
+            return Err(());
+        }
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| key(group.model) == key(scenario))
+        {
+            // Deduplicated corner scenarios have only zero and twice-nominal lag.
+            // The central prior differs from both corners and forms its own group.
+            if group.variants.len() == 2 {
+                return Err(());
+            }
+            group.variants.push((index, scenario));
+        } else {
+            groups.push(ScenarioGroup {
+                model: scenario,
+                variants: vec![(index, scenario)],
+            });
+        }
+    }
+    Ok(groups)
+}
+
+struct LagWorkspace {
+    scenario_index: usize,
+    scenario: Scenario,
+    probabilities: Vec<Option<f64>>,
+    matches: Vec<u8>,
+    boundary: Vec<bool>,
+}
+
 fn transition(s: Scenario, dt: f64) -> [[f64; 2]; 2] {
     let a = 1. / s.disconnected;
     let b = 1. / s.connected;
@@ -509,8 +549,14 @@ struct Smoother {
     filtered: Vec<[f64; 2]>,
     future: Vec<[f64; 2]>,
 }
+#[cfg(test)]
+thread_local! {
+    static SMOOTHER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 impl Smoother {
     fn new(observations: &[Observation], s: Scenario, control: &Control) -> Option<Self> {
+        #[cfg(test)]
+        SMOOTHER_BUILDS.with(|count| count.set(count.get() + 1));
         let mut filtered = Vec::with_capacity(observations.len());
         let mut state = [1. - s.prior, s.prior];
         for (i, o) in observations.iter().enumerate() {
@@ -600,72 +646,104 @@ pub(crate) fn analyze(
     let mut supported = vec![true; count];
     let scenarios = scenarios(response.parameters);
     let scenario_count = scenarios.len();
-    for (scenario_index, scenario) in scenarios.into_iter().enumerate() {
+    let groups = match group_scenarios(&scenarios, &control) {
+        Ok(groups) => groups,
+        Err(()) => return response.incomplete(PresenceStatus::AnalysisTimeout),
+    };
+    for group in groups {
         if control.stopped() {
             return response.incomplete(PresenceStatus::AnalysisTimeout);
         }
-        let mut probabilities = vec![None; count];
-        let mut matches = vec![0_u8; count];
-        let mut boundary = vec![false; count];
+        // Only this group's (at most two) lag workspaces and one segment smoother
+        // are live. Grouping never caches smoothers across segments or model parameters.
+        let mut variants: Vec<_> = group
+            .variants
+            .into_iter()
+            .map(|(scenario_index, scenario)| LagWorkspace {
+                scenario_index,
+                scenario,
+                probabilities: vec![None; count],
+                matches: vec![0_u8; count],
+                boundary: vec![false; count],
+            })
+            .collect();
         for observations in &segments {
             if control.stopped() {
                 return response.incomplete(PresenceStatus::AnalysisTimeout);
             }
-            let start = observations[0].at - scenario.lag;
-            let end = observations.last().unwrap().at - scenario.lag;
-            for edge in [start, end] {
-                if edge > from && edge < to {
-                    let index = ((edge - from) / width).floor().min((count - 1) as f64) as usize;
-                    if from + index as f64 * width < edge
-                        && edge < from + (index + 1) as f64 * width
-                    {
-                        boundary[index] = true;
+            let mut ranges = [(0., 0., 0_usize, 0_usize); 2];
+            for (variant, range) in variants.iter_mut().zip(&mut ranges) {
+                if control.stopped() {
+                    return response.incomplete(PresenceStatus::AnalysisTimeout);
+                }
+                let start = observations[0].at - variant.scenario.lag;
+                let end = observations.last().unwrap().at - variant.scenario.lag;
+                for edge in [start, end] {
+                    if edge > from && edge < to {
+                        let index =
+                            ((edge - from) / width).floor().min((count - 1) as f64) as usize;
+                        if from + index as f64 * width < edge
+                            && edge < from + (index + 1) as f64 * width
+                        {
+                            variant.boundary[index] = true;
+                        }
                     }
                 }
+                let first = ((start - from) / width).ceil().clamp(0., count as f64) as usize;
+                let last = ((end - from) / width).floor().clamp(0., count as f64) as usize;
+                *range = (start, end, first, last);
             }
-            let first = ((start - from) / width).ceil().clamp(0., count as f64) as usize;
-            let last = ((end - from) / width).floor().clamp(0., count as f64) as usize;
-            if first >= last {
+            if !ranges.iter().any(|(_, _, first, last)| first < last) {
                 continue;
             }
-            let Some(smoother) = Smoother::new(observations, scenario, &control) else {
+            let Some(smoother) = Smoother::new(observations, group.model, &control) else {
                 if control.stopped() {
                     return response.incomplete(PresenceStatus::AnalysisTimeout);
                 }
                 // Unsupported numerical scenarios never contribute an invented probability.
                 continue;
             };
-            for index in first..last {
+            for (variant, (start, end, first, last)) in variants.iter_mut().zip(ranges) {
+                if control.stopped() {
+                    return response.incomplete(PresenceStatus::AnalysisTimeout);
+                }
+                for index in first..last {
+                    if index.is_multiple_of(64) && control.stopped() {
+                        return response.incomplete(PresenceStatus::AnalysisTimeout);
+                    }
+                    let left = from + index as f64 * width;
+                    let right = from + (index + 1) as f64 * width;
+                    if left < start || right > end {
+                        continue;
+                    }
+                    variant.matches[index] = variant.matches[index].saturating_add(1);
+                    variant.probabilities[index] = smoother.at(
+                        observations,
+                        variant.scenario,
+                        from + (index as f64 + 0.5) * width + variant.scenario.lag,
+                    );
+                }
+            }
+        }
+        for variant in variants {
+            for index in 0..count {
                 if index.is_multiple_of(64) && control.stopped() {
                     return response.incomplete(PresenceStatus::AnalysisTimeout);
                 }
-                let left = from + index as f64 * width;
-                let right = from + (index + 1) as f64 * width;
-                if left < start || right > end {
+                if variant.matches[index] != 1 || variant.boundary[index] {
+                    supported[index] = false;
                     continue;
                 }
-                matches[index] = matches[index].saturating_add(1);
-                probabilities[index] = smoother.at(
-                    observations,
-                    scenario,
-                    from + (index as f64 + 0.5) * width + scenario.lag,
-                );
+                let Some(probability) = variant.probabilities[index] else {
+                    supported[index] = false;
+                    continue;
+                };
+                if variant.scenario_index == 0 {
+                    central[index] = Some(probability);
+                }
+                minimum[index] = minimum[index].min(probability);
+                maximum[index] = maximum[index].max(probability);
             }
-        }
-        for index in 0..count {
-            if matches[index] != 1 || boundary[index] {
-                supported[index] = false;
-                continue;
-            }
-            let Some(probability) = probabilities[index] else {
-                supported[index] = false;
-                continue;
-            };
-            if scenario_index == 0 {
-                central[index] = Some(probability);
-            }
-            minimum[index] = minimum[index].min(probability);
-            maximum[index] = maximum[index].max(probability);
         }
     }
     response.sensitivity_scenarios = scenario_count;

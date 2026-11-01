@@ -428,6 +428,68 @@ ALTER TABLE community_settings ADD COLUMN cadence_mode TEXT NOT NULL DEFAULT 'fi
 UPDATE community_schema_version SET version=2 WHERE id=1;
 ";
 
+// Only the released layout and its compatible covering extension are ours to evolve.
+// Validate metadata rather than SQL spelling, including auxiliary rowid information.
+fn sample_member_index_needs_covering(conn: &Connection) -> Result<bool, StoreError> {
+    let owner: Option<(String, String, bool)> = conn
+        .query_row(
+            "SELECT type,tbl_name,sql IS NOT NULL FROM main.sqlite_schema WHERE name='community_members_sample_member'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if !matches!(owner, Some((kind, table, true)) if kind == "index" && table == "community_members")
+    {
+        return Err(StoreError::Initialize);
+    }
+    let flags: Option<(bool, String, bool)> = conn
+        .query_row(
+            "SELECT \"unique\",origin,partial FROM pragma_index_list('community_members','main') WHERE name='community_members_sample_member'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if !matches!(flags, Some((false, origin, false)) if origin == "c") {
+        return Err(StoreError::Initialize);
+    }
+    let columns = conn
+        .prepare("PRAGMA main.index_xinfo(community_members_sample_member)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected: &[(i64, Option<&str>, i64)] = match columns.len() {
+        3 => &[(1, Some("sample_id"), 1), (0, Some("id"), 1), (-1, None, 0)],
+        4 => &[
+            (1, Some("sample_id"), 1),
+            (0, Some("id"), 1),
+            (4, Some("roles"), 1),
+            (-1, None, 0),
+        ],
+        _ => return Err(StoreError::Initialize),
+    };
+    if columns.iter().zip(expected).enumerate().any(
+        |(position, ((seqno, cid, name, descending, collation, key), expected))| {
+            *seqno != position as i64
+                || *cid != expected.0
+                || name.as_deref() != expected.1
+                || *descending != 0
+                || collation.as_deref() != Some("BINARY")
+                || *key != expected.2
+        },
+    ) {
+        return Err(StoreError::Initialize);
+    }
+    Ok(columns.len() == 3)
+}
+
 /// Runs on the storage worker without a query progress handler. Creation and recovery commit together.
 pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
     let has_version: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='community_schema_version')", [], |r| r.get(0))?;
@@ -457,6 +519,8 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
     if version.is_none() {
         tx.execute_batch(SCHEMA_V1)?;
     }
+    // Reject unknown retained definitions before changing any access paths or recovering rows.
+    let extend_sample_member_index = sample_member_index_needs_covering(&tx)?;
     if version.is_none_or(|version| version == 1) {
         tx.execute_batch(MIGRATE_V2)?;
         if version.is_none() {
@@ -470,6 +534,16 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), StoreError> {
     // or perform recovery. A failure rolls back schema and version changes as well.
     read_community_settings(&tx).map_err(|_| StoreError::Initialize)?;
     read_community_pause(&tx).map_err(|_| StoreError::Initialize)?;
+    if extend_sample_member_index {
+        // The key prefix and index name remain compatible with existing readers.
+        tx.execute_batch(
+            "DROP INDEX community_members_sample_member;
+            CREATE INDEX community_members_sample_member ON community_members(sample_id,id,roles);",
+        )?;
+    }
+    // This non-unique access path changes no retained data or logical schema contract.
+    // Add it atomically for fresh, v1 and v2 databases without rewriting released DDL.
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS community_members_account_channel_member_sample ON community_members(account,channel,id,sample_id);")?;
     let at = now();
     tx.execute("UPDATE community_samples SET outcome='interrupted',failure_code='process_interrupted',completed_at_utc=?1 WHERE outcome='pending'", [&at])?;
     tx.execute("UPDATE community_runs SET ended_at_utc=?1,end_reason='process_interrupted' WHERE ended_at_utc IS NULL", [&at])?;
@@ -743,7 +817,9 @@ impl Store {
 // Both account and channel pagination seek directly below the independent member cursor.
 // Sample metadata, including optional time bounds, is checked after each member seek.
 fn receipt_sql(account: bool, channel: bool, from: bool, to: bool) -> String {
-    let source = if account {
+    let source = if account && channel {
+        "community_members m INDEXED BY community_members_account_channel_member_sample CROSS JOIN community_samples s ON s.id=m.sample_id"
+    } else if account {
         "community_members m INDEXED BY community_members_account_member_sample JOIN community_samples s ON s.id=m.sample_id"
     } else if channel {
         "community_members m INDEXED BY community_members_channel_member CROSS JOIN community_samples s ON s.id=m.sample_id"
