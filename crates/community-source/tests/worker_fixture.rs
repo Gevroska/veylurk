@@ -23,7 +23,7 @@ fn write(output: &mut impl Write, value: &Value) {
 }
 fn main() {
     let mode = std::env::args().nth(1).unwrap();
-    if mode == "descendant" {
+    if mode == "descendant" || mode == "never_reads" {
         std::thread::sleep(Duration::from_secs(30));
         return;
     }
@@ -31,8 +31,8 @@ fn main() {
     let mut output = std::io::stdout();
     let start = read(&mut input).unwrap();
     assert_eq!(start["kind"], "Start");
-    if mode == "descendant_owner" {
-        let _child = Command::new(std::env::current_exe().unwrap())
+    if mode == "descendant_owner" || mode == "descendant_owner_wait" {
+        let child = Command::new(std::env::current_exe().unwrap())
             .arg("descendant")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -40,11 +40,67 @@ fn main() {
             .spawn()
             .unwrap();
         write(&mut output, &json!({"kind":"Ready"}));
+        if mode == "descendant_owner_wait" {
+            write(&mut output, &json!({"descendant":child.id()}));
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
         std::thread::sleep(Duration::from_millis(300));
         return;
     }
     if mode == "unexpected_exit" {
         std::process::exit(23);
+    }
+    if mode == "stopped_then_exit" {
+        write(
+            &mut output,
+            &json!({"kind":"Stopped","cleanup_confirmed":true,"diagnostics":{
+                "primary_failure":{
+                    "code":"authentication_denied","stage":"preparing","observed_at_unix_ms":11,
+                    "controller_epoch":7,"job_id":null,"navigation_ready":false,"last_player_observation":null,
+                    "script_pending":false,"network_pending":false,"response_pending":false,"trigger_pending":false,
+                    "navigation_failure":null
+                },"cleanup_diagnostics":null,"host_termination":null,"window_dismissal":null,"worker":null
+            }}),
+        );
+        std::process::exit(23);
+    }
+    #[cfg(windows)]
+    if mode == "access_violation" {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+            fn RaiseException(code: u32, flags: u32, count: u32, arguments: *const usize);
+        }
+        unsafe {
+            SetErrorMode(3);
+            RaiseException(0xC000_0005, 0, 0, std::ptr::null());
+        }
+        unreachable!("unhandled native exception returned");
+    }
+    #[cfg(windows)]
+    if mode == "sentinel" {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetEvent(event: *mut std::ffi::c_void) -> i32;
+        }
+        let event: usize = std::env::args().nth(2).unwrap().parse().unwrap();
+        unsafe {
+            SetEvent(event as *mut std::ffi::c_void);
+        }
+        write(&mut output, &json!({"kind":"Ready"}));
+        return;
+    }
+    if mode == "stalled_progress" {
+        loop {
+            write(
+                &mut output,
+                &json!({"kind":"Pulse","native_progress":0,"diagnostics":{
+                    "primary_failure":null,"cleanup_diagnostics":null,"host_termination":null,"window_dismissal":null,"worker":null
+                }}),
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
     if mode == "oversized" {
         output
@@ -98,6 +154,16 @@ fn main() {
                     }}),
                 );
                 std::process::exit(23);
+            }
+            "Sample" if mode == "wrong_ticket" => {
+                write(
+                    &mut output,
+                    &json!({"kind":"Completed","ticket":frame["ticket"].as_u64().unwrap()+1,
+                    "job_id":frame["job_id"],"channel":frame["channel"],"outcome":{
+                        "kind":"Failure","code":"operator_cancelled","pauses_community":false
+                    }}),
+                );
+                return;
             }
             _ => {}
         }

@@ -14,13 +14,34 @@ Disable, re-enable, sign-in and application restart do not clear the durable pau
 
 The current Community diagnostic snapshot contains fixed failure and phase codes, structural readiness flags, browser identity, numeric exit and operation results, and elapsed cleanup time. It contains no account names, page text, URLs, cookies or credentials. These details are held in bounded memory and carried with the reserved terminal event. The primary failure and cleanup details are not saved across application restarts; the persisted pause remains separate. Browser cleanup performs no diagnostic file writes.
 
-The service window is auxiliary. Its Close button minimizes it without cancelling an accepted job, closing admission, changing the controller epoch or resuming a paused sign-in. Sign-in can be reopened through the existing control; sampling still requires explicit Resume. Disable and application shutdown still retire the host and require the existing cleanup confirmation. The standalone proof window retains its genuine Close behavior.
+The service window is auxiliary. Its Close button hides it without cancelling an accepted job, closing admission, changing the controller epoch or resuming a paused sign-in. Sign-in can be reopened through the existing control; sampling still requires explicit Resume. Disable and application shutdown still retire the host and require the existing cleanup confirmation. The standalone proof window retains its genuine Close behavior.
 
 `host_termination` retains the first observed stop trigger, its UTC millisecond timestamp, controller epoch and optional job ID. Reasons are fixed identifiers: `shutdown_requested`, `command_channel_closed`, `source_failure_without_controller`, `cleanup_unconfirmed`, `startup_failed`, `message_pump_quit`, `message_pump_error`, `native_host_interrupted` and `proof_window_close`. Cleanup and the exit guard cannot replace an earlier reason. A service window dismissal increments only the bounded `window_dismissal` count and latest timestamp. These two status fields describe the current service-host lifetime and reset when a new host starts; controller recycling does not reset them.
 
 After receiving the terminal report, the coordinator queues only the typed termination snapshot in the existing fault journal as `community_host_termination`. No native-thread file write or additional writer is introduced. This event can become the latest diagnostic but never occupies the first storage failure. Existing record, queue, rotation and process limits still apply. An unexpected host terminal also ends an open Community run with `host_failure` at the observed coordinator boundary; explicit retirement keeps its own end reason. An older unrecorded stop cannot be reconstructed retrospectively.
 
 Browser cleanup requires a matching normal browser-exit notification and successful controller and observer cleanup. An event received before retirement is retained for the same browser identity. A shutdown requested during recycling uses that existing retirement rather than losing its identity. A page timeout may use the existing per-channel backoff after confirmed cleanup; an actual source denial or uncertain cleanup still requires explicit Resume. No player-readiness or source-authentication checks are relaxed.
+
+## Isolated browser process
+
+The integrated browser runs in a private child of the same executable. A native
+browser-process failure therefore need not terminate the HTTP server, IRC or
+SQLite writer. Current Community status includes `worker` diagnostics with the
+worker's process identity, numeric exit code, failure classification and separate
+`worker_tree_exited`/`containment_confirmed` fields. These describe physical
+process containment, not a normal WebView2 exit or source/authentication success.
+
+After abnormal worker exit, Community retains unconfirmed normal cleanup and its
+durable pause. It does not automatically restart or resample. The interface shows
+the contained failure separately from browser shutdown confirmation. Once all
+worker processes are confirmed exited, restart Veylurk and explicitly choose
+Resume. Source-denial barriers remain separate and are not silently cleared.
+
+The worker details are a bounded current-process snapshot and must be captured
+before restart if needed for investigation. The durable pause and existing host
+termination journal are separate; this change does not persist raw pipe data,
+accounts, profiles, credentials or full memory dumps. See the
+[native crash plan and results](native-worker-crash.md).
 
 ## Storage fault journal
 

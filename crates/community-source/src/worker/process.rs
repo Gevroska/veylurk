@@ -155,12 +155,18 @@ impl Job {
             std::thread::sleep(POLL);
         }
     }
+    fn close(&mut self) {
+        if !self.0.is_null() {
+            let handle = std::mem::replace(&mut self.0, std::ptr::null_mut());
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.0);
-        }
+        self.close();
     }
 }
 
@@ -243,6 +249,7 @@ fn worker_command() -> io::Result<Command> {
     Ok(command)
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Inbound {
     Frame(WorkerFrame),
     Eof,
@@ -250,8 +257,60 @@ enum Inbound {
 }
 
 fn supervise(options: HostOptions, bridge: Bridge) {
+    if has_environment_override(|name| std::env::var_os(name).is_some()) {
+        refuse_environment_override(&bridge);
+        return;
+    }
     let launched = worker_command().and_then(|mut command| OwnedWorker::launch(&mut command));
     supervise_owned(options, bridge, launched);
+}
+
+fn has_environment_override(mut present: impl FnMut(&str) -> bool) -> bool {
+    WEBVIEW_ENVIRONMENT_OVERRIDES
+        .iter()
+        .any(|name| present(name))
+}
+
+fn refuse_environment_override(bridge: &Bridge) {
+    use crate::host::{CleanupDiagnostics, PrimaryFailure};
+    let code = "webview2_environment_override";
+    bridge
+        .control
+        .observe_termination(HostTerminationReason::StartupFailed);
+    let job = bridge.control.pending_job();
+    bridge.control.record_fault(FaultReport {
+        primary_failure: Some(PrimaryFailure {
+            code,
+            stage: "initializing",
+            observed_at_unix_ms: crate::host::unix_milliseconds(),
+            controller_epoch: 0,
+            job_id: job.as_ref().map(|job| job.job_id),
+            navigation_ready: false,
+            last_player_observation: None,
+            script_pending: false,
+            network_pending: false,
+            response_pending: false,
+            trigger_pending: false,
+            navigation_failure: None,
+        }),
+        cleanup_diagnostics: Some(CleanupDiagnostics {
+            no_browser_cleanup_required: true,
+            confirmed: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    if let Some(job) = job {
+        bridge.control.complete(
+            job.ticket,
+            Err(SourceFailure {
+                code,
+                pauses_community: false,
+            }),
+        );
+    }
+    bridge.emit(Status::Paused { code });
+    bridge.control.terminate(true, code);
 }
 
 fn supervise_owned(options: HostOptions, bridge: Bridge, launched: io::Result<OwnedWorker>) {
@@ -317,12 +376,13 @@ fn supervise_owned(options: HostOptions, bridge: Bridge, launched: io::Result<Ow
         None
     };
     // This is the sole startup gate; Job assignment has already succeeded.
-    if outbound
-        .try_send(ParentFrame::Start {
-            version: VERSION,
-            profile_dir: options.profile_dir,
-        })
-        .is_err()
+    if failure.is_none()
+        && outbound
+            .try_send(ParentFrame::Start {
+                version: VERSION,
+                profile_dir: options.profile_dir,
+            })
+            .is_err()
     {
         failure = Some(WorkerFailure::Start);
     }
@@ -497,14 +557,16 @@ fn accept_frame(
     match frame {
         WorkerFrame::Pulse {
             native_progress,
-            diagnostics,
-        } => {
+            mut diagnostics,
+        } if terminal.is_none() => {
             if native_progress < progress.0 {
                 return Err(());
             }
             if native_progress > progress.0 {
                 *progress = (native_progress, Instant::now());
             }
+            // Only this supervisor owns process identity and containment proof.
+            diagnostics.worker = None;
             bridge.control.record_fault(diagnostics);
         }
         WorkerFrame::Ready if terminal.is_none() => bridge.emit(Status::Ready),
@@ -530,9 +592,13 @@ fn accept_frame(
         }
         WorkerFrame::Stopped {
             cleanup_confirmed,
-            diagnostics,
+            mut diagnostics,
         } if terminal.is_none() => {
             bridge.control.stop_accepting();
+            diagnostics.worker = None;
+            // Preserve a completely received final source/cleanup snapshot even
+            // if the worker then crashes in its remaining native teardown.
+            bridge.control.record_fault(diagnostics.clone());
             *terminal = Some((cleanup_confirmed, diagnostics));
         }
         _ => return Err(()),
@@ -734,16 +800,40 @@ pub(super) fn run_worker() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
 
-    fn fixture(mode: &str) -> OwnedWorker {
-        let binary = std::env::current_exe()
+    #[repr(C)]
+    struct Security {
+        size: u32,
+        descriptor: *mut std::ffi::c_void,
+        inherit: i32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateEventW(
+            security: *const Security,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> Handle;
+        fn GetHandleInformation(handle: Handle, flags: *mut u32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    }
+
+    fn fixture_path() -> PathBuf {
+        std::env::current_exe()
             .unwrap()
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .join("examples")
-            .join("community-worker-fixture.exe");
+            .join("community-worker-fixture.exe")
+    }
+
+    fn fixture(mode: &str) -> OwnedWorker {
+        let binary = fixture_path();
         assert!(
             binary.is_file(),
             "build the offline community-worker-fixture example before testing"
@@ -811,6 +901,26 @@ mod tests {
     }
 
     #[test]
+    fn native_access_violation_is_contained_without_fabricated_com_cleanup() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(45, "room").unwrap();
+        supervise_owned(options(), bridge, Ok(fixture("access_violation")));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                outcome: Err(_),
+                ..
+            })
+        ));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        assert!(report.cleanup_diagnostics.is_none());
+        let worker = report.worker.unwrap();
+        assert_eq!(worker.exit_code, Some(0xC000_0005));
+        assert!(worker.containment_confirmed && worker.worker_tree_exited);
+    }
+
+    #[test]
     fn fully_delivered_receipt_survives_a_later_unexpected_child_exit() {
         let (handle, bridge) = HostHandle::channel();
         handle.try_sample(51, "room").unwrap();
@@ -832,8 +942,21 @@ mod tests {
     }
 
     #[test]
+    fn final_source_fault_survives_an_abnormal_exit_after_the_stopped_frame() {
+        let (handle, bridge) = HostHandle::channel();
+        supervise_owned(options(), bridge, Ok(fixture("stopped_then_exit")));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        assert_eq!(
+            report.primary_failure.unwrap().code,
+            "authentication_denied"
+        );
+        assert_eq!(report.worker.unwrap().exit_code, Some(23));
+    }
+
+    #[test]
     fn malformed_oversized_and_partial_child_frames_never_complete_a_sample_successfully() {
-        for mode in ["malformed", "oversized", "partial"] {
+        for mode in ["malformed", "oversized", "partial", "wrong_ticket"] {
             let (handle, bridge) = HostHandle::channel();
             handle.try_sample(61, "room").unwrap();
             supervise_owned(options(), bridge, Ok(fixture(mode)));
@@ -928,6 +1051,125 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_only_job_handle_kills_the_worker_and_its_descendant() {
+        let mut worker = fixture("descendant_owner_wait");
+        write_frame(
+            worker.child.stdin.as_mut().unwrap(),
+            &ParentFrame::Start {
+                version: VERSION,
+                profile_dir: options().profile_dir,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame::<WorkerFrame>(worker.child.stdout.as_mut().unwrap()).unwrap(),
+            Some(WorkerFrame::Ready)
+        ));
+        let message: serde_json::Value = read_frame(worker.child.stdout.as_mut().unwrap())
+            .unwrap()
+            .unwrap();
+        let descendant_pid = message["descendant"].as_u64().unwrap() as u32;
+        let descendant = unsafe { OpenProcess(0x0010_0000, 0, descendant_pid) };
+        assert!(!descendant.is_null());
+        let descendant = unsafe { OwnedHandle::from_raw_handle(descendant) };
+        assert!(worker.job.active().unwrap() >= 2);
+        worker.job.close();
+        assert_eq!(
+            unsafe { WaitForSingleObject(worker.child.as_raw_handle(), 5000) },
+            0
+        );
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle(), 5000) },
+            0
+        );
+    }
+
+    #[test]
+    fn stdio_handle_list_excludes_an_inheritable_sentinel_and_the_job_handle() {
+        let security = Security {
+            size: std::mem::size_of::<Security>() as u32,
+            descriptor: std::ptr::null_mut(),
+            inherit: 1,
+        };
+        let sentinel = unsafe { CreateEventW(&security, 1, 0, std::ptr::null()) };
+        assert!(!sentinel.is_null());
+        let sentinel = unsafe { OwnedHandle::from_raw_handle(sentinel) };
+        let mut flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(sentinel.as_raw_handle(), &mut flags) },
+            0
+        );
+        assert_eq!(flags & 1, 1);
+        let mut command = Command::new(fixture_path());
+        command
+            .arg("sentinel")
+            .arg((sentinel.as_raw_handle() as usize).to_string())
+            .env_clear();
+        let mut worker = OwnedWorker::launch(&mut command).unwrap();
+        assert_ne!(unsafe { GetHandleInformation(worker.job.0, &mut flags) }, 0);
+        assert_eq!(
+            flags & 1,
+            0,
+            "the worker cannot keep the kill-on-close Job alive"
+        );
+        write_frame(
+            worker.child.stdin.as_mut().unwrap(),
+            &ParentFrame::Start {
+                version: VERSION,
+                profile_dir: options().profile_dir,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame::<WorkerFrame>(worker.child.stdout.as_mut().unwrap()).unwrap(),
+            Some(WorkerFrame::Ready)
+        ));
+        assert_eq!(
+            unsafe { WaitForSingleObject(sentinel.as_raw_handle(), 0) },
+            0x102,
+            "worker inherited an unrelated parent handle"
+        );
+        assert!(worker.finish(true).1);
+    }
+
+    #[test]
+    fn live_ipc_cannot_hide_a_stalled_native_thread() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(81, "room").unwrap();
+        let started = Instant::now();
+        supervise_owned(options(), bridge, Ok(fixture("stalled_progress")));
+        assert!(started.elapsed() < STALL_LIMIT + TREE_EXIT_LIMIT + Duration::from_secs(2));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                outcome: Err(_),
+                ..
+            })
+        ));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        assert_eq!(report.worker.unwrap().failure, Some(WorkerFailure::Stalled));
+    }
+
+    #[test]
+    fn a_blocked_pipe_writer_is_bounded_independently_of_native_progress() {
+        let (handle, bridge) = HostHandle::channel();
+        let long_profile = PathBuf::from(format!("C:\\{}", "x".repeat(16384)));
+        let started = Instant::now();
+        supervise_owned(
+            HostOptions {
+                profile_dir: long_profile,
+            },
+            bridge,
+            Ok(fixture("never_reads")),
+        );
+        assert!(started.elapsed() < PIPE_WRITE_LIMIT + TREE_EXIT_LIMIT + Duration::from_secs(2));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        assert_eq!(report.worker.unwrap().failure, Some(WorkerFailure::Stalled));
+    }
+
+    #[test]
     fn environment_is_an_os_allowlist_and_main_host_never_calls_native_service() {
         let command = worker_command().unwrap();
         let keys: Vec<_> = command
@@ -947,5 +1189,81 @@ mod tests {
             .unwrap();
         assert!(!spawn.contains("native::"));
         assert!(spawn.contains("crate::worker::spawn"));
+    }
+
+    #[test]
+    fn every_webview_override_is_refused_before_any_worker_or_profile_exists() {
+        for name in WEBVIEW_ENVIRONMENT_OVERRIDES {
+            assert!(has_environment_override(|candidate| candidate == name));
+        }
+        assert!(!has_environment_override(|_| false));
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(91, "room").unwrap();
+        refuse_environment_override(&bridge);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                outcome: Err(SourceFailure {
+                    code: "webview2_environment_override",
+                    ..
+                }),
+                ..
+            })
+        ));
+        let (cleanup, report) = terminal(&handle);
+        assert!(cleanup);
+        assert!(report.worker.is_none());
+        assert!(
+            report
+                .cleanup_diagnostics
+                .unwrap()
+                .no_browser_cleanup_required
+        );
+        assert_eq!(
+            report.primary_failure.unwrap().code,
+            "webview2_environment_override"
+        );
+    }
+
+    #[test]
+    fn a_pulse_after_stopped_cannot_erase_the_final_fault() {
+        let (handle, bridge) = HostHandle::channel();
+        let mut progress = (0, Instant::now());
+        let mut terminal = None;
+        let final_report = FaultReport {
+            cleanup_diagnostics: Some(crate::host::CleanupDiagnostics {
+                close_hresult: Some(-7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(accept_frame(
+            &bridge,
+            WorkerFrame::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: final_report
+            },
+            &mut progress,
+            &mut terminal
+        )
+        .is_ok());
+        assert!(accept_frame(
+            &bridge,
+            WorkerFrame::Pulse {
+                native_progress: 1,
+                diagnostics: FaultReport::default()
+            },
+            &mut progress,
+            &mut terminal
+        )
+        .is_err());
+        assert_eq!(
+            handle
+                .fault_report()
+                .cleanup_diagnostics
+                .unwrap()
+                .close_hresult,
+            Some(-7)
+        );
     }
 }

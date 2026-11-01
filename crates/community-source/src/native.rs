@@ -3390,15 +3390,7 @@ fn startup(
         let app = make_window(directory.clone(), config, service_options)?;
         // Do not inherit profile/browser/argument overrides that could select
         // another browser or alter default security. Never rewrite them.
-        let overrides = [
-            "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
-            "WEBVIEW2_USER_DATA_FOLDER",
-            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-            "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
-            "WEBVIEW2_CHANNEL_SEARCH_KIND",
-            "WEBVIEW2_RELEASE_CHANNELS",
-        ];
-        if overrides
+        if crate::worker::WEBVIEW_ENVIRONMENT_OVERRIDES
             .iter()
             .any(|name| std::env::var_os(name).is_some())
         {

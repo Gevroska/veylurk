@@ -15,6 +15,18 @@ pub(crate) use process::spawn;
 const WORKER_ARGUMENT: &str = "--veylurk-private-community-worker-v1";
 const VERSION: u32 = 1;
 const FRAME_CAP: usize = 512 * 1024;
+// Serde treats a syntactic &str field as borrowed even with deserialize_with.
+// This transparent alias lets the explicit vocabulary decoder own the decision;
+// no input buffer lifetime or leaked allocation becomes part of a public value.
+pub(crate) type StructuralCode = &'static str;
+pub(crate) const WEBVIEW_ENVIRONMENT_OVERRIDES: [&str; 6] = [
+    "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+    "WEBVIEW2_USER_DATA_FOLDER",
+    "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+    "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
+    "WEBVIEW2_CHANNEL_SEARCH_KIND",
+    "WEBVIEW2_RELEASE_CHANNELS",
+];
 
 pub(crate) fn dispatch() -> Option<std::process::ExitCode> {
     let mut arguments = std::env::args_os().skip(1);
@@ -56,6 +68,7 @@ enum ParentFrame {
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum WorkerFrame {
     Pulse {
         native_progress: u64,
@@ -66,7 +79,7 @@ enum WorkerFrame {
     LoginFailed,
     Paused {
         #[serde(deserialize_with = "fixed_string")]
-        code: &'static str,
+        code: StructuralCode,
     },
     Completed {
         ticket: u64,
@@ -82,13 +95,14 @@ enum WorkerFrame {
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum WireOutcome {
     Sample {
         sample: WireSample,
     },
     Failure {
         #[serde(deserialize_with = "fixed_string")]
-        code: &'static str,
+        code: StructuralCode,
         pauses_community: bool,
     },
 }

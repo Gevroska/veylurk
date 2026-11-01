@@ -1,5 +1,6 @@
 //! Bounded typed interface. No COM object, URL, script, or credential crosses it.
 #![cfg_attr(not(windows), allow(dead_code))]
+use crate::worker::StructuralCode;
 use crate::{channel_login, is_channel_page, sampling::Provenance, ParsedSample, CATEGORIES};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -94,9 +95,9 @@ pub struct SourceFailure {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PrimaryFailure {
     #[serde(deserialize_with = "crate::worker::fixed_string")]
-    pub code: &'static str,
+    pub code: StructuralCode,
     #[serde(deserialize_with = "crate::worker::fixed_string")]
-    pub stage: &'static str,
+    pub stage: StructuralCode,
     pub observed_at_unix_ms: i64,
     pub controller_epoch: u64,
     pub job_id: Option<u64>,
@@ -120,7 +121,7 @@ pub enum NavigationFailure {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NativeOperationFailure {
     #[serde(deserialize_with = "crate::worker::fixed_string")]
-    pub operation: &'static str,
+    pub operation: StructuralCode,
     pub hresult: i32,
 }
 

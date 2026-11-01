@@ -700,6 +700,64 @@ async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
 }
 
 #[tokio::test]
+async fn abnormal_worker_exit_keeps_numeric_containment_separate_from_cleanup_and_blocks_resume() {
+    for earlier_source in [None, Some(CommunityPauseReason::RateLimited)] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        if earlier_source.is_some() {
+            runner.pause_source("rate_limited").await.unwrap();
+        }
+        let worker = WorkerDiagnostics {
+            process_id: Some(123),
+            started_at_unix_ms: Some(456),
+            exit_code: Some(0xC000_0005),
+            worker_tree_exited: true,
+            containment_confirmed: true,
+            failure: Some(community_source::host::WorkerFailure::UnexpectedExit),
+        };
+        runner
+            .event(HostEvent::SampleCompleted {
+                job_id: 1,
+                channel: "example".into(),
+                outcome: Err(community_source::host::SourceFailure {
+                    code: "worker_failed",
+                    pauses_community: true,
+                }),
+            })
+            .await
+            .unwrap();
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: FaultReport {
+                    worker: Some(worker),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let status = runner.service.status.read().await.clone();
+        assert!(status.paused);
+        assert_eq!(status.cleanup_confirmed, Some(false));
+        assert!(status.cleanup_diagnostics.is_none());
+        let diagnostic = status.worker.unwrap();
+        assert_eq!(diagnostic.exit_code, Some(0xC000_0005));
+        assert!(diagnostic.containment_confirmed && diagnostic.worker_tree_exited);
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            earlier_source.or(Some(CommunityPauseReason::CleanupUnconfirmed))
+        );
+        assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+        assert!(runner.pending.is_none());
+        let starts = runner.host_start_attempts;
+        runner.control(Command::Resume).await.unwrap();
+        assert_eq!(runner.host_start_attempts, starts);
+        assert!(runner.paused);
+        assert!(runner.host.is_none());
+        assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+    }
+}
+
+#[tokio::test]
 async fn matching_cancelled_denial_still_persists_the_pause() {
     let (_directory, store, mut runner) = pending_fixture().await;
     runner.sync_channels(&[]);

@@ -379,11 +379,11 @@ pub struct Provenance {
     pub finished_monotonic_seconds: f64,
     pub finished_minus_response_ms: Option<f64>,
     #[serde(deserialize_with = "crate::worker::fixed_string")]
-    pub timing_order: &'static str,
+    pub timing_order: crate::worker::StructuralCode,
     #[serde(deserialize_with = "crate::worker::fixed_string")]
-    pub transport: &'static str,
+    pub transport: crate::worker::StructuralCode,
     #[serde(deserialize_with = "crate::worker::fixed_string")]
-    pub server_freshness: &'static str,
+    pub server_freshness: crate::worker::StructuralCode,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

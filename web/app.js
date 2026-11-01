@@ -731,6 +731,23 @@
       detail(summary, "Browser stop reason", communityStopLabel(data.host_termination.reason));
       detail(summary, "Browser stop recorded", communityEventTime(data.host_termination.observed_at_unix_ms));
     }
+    if (data.worker?.failure) {
+      const failures = {
+        start: "The browser process could not start.",
+        unexpected_exit: "The browser process exited unexpectedly.",
+        protocol: "Communication with the browser process failed.",
+        stalled: "The browser process stopped responding.",
+        shutdown_timeout: "The browser process did not close in time.",
+      };
+      const contained = data.worker.containment_confirmed === true && data.worker.worker_tree_exited === true;
+      detail(summary, "Browser process failure", Object.hasOwn(failures, data.worker.failure) ? failures[data.worker.failure] : "An unrecognized browser process failure occurred.");
+      detail(summary, "Browser failure contained", contained ? "Confirmed; all browser worker processes exited." : "Not confirmed.");
+      const exitCode = data.worker.exit_code;
+      if (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 0xffffffff) {
+        detail(summary, "Browser exit code", `0x${exitCode.toString(16).toUpperCase().padStart(8, "0")}`);
+      }
+      detail(summary, "Community recovery", contained ? "Restart Veylurk, then choose Resume for Community collection." : "Close Veylurk and confirm its browser processes have exited before restarting.");
+    }
     if (data.window_dismissal && Number.isSafeInteger(data.window_dismissal.count) && data.window_dismissal.count > 0) {
       detail(summary, "Helper window dismissals", `${count(data.window_dismissal.count)} · window minimized`);
     }

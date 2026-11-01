@@ -669,6 +669,32 @@ test("Community shows the source failure separately from cleanup and safely hand
   assert.doesNotMatch(app.get("community-status").textContent, /source diagnostic|Latest browser cleanup in this run/);
 });
 
+test("Community distinguishes contained worker failure from normal browser cleanup", async () => {
+  const status = communityState({ paused: true, cleanup_confirmed: false,
+    last_error: "cleanup_unconfirmed", persisted_pause_reason: "cleanup_unconfirmed",
+    worker: { failure: "unexpected_exit", exit_code: 0xc0000005, worker_tree_exited: true, containment_confirmed: true } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  const text = app.get("community-status").textContent;
+  assert.match(text, /Browser shutdown confirmationNot confirmed/);
+  assert.match(text, /The browser process exited unexpectedly/);
+  assert.match(text, /Browser failure containedConfirmed; all browser worker processes exited/);
+  assert.match(text, /Browser exit code0xC0000005/);
+  assert.match(text, /Restart Veylurk, then choose Resume for Community collection/);
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/community/resume"), false);
+});
+
+test("Community does not claim containment from partial diagnostics or render arbitrary worker codes", async () => {
+  let status = communityState({ worker: { failure: "<img src=x>", exit_code: -1, containment_confirmed: true, worker_tree_exited: false } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  assert.match(app.get("community-status").textContent, /Browser failure containedNot confirmed/);
+  assert.doesNotMatch(app.get("community-status").textContent, /<img|Browser exit code|Restart Veylurk, then choose Resume/);
+  status = communityState();
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.doesNotMatch(app.get("community-status").textContent, /Browser process failure|Browser failure contained|Community recovery/);
+});
+
 test("Community explains saved cleanup and ambiguous legacy pauses without attributing a Twitch denial", async () => {
   let status = communityState({ paused: true, last_error: "cleanup_unconfirmed", persisted_pause_reason: "cleanup_unconfirmed" });
   const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);

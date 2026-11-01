@@ -487,9 +487,14 @@ impl Coordinator {
             "integrity_denied" => CommunityPauseReason::IntegrityDenied,
             "challenge_denied" => CommunityPauseReason::ChallengeDenied,
             "rate_limited" => CommunityPauseReason::RateLimited,
-            "cleanup_unconfirmed" | "controller_cleanup_unconfirmed" | "operator_cancelled" => {
-                CommunityPauseReason::CleanupUnconfirmed
-            }
+            "cleanup_unconfirmed"
+            | "controller_cleanup_unconfirmed"
+            | "operator_cancelled"
+            | "worker_failed"
+            | "worker_start_failed"
+            | "worker_protocol_failure"
+            | "worker_stalled"
+            | "worker_shutdown_timeout" => CommunityPauseReason::CleanupUnconfirmed,
             _ => CommunityPauseReason::SourceDenied,
         };
         // Retain the first source barrier, including historically ambiguous
