@@ -7,7 +7,10 @@ use axum::{
     Json, Router,
 };
 use chrono::{SecondsFormat, Utc};
-use community_source::host::{HostEvent, HostHandle, HostOptions, SourceSample};
+use community_source::host::{
+    CleanupDiagnostics, FaultReport, HostEvent, HostHandle, HostOptions, PrimaryFailure,
+    SourceSample,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
@@ -37,6 +40,8 @@ pub struct Status {
     pub achieved_interval_seconds: Option<f64>,
     pub last_returned_accounts: Option<usize>,
     pub cleanup_confirmed: Option<bool>,
+    pub primary_failure: Option<PrimaryFailure>,
+    pub cleanup_diagnostics: Option<CleanupDiagnostics>,
     pub channels: Vec<ChannelCadenceStatus>,
 }
 
@@ -272,6 +277,8 @@ impl Community {
             achieved_interval_seconds: None,
             last_returned_accounts: None,
             cleanup_confirmed: None,
+            primary_failure: None,
+            cleanup_diagnostics: None,
             channels: Vec::new(),
         }));
         let (commands, receiver) = mpsc::channel(8);
@@ -676,12 +683,25 @@ impl Coordinator {
     async fn events(&mut self) -> Result<(), StoreError> {
         // Native status is bounded, and one outstanding job has one reserved completion slot.
         for _ in 0..8 {
+            if let Some(report) = self.host.as_ref().map(HostHandle::fault_report) {
+                self.record_fault(report).await;
+            }
             let Some(event) = self.host.as_ref().and_then(|host| host.try_event().ok()) else {
                 break;
             };
             self.event(event).await?;
         }
         Ok(())
+    }
+
+    async fn record_fault(&self, report: FaultReport) {
+        let mut status = self.service.status.write().await;
+        if report.primary_failure.is_some() {
+            status.primary_failure = report.primary_failure;
+        }
+        if report.cleanup_diagnostics.is_some() {
+            status.cleanup_diagnostics = report.cleanup_diagnostics;
+        }
     }
 
     async fn event(&mut self, event: HostEvent) -> Result<(), StoreError> {
@@ -739,7 +759,11 @@ impl Coordinator {
                     }
                 }
             }
-            HostEvent::Stopped { cleanup_confirmed } => {
+            HostEvent::Stopped {
+                cleanup_confirmed,
+                diagnostics,
+            } => {
+                self.record_fault(diagnostics).await;
                 self.host = None;
                 self.ready = false;
                 self.service.status.write().await.cleanup_confirmed = Some(cleanup_confirmed);

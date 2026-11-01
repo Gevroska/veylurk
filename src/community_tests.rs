@@ -437,6 +437,76 @@ async fn denied_pause_restores_on_startup_and_only_explicit_resume_clears_it() {
 }
 
 #[tokio::test]
+async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
+    let (_directory, store, mut runner) = pending_fixture().await;
+    let report = FaultReport {
+        primary_failure: Some(PrimaryFailure {
+            code: "navigation_ui_deadline",
+            stage: "preparing",
+            observed_at_unix_ms: 1,
+            controller_epoch: 7,
+            job_id: Some(1),
+            navigation_ready: true,
+            last_player_observation: Some(community_source::sampling::PlayerObservation {
+                video_paused: Some(true),
+                ..Default::default()
+            }),
+            script_pending: true,
+            network_pending: false,
+            response_pending: false,
+            trigger_pending: false,
+        }),
+        cleanup_diagnostics: Some(CleanupDiagnostics {
+            controller_epoch: 7,
+            expected_browser_pid: Some(100),
+            close_hresult: Some(0),
+            unsubscribe_hresult: Some(0),
+            elapsed_ms: 5000,
+            ..Default::default()
+        }),
+    };
+    runner.record_fault(report.clone()).await;
+    runner
+        .event(HostEvent::SampleCompleted {
+            job_id: 1,
+            channel: "example".into(),
+            outcome: Err(community_source::host::SourceFailure {
+                code: "navigation_ui_deadline",
+                pauses_community: false,
+            }),
+        })
+        .await
+        .unwrap();
+    runner
+        .event(HostEvent::Stopped {
+            cleanup_confirmed: false,
+            diagnostics: report,
+        })
+        .await
+        .unwrap();
+    let status = runner.service.status.read().await.clone();
+    assert_eq!(status.last_error, Some("cleanup_unconfirmed"));
+    assert!(status.paused);
+    let primary = status.primary_failure.unwrap();
+    assert_eq!(
+        (primary.code, primary.stage),
+        ("navigation_ui_deadline", "preparing")
+    );
+    assert!(primary.script_pending && primary.navigation_ready);
+    assert_eq!(
+        primary.last_player_observation.unwrap().video_paused,
+        Some(true)
+    );
+    assert!(!status.cleanup_diagnostics.unwrap().confirmed);
+    assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+    assert_eq!(
+        store.community_pause().await.unwrap(),
+        Some(CommunityPauseReason::SourceDenied)
+    );
+    runner.retire(CommunityRunEndReason::Paused).await.unwrap();
+}
+
+#[tokio::test]
 async fn matching_cancelled_denial_still_persists_the_pause() {
     let (_directory, store, mut runner) = pending_fixture().await;
     runner.sync_channels(&[]);

@@ -631,6 +631,12 @@
     detail(summary, "Latest returned accounts", count(data.last_returned_accounts));
     detail(summary, "Browser shutdown confirmation", data.cleanup_confirmed === true ? "Confirmed" : data.cleanup_confirmed === false ? "Not confirmed" : "Not reported");
     detail(summary, "Latest safe error code", data.last_error ? communityCode(data.last_error) : "None");
+    if (data.primary_failure) {
+      detail(summary, "Latest source failure in this run", `${communityCode(data.primary_failure.code)} · ${communityCode(data.primary_failure.stage)}`);
+    }
+    if (data.cleanup_diagnostics) {
+      detail(summary, "Latest browser cleanup in this run", data.cleanup_diagnostics.confirmed === true ? "Confirmed" : "Not confirmed");
+    }
     const oldTable = $("community-status").querySelector(".table-wrap");
     const tableScroll = oldTable ? oldTable.scrollLeft : 0;
     const tableFocused = oldTable && document.activeElement === oldTable;

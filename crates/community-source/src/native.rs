@@ -1,8 +1,8 @@
 //! Native Windows proof host. No private HTTP client, request replay, browser
 //! flags, cookie API, remote debugging port, or production collection.
 use crate::host::{
-    AcceptedJob, Bridge, HostOptions, QueuedCommand, ServiceExitGuard, SourceFailure, SourceSample,
-    Status, RECYCLE_NAVIGATIONS,
+    AcceptedJob, Bridge, BrowserLifecycle, FaultReport, HostOptions, PrimaryFailure, QueuedCommand,
+    ServiceExitGuard, SourceFailure, SourceSample, Status, RECYCLE_NAVIGATIONS,
 };
 use crate::{
     channel_login, is_channel_page, is_popout_page, parse_response,
@@ -127,7 +127,9 @@ struct State {
     script_pending_since: Option<Instant>,
     denied: bool,
     closing_at: Option<Instant>,
-    browser_exited: bool,
+    browser: BrowserLifecycle,
+    last_player_observation: Option<sampling::PlayerObservation>,
+    fault: FaultReport,
     evidence_write_failed: bool,
     tracker: Option<Tracker>,
     network_enabled: bool,
@@ -143,8 +145,6 @@ struct State {
     trigger_deadline: Option<sampling::TriggerDeadline>,
     controller_epoch: u64,
     recycling_at: Option<Instant>,
-    exiting_epoch: Option<u64>,
-    cleanup_detached: bool,
     initializing_at: Option<Instant>,
 }
 
@@ -249,6 +249,40 @@ impl App {
         if self.state.borrow().closing_at.is_some() || self.state.borrow().recycling_at.is_some() {
             return;
         }
+        if code != "operator_cancelled" {
+            let mut state = self.state.borrow_mut();
+            state.fault = FaultReport {
+                primary_failure: Some(PrimaryFailure {
+                    code,
+                    stage: match state.auto_stage {
+                        Some(AutoStage::Navigating(_)) => "navigating",
+                        Some(AutoStage::Preparing(_)) => "preparing",
+                        Some(AutoStage::Enabling(_)) => "enabling",
+                        Some(AutoStage::Ready(_)) => "ready",
+                        Some(AutoStage::Sampling) => "sampling",
+                        None if state.initializing_at.is_some() => "initializing",
+                        None => "idle",
+                    },
+                    observed_at_unix_ms: unix_milliseconds(),
+                    controller_epoch: state.controller_epoch,
+                    job_id: service
+                        .active
+                        .borrow()
+                        .as_ref()
+                        .map(|job| job.job_id)
+                        .or_else(|| service.bridge.control.pending_job().map(|job| job.job_id)),
+                    navigation_ready: state.navigation_ready,
+                    last_player_observation: state.last_player_observation.clone(),
+                    script_pending: state.script_pending,
+                    network_pending: state.network_pending,
+                    response_pending: state.pending,
+                    trigger_pending: state.trigger_pending,
+                }),
+                ..Default::default()
+            };
+            drop(state);
+            self.publish_fault();
+        }
         let active = service.active.borrow_mut().take();
         let job = active.or_else(|| {
             service.bridge.control.pending_job().filter(|job| {
@@ -292,67 +326,110 @@ impl App {
         self.disable_network();
         {
             let mut state = self.state.borrow_mut();
-            state.exiting_epoch = Some(state.controller_epoch);
-            state.controller_epoch += 1;
+            if state.browser.retire() {
+                state.controller_epoch += 1;
+            }
             state.recycling_at = Some(Instant::now());
-            state.browser_exited = false;
             state.auto_stage = None;
         }
-        let detached = self.detach_engine();
-        self.state.borrow_mut().cleanup_detached = detached;
+        self.detach_engine();
     }
 
-    fn detach_engine(&self) -> bool {
+    fn detach_engine(&self) {
         let Some(engine) = self.engine.borrow_mut().take() else {
-            return true;
+            return;
         };
-        let mut detached = true;
+        let record = |operation, result: windows::core::Result<()>| {
+            let hresult = result.err().map_or(0, |error| error.code().0);
+            self.state
+                .borrow_mut()
+                .browser
+                .detach_result(operation, hresult);
+        };
         unsafe {
             for (receiver, token) in &engine.protocol_receivers {
-                detached &= receiver
-                    .remove_DevToolsProtocolEventReceived(*token)
-                    .is_ok();
+                record(
+                    "remove_protocol_event",
+                    receiver.remove_DevToolsProtocolEventReceived(*token),
+                );
             }
-            detached &= engine
-                .core
-                .remove_NewWindowRequested(engine.new_window_token)
-                .is_ok();
-            detached &= engine
-                .core
-                .remove_NavigationStarting(engine.navigation_token)
-                .is_ok();
-            detached &= engine
-                .core
-                .remove_SourceChanged(engine.source_token)
-                .is_ok();
-            detached &= engine
-                .core
-                .remove_NavigationCompleted(engine.navigation_completed_token)
-                .is_ok();
-            detached &= engine
-                .core2
-                .remove_DOMContentLoaded(engine.document_loaded_token)
-                .is_ok();
-            detached &= engine
-                .core
-                .remove_ProcessFailed(engine.process_failed_token)
-                .is_ok();
-            detached &= engine.controller.Close().is_ok();
+            record(
+                "remove_new_window",
+                engine
+                    .core
+                    .remove_NewWindowRequested(engine.new_window_token),
+            );
+            record(
+                "remove_navigation_starting",
+                engine
+                    .core
+                    .remove_NavigationStarting(engine.navigation_token),
+            );
+            record(
+                "remove_source_changed",
+                engine.core.remove_SourceChanged(engine.source_token),
+            );
+            record(
+                "remove_navigation_completed",
+                engine
+                    .core
+                    .remove_NavigationCompleted(engine.navigation_completed_token),
+            );
+            record(
+                "remove_document_loaded",
+                engine
+                    .core2
+                    .remove_DOMContentLoaded(engine.document_loaded_token),
+            );
+            record(
+                "remove_process_failed",
+                engine
+                    .core
+                    .remove_ProcessFailed(engine.process_failed_token),
+            );
+            let result = engine
+                .controller
+                .Close()
+                .err()
+                .map_or(0, |error| error.code().0);
+            self.state.borrow_mut().browser.diagnostics.close_hresult = Some(result);
         }
         EXIT_ENV.with(|slot| {
             *slot.borrow_mut() = Some((engine.environment, engine.environment5, engine.exit_token))
         });
-        detached
     }
 
-    fn release_exit_environment(&self) -> bool {
+    fn release_exit_environment(&self) -> Option<i32> {
         EXIT_ENV.with(|slot| {
             slot.borrow_mut()
                 .take()
-                .is_none_or(|(_, environment5, token)| unsafe {
-                    environment5.remove_BrowserProcessExited(token).is_ok()
+                .map(|(_, environment5, token)| unsafe {
+                    environment5
+                        .remove_BrowserProcessExited(token)
+                        .err()
+                        .map_or(0, |error| error.code().0)
                 })
         })
+    }
+
+    fn complete_cleanup(&self, started: Instant) -> bool {
+        let unsubscribe = self.release_exit_environment();
+        let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let diagnostics = self.state.borrow_mut().browser.finish(elapsed, unsubscribe);
+        let confirmed = diagnostics.confirmed;
+        self.state.borrow_mut().fault.cleanup_diagnostics = Some(diagnostics);
+        self.publish_fault();
+        confirmed
+    }
+
+    fn publish_fault(&self) {
+        let Some(service) = &self.service else {
+            return;
+        };
+        let report = self.state.borrow().fault.clone();
+        // Publish before cancellation/Close without disk I/O or another worker.
+        // The reserved terminal slot carries this bounded snapshot through shutdown.
+        service.bridge.control.record_fault(report);
     }
 
     fn finish_service(&self, cleanup_confirmed: bool) {
@@ -406,11 +483,6 @@ impl App {
         };
         if service.bridge.control.shutdown.load(Ordering::Acquire) {
             service.bridge.control.stop_accepting();
-            if self.state.borrow().recycling_at.is_some() {
-                let recycled = self.state.borrow_mut().recycling_at.take();
-                self.state.borrow_mut().closing_at = recycled;
-                return;
-            }
             self.close();
             return;
         }
@@ -430,11 +502,9 @@ impl App {
         }
         let recycling = self.state.borrow().recycling_at;
         if let Some(started) = recycling {
-            let exited = self.state.borrow().browser_exited;
+            let exited = self.state.borrow().browser.diagnostics.normal_exit_observed;
             if exited || started.elapsed() >= FLUSH_TIME {
-                let exit_observer_detached = self.release_exit_environment();
-                let confirmed =
-                    exited && self.state.borrow().cleanup_detached && exit_observer_detached;
+                let confirmed = self.complete_cleanup(started);
                 if !confirmed {
                     service.bridge.emit(Status::Paused {
                         code: "controller_cleanup_unconfirmed",
@@ -445,8 +515,7 @@ impl App {
                 {
                     let mut state = self.state.borrow_mut();
                     state.recycling_at = None;
-                    state.exiting_epoch = None;
-                    state.browser_exited = false;
+                    state.browser = BrowserLifecycle::default();
                     state.navigation_gate = sampling::NavigationGate::default();
                     state.player_gate = sampling::PlayerGate::default();
                     state.selected_channel = None;
@@ -850,6 +919,7 @@ impl App {
         let intent = {
             let mut state = self.state.borrow_mut();
             state.navigation_ready = false;
+            state.last_player_observation = None;
             state.navigation_gate.begin()
         };
         let generation = self.state.borrow().generation;
@@ -1253,6 +1323,7 @@ impl App {
                 );
                 return Ok(());
             };
+            app.state.borrow_mut().last_player_observation = Some(ui.player.clone());
             if let Some(run) = app.evidence.borrow_mut().autonomous.as_mut() {
                 if let Some(attempt) = run.attempts.last_mut() {
                     attempt.video_element_present = Some(ui.player.video_present);
@@ -1880,7 +1951,10 @@ impl App {
             run.finalize(self.elapsed_ms(), "operator_cancelled");
         }
         self.cancel_round();
-        self.state.borrow_mut().closing_at = Some(Instant::now());
+        {
+            let mut state = self.state.borrow_mut();
+            state.closing_at = Some(state.recycling_at.take().unwrap_or_else(Instant::now));
+        }
         self.evidence.borrow_mut().phase = "closing";
         self.evidence.borrow_mut().browser_cleanup = "waiting_for_browser_exit";
         self.save();
@@ -1889,18 +1963,17 @@ impl App {
         );
         {
             let mut state = self.state.borrow_mut();
-            state.exiting_epoch = Some(state.controller_epoch);
-            state.controller_epoch += 1;
-            state.browser_exited = false;
+            if state.browser.retire() {
+                state.controller_epoch += 1;
+            }
         }
-        let detached = self.detach_engine();
-        self.state.borrow_mut().cleanup_detached = detached;
+        self.detach_engine();
     }
 
     fn tick(self: &Rc<Self>) {
         let closing = self.state.borrow().closing_at;
         if let Some(started) = closing {
-            let exited = self.state.borrow().browser_exited;
+            let exited = self.state.borrow().browser.diagnostics.normal_exit_observed;
             if exited || started.elapsed() >= FLUSH_TIME {
                 {
                     let mut evidence = self.evidence.borrow_mut();
@@ -1912,9 +1985,9 @@ impl App {
                     };
                 }
                 self.save();
-                let detached = self.release_exit_environment();
+                let confirmed = self.complete_cleanup(started);
                 if self.service.is_some() {
-                    self.finish_service(exited && detached && self.state.borrow().cleanup_detached);
+                    self.finish_service(confirmed);
                 } else {
                     unsafe {
                         let _ = DestroyWindow(self.hwnd);
@@ -2062,6 +2135,9 @@ unsafe fn attach(
     let core = controller.CoreWebView2()?;
     let core2: ICoreWebView2_2 = core.cast()?;
     let environment5: ICoreWebView2Environment5 = environment.cast()?;
+    let mut browser_pid = 0;
+    core.BrowserProcessId(&mut browser_pid)?;
+    app.state.borrow_mut().browser.bind(epoch, browser_pid);
     let mut protocol_receivers = Vec::new();
     for kind in [
         "Network.requestWillBeSent",
@@ -2093,12 +2169,18 @@ unsafe fn attach(
         protocol_receivers.push((receiver, token));
     }
     let weak = Rc::downgrade(app);
-    let exit_handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, _| {
-        if let Some(app) = weak.upgrade() {
-            if app.state.borrow().exiting_epoch != Some(epoch) && !app.controller_current(epoch) {
-                return Ok(());
-            }
-            app.state.borrow_mut().browser_exited = true;
+    let exit_handler = BrowserProcessExitedEventHandler::create(Box::new(move |_, args| {
+        if let (Some(app), Some(args)) = (weak.upgrade(), args) {
+            let mut pid = 0;
+            let mut kind = COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND(0);
+            args.BrowserProcessId(&mut pid)?;
+            args.BrowserProcessExitKind(&mut kind)?;
+            app.state.borrow_mut().browser.observe_exit(
+                epoch,
+                pid,
+                kind.0,
+                kind == COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND_NORMAL,
+            );
         }
         Ok(())
     }));
@@ -2605,6 +2687,59 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn closing_during_recycle_preserves_exit_identity_and_original_deadline() {
+        let (_handle, app) = fixture();
+        app.state.borrow_mut().browser.bind(3, 100);
+        app.state.borrow_mut().browser.observe_exit(3, 100, 0, true);
+        app.begin_recycle();
+        let started = app.state.borrow().recycling_at.unwrap();
+        assert_eq!(app.epoch(), 4);
+        app.close();
+        assert_eq!(app.epoch(), 4);
+        assert_eq!(app.state.borrow().closing_at, Some(started));
+        assert!(app.state.borrow().recycling_at.is_none());
+        assert!(app.state.borrow().browser.diagnostics.normal_exit_observed);
+        assert_eq!(app.state.borrow().browser.diagnostics.controller_epoch, 3);
+    }
+
+    #[test]
+    fn primary_failure_snapshot_precedes_cancellation_and_survives_cleanup_failure() {
+        let (handle, app) = fixture();
+        handle.try_sample(44, "room").unwrap();
+        {
+            let mut state = app.state.borrow_mut();
+            state.auto_stage = Some(AutoStage::Preparing(Instant::now()));
+            state.navigation_ready = true;
+            state.script_pending = true;
+            state.network_pending = true;
+            state.pending = true;
+            state.last_player_observation = Some(sampling::PlayerObservation {
+                video_paused: Some(true),
+                ..Default::default()
+            });
+        }
+        app.service_failure("navigation_ui_deadline", false);
+        assert!(!app.state.borrow().script_pending);
+        let report = handle.fault_report();
+        let primary = report.primary_failure.unwrap();
+        assert_eq!(
+            (primary.code, primary.stage, primary.job_id),
+            ("navigation_ui_deadline", "preparing", Some(44))
+        );
+        assert!(primary.script_pending && primary.network_pending && primary.response_pending);
+        assert_eq!(
+            primary.last_player_observation.unwrap().video_paused,
+            Some(true)
+        );
+        assert!(!app.complete_cleanup(Instant::now()));
+        assert_eq!(
+            handle.fault_report().primary_failure.unwrap().code,
+            "navigation_ui_deadline"
+        );
+        assert!(!handle.fault_report().cleanup_diagnostics.unwrap().confirmed);
+    }
+
+    #[test]
     fn login_publication_after_an_older_timer_snapshot_does_not_fence_its_own_callback() {
         let (handle, app) = fixture();
         let service = app.service.as_ref().unwrap();
@@ -2681,6 +2816,7 @@ mod lifecycle_tests {
                 }
                 Ok(crate::host::HostEvent::Stopped {
                     cleanup_confirmed: false,
+                    ..
                 }) => {
                     stopped = true;
                     break;

@@ -1,6 +1,7 @@
 //! Bounded typed interface. No COM object, URL, script, or credential crosses it.
 #![cfg_attr(not(windows), allow(dead_code))]
 use crate::{channel_login, is_channel_page, sampling::Provenance, ParsedSample, CATEGORIES};
+use serde::Serialize;
 use std::{
     path::PathBuf,
     sync::{
@@ -89,6 +90,117 @@ pub struct SourceFailure {
     pub pauses_community: bool,
 }
 
+/// Allowlisted structural state only. Never a page string, URL, account or token.
+#[derive(Clone, Debug, Serialize)]
+pub struct PrimaryFailure {
+    pub code: &'static str,
+    pub stage: &'static str,
+    pub observed_at_unix_ms: i64,
+    pub controller_epoch: u64,
+    pub job_id: Option<u64>,
+    pub navigation_ready: bool,
+    pub last_player_observation: Option<crate::sampling::PlayerObservation>,
+    pub script_pending: bool,
+    pub network_pending: bool,
+    pub response_pending: bool,
+    pub trigger_pending: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeOperationFailure {
+    pub operation: &'static str,
+    pub hresult: i32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CleanupDiagnostics {
+    pub controller_epoch: u64,
+    pub expected_browser_pid: Option<u32>,
+    pub observed_exit_pid: Option<u32>,
+    pub observed_exit_kind: Option<i32>,
+    pub normal_exit_observed: bool,
+    pub close_hresult: Option<i32>,
+    pub first_detach_failure: Option<NativeOperationFailure>,
+    pub unsubscribe_hresult: Option<i32>,
+    pub elapsed_ms: u64,
+    pub confirmed: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FaultReport {
+    pub primary_failure: Option<PrimaryFailure>,
+    pub cleanup_diagnostics: Option<CleanupDiagnostics>,
+}
+
+/// An exit belongs to a browser identity, not to the time retirement was requested.
+#[derive(Default)]
+pub(crate) struct BrowserLifecycle {
+    pub diagnostics: CleanupDiagnostics,
+    bound: bool,
+    retiring: bool,
+}
+
+impl BrowserLifecycle {
+    pub fn bind(&mut self, epoch: u64, pid: u32) {
+        *self = Self {
+            diagnostics: CleanupDiagnostics {
+                controller_epoch: epoch,
+                expected_browser_pid: (pid != 0).then_some(pid),
+                ..Default::default()
+            },
+            bound: true,
+            retiring: false,
+        };
+    }
+
+    pub fn retire(&mut self) -> bool {
+        if self.retiring {
+            return false;
+        }
+        self.retiring = true;
+        true
+    }
+
+    pub fn observe_exit(&mut self, epoch: u64, pid: u32, kind: i32, normal: bool) {
+        if !self.bound || epoch != self.diagnostics.controller_epoch {
+            return;
+        }
+        if self.diagnostics.observed_exit_pid == self.diagnostics.expected_browser_pid
+            && self.diagnostics.observed_exit_kind.is_some()
+        {
+            return;
+        }
+        self.diagnostics.observed_exit_pid = Some(pid);
+        self.diagnostics.observed_exit_kind = Some(kind);
+        self.diagnostics.normal_exit_observed |=
+            normal && self.diagnostics.expected_browser_pid == Some(pid) && pid != 0;
+    }
+
+    pub fn detach_result(&mut self, operation: &'static str, hresult: i32) {
+        if hresult < 0 && self.diagnostics.first_detach_failure.is_none() {
+            self.diagnostics.first_detach_failure =
+                Some(NativeOperationFailure { operation, hresult });
+        }
+    }
+
+    pub fn finish(
+        &mut self,
+        elapsed_ms: u64,
+        unsubscribe_hresult: Option<i32>,
+    ) -> CleanupDiagnostics {
+        self.diagnostics.elapsed_ms = elapsed_ms;
+        self.diagnostics.unsubscribe_hresult = unsubscribe_hresult;
+        self.diagnostics.confirmed = self.diagnostics.normal_exit_observed
+            && self
+                .diagnostics
+                .close_hresult
+                .is_some_and(|result| result >= 0)
+            && self.diagnostics.first_detach_failure.is_none()
+            && unsubscribe_hresult.is_some_and(|result| result >= 0);
+        self.diagnostics.clone()
+    }
+}
+
 // Storage is fixed: four queued statuses plus one completion and one terminal
 // slot. Keeping the payload inline avoids an extra allocation per receipt.
 #[allow(clippy::large_enum_variant)]
@@ -105,6 +217,7 @@ pub enum HostEvent {
     },
     Stopped {
         cleanup_confirmed: bool,
+        diagnostics: FaultReport,
     },
 }
 
@@ -122,6 +235,7 @@ struct Admission {
     accepted: Option<AcceptedJob>,
     completion: Option<HostEvent>,
     terminal: Option<HostEvent>,
+    diagnostics: FaultReport,
 }
 
 impl Default for Control {
@@ -137,6 +251,7 @@ impl Default for Control {
                 accepted: None,
                 completion: None,
                 terminal: None,
+                diagnostics: FaultReport::default(),
             }),
         }
     }
@@ -197,6 +312,13 @@ impl Admission {
 }
 
 impl Control {
+    pub fn record_fault(&self, report: FaultReport) {
+        self.admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .diagnostics = report;
+    }
+
     pub fn login_cancel_version(&self, publication: u64) -> Option<u64> {
         // A receiver may dequeue before show_login returns, but this lock
         // fences it until that publication has committed its exact version.
@@ -284,7 +406,10 @@ impl Control {
                 });
             }
         }
-        admission.terminal = Some(HostEvent::Stopped { cleanup_confirmed });
+        admission.terminal = Some(HostEvent::Stopped {
+            cleanup_confirmed,
+            diagnostics: admission.diagnostics.clone(),
+        });
     }
 }
 
@@ -336,6 +461,14 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    pub fn fault_report(&self) -> FaultReport {
+        self.control
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .diagnostics
+            .clone()
+    }
     pub fn spawn(options: HostOptions) -> Result<Self, HostError> {
         if !options.profile_dir.is_absolute() {
             return Err(HostError::InvalidProfileDirectory);
@@ -468,6 +601,127 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
 
+    #[test]
+    fn early_identity_bound_exit_survives_retirement_and_close_transition() {
+        let mut browser = BrowserLifecycle::default();
+        browser.bind(7, 100);
+        browser.observe_exit(7, 100, 0, true);
+        assert!(browser.retire());
+        assert!(
+            !browser.retire(),
+            "recycle-to-close must keep its retirement identity"
+        );
+        browser.diagnostics.close_hresult = Some(0);
+        assert!(browser.finish(12, Some(0)).confirmed);
+        browser.bind(8, 100);
+        browser.observe_exit(7, 100, 0, true);
+        browser.diagnostics.close_hresult = Some(0);
+        assert!(!browser.finish(5000, Some(0)).confirmed);
+    }
+
+    #[test]
+    fn stale_mismatched_and_abnormal_exits_never_confirm_cleanup() {
+        for (epoch, pid, kind, normal) in [(6, 100, 0, true), (7, 200, 0, true), (7, 100, 1, false)]
+        {
+            let mut browser = BrowserLifecycle::default();
+            browser.bind(7, 100);
+            browser.observe_exit(epoch, pid, kind, normal);
+            browser.retire();
+            browser.diagnostics.close_hresult = Some(0);
+            assert!(!browser.finish(5000, Some(0)).confirmed);
+            if kind == 1 {
+                browser.observe_exit(7, 100, 0, true);
+                assert_eq!(browser.diagnostics.observed_exit_kind, Some(1));
+                assert!(!browser.finish(5001, Some(0)).confirmed);
+            }
+        }
+        let mut browser = BrowserLifecycle::default();
+        browser.bind(7, 0);
+        browser.observe_exit(7, 0, 0, true);
+        browser.diagnostics.close_hresult = Some(0);
+        assert!(!browser.finish(5000, Some(0)).confirmed);
+    }
+
+    #[test]
+    fn every_cleanup_operation_is_required_and_first_detach_failure_is_retained() {
+        for failure in 0..4 {
+            let mut browser = BrowserLifecycle::default();
+            browser.bind(7, 100);
+            browser.retire();
+            browser.observe_exit(7, 100, 0, true);
+            browser.diagnostics.close_hresult = Some(if failure == 0 { -1 } else { 0 });
+            if failure == 1 {
+                browser.detach_result("remove_protocol_event", -2);
+                browser.detach_result("remove_navigation_starting", -3);
+                assert_eq!(
+                    browser
+                        .diagnostics
+                        .first_detach_failure
+                        .as_ref()
+                        .unwrap()
+                        .operation,
+                    "remove_protocol_event"
+                );
+            }
+            let unsubscribe = match failure {
+                2 => Some(-4),
+                3 => None,
+                _ => Some(0),
+            };
+            let result = browser.finish(5000, unsubscribe);
+            assert!(!result.confirmed);
+            assert!(result.normal_exit_observed);
+        }
+    }
+
+    #[test]
+    fn reserved_terminal_preserves_fault_report_when_status_queue_is_full() {
+        let (handle, bridge) = HostHandle::channel();
+        for _ in 0..12 {
+            bridge.emit(Status::Ready);
+        }
+        bridge.control.record_fault(FaultReport {
+            primary_failure: Some(PrimaryFailure {
+                code: "navigation_ui_deadline",
+                stage: "preparing",
+                observed_at_unix_ms: 1,
+                controller_epoch: 7,
+                job_id: Some(1),
+                navigation_ready: true,
+                last_player_observation: None,
+                script_pending: true,
+                network_pending: false,
+                response_pending: false,
+                trigger_pending: false,
+            }),
+            cleanup_diagnostics: Some(CleanupDiagnostics {
+                controller_epoch: 7,
+                close_hresult: Some(-1),
+                ..Default::default()
+            }),
+        });
+        bridge.control.terminate(false, "operator_cancelled");
+        for _ in 0..4 {
+            assert!(matches!(handle.try_event(), Ok(HostEvent::Ready)));
+        }
+        let Ok(HostEvent::Stopped {
+            cleanup_confirmed,
+            diagnostics,
+        }) = handle.try_event()
+        else {
+            panic!("missing reserved terminal");
+        };
+        assert!(!cleanup_confirmed);
+        assert_eq!(
+            diagnostics.primary_failure.unwrap().code,
+            "navigation_ui_deadline"
+        );
+        assert_eq!(
+            diagnostics.cleanup_diagnostics.unwrap().close_hresult,
+            Some(-1)
+        );
+    }
+
     fn failure() -> Result<SourceSample, SourceFailure> {
         Err(SourceFailure {
             code: "operator_cancelled",
@@ -516,7 +770,8 @@ mod tests {
         assert!(matches!(
             handle.try_event(),
             Ok(HostEvent::Stopped {
-                cleanup_confirmed: true
+                cleanup_confirmed: true,
+                ..
             })
         ));
         bridge.control.terminate(false, "native_host_interrupted");
@@ -578,7 +833,8 @@ mod tests {
             assert!(matches!(
                 handle.try_event(),
                 Ok(HostEvent::Stopped {
-                    cleanup_confirmed: true
+                    cleanup_confirmed: true,
+                    ..
                 })
             ));
             assert!(handle.try_event().is_err());
@@ -613,7 +869,8 @@ mod tests {
         assert!(matches!(
             handle.try_event(),
             Ok(HostEvent::Stopped {
-                cleanup_confirmed: false
+                cleanup_confirmed: false,
+                ..
             })
         ));
         assert!(handle.try_event().is_err());

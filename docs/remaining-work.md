@@ -142,3 +142,32 @@ member receipts. Fixed settings migrated intact; legacy PATCH requests preserved
 the current mode; explicit Adaptive targets matched the saved response counts.
 The production installation was unchanged. Long reliability trials remain owner-managed.
 See [the cadence contract](community-cadence.md).
+
+## Community cleanup recovery candidate
+
+The isolated test instance reported repeated source timeouts followed by
+`cleanup_unconfirmed`. The retained generic `source_denied` pause is a conservative
+safety latch, not evidence of Twitch authentication or integrity denial. A later
+controlled rotation on the previous binary accepted one sample and reported
+`navigation_ui_deadline` for the next channel with confirmed cleanup; a page
+readiness timeout alone therefore does not establish a browser cleanup fault.
+
+The recovery candidate preserves a browser exit already observed before retirement,
+checks its controller epoch, expected browser PID and normal exit kind, and keeps
+the same identity and deadline when recycling changes to closing. Confirmation
+still requires successful handler detachment, controller Close and exit-observer
+removal, plus the matching BrowserProcessExited event within the existing bounded
+wait. There is no process-handle substitute, deadline extension, player-gate change
+or automatic bypass of a denial pause.
+
+Community status now separates the latest structural primary source failure from
+cleanup diagnostics for the current application run. These bounded typed snapshots
+remain in memory and the reserved terminal event; they are not persisted to disk.
+Reporting does not perform disk I/O on the native thread or delay browser cleanup.
+The generic pause still persists unchanged, and the runtime does not infer a past
+primary failure from it after restart. Persistent fault reporting is deferred. Native and
+coordinator regression tests cover identity, early/stale/abnormal exits, close during
+recycling, cleanup operation failures and preservation of the primary failure.
+Source review, hosted Windows checks and a short isolated test rotation remain
+pending for this candidate. Production port 8795 and its executable are outside
+this recovery task.

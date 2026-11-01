@@ -591,6 +591,25 @@ test("Community starts disabled without browser actions and reports scheduling l
   assert.equal(/type="password"/.test(html), false);
 });
 
+test("Community shows the source failure separately from cleanup and safely handles older status", async () => {
+  let status = communityState({ paused: true, last_error: "cleanup_unconfirmed",
+    primary_failure: { code: "navigation_ui_deadline", stage: "preparing" },
+    cleanup_diagnostics: { confirmed: false } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  assert.match(app.get("community-status").textContent, /Latest safe error codecleanup_unconfirmed/);
+  assert.match(app.get("community-status").textContent, /Latest source failure in this runnavigation_ui_deadline · preparing/);
+  assert.match(app.get("community-status").textContent, /Latest browser cleanup in this runNot confirmed/);
+  status = communityState({ primary_failure: { code: '<img src=x>', stage: 'unsafe code' }, cleanup_diagnostics: { confirmed: true } });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /Latest source failure in this rununknown · unknown/);
+  assert.match(app.get("community-status").textContent, /Latest browser cleanup in this runConfirmed/);
+  assert.doesNotMatch(app.get("community-status").textContent, /<img|unsafe code/);
+  status = communityState();
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.doesNotMatch(app.get("community-status").textContent, /Latest source failure in this run|Latest browser cleanup in this run/);
+});
+
 test("Community settings validate full writes and preserve unsaved values across refreshes", async () => {
   let saved = { enabled: false, target_interval_seconds: 300 };
   const app = createApp((target, options) => {

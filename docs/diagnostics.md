@@ -2,6 +2,16 @@
 
 The application keeps bounded fault records independently of SQLite. This makes a failed storage operation inspectable even when the database cannot accept a diagnostic row. The records are local operational evidence, separate from account observations and inferred visits.
 
+## Community browser faults
+
+Community status keeps the latest source failure separately from the browser cleanup result. A page-readiness deadline can therefore remain visible even if cleanup subsequently fails. The interface labels these details as belonging to the current run. A persisted generic `source_denied` pause from an older run does not establish that Twitch denied a request.
+
+The current Community diagnostic snapshot contains fixed failure and phase codes, structural readiness flags, browser identity, numeric exit and operation results, and elapsed cleanup time. It contains no account names, page text, URLs, cookies or credentials. These details are held in bounded memory and carried with the reserved terminal event. They are not saved across application restarts; the persisted pause remains separate. Browser cleanup performs no diagnostic file writes.
+
+Browser cleanup requires a matching normal browser-exit notification and successful controller and observer cleanup. An event received before retirement is retained for the same browser identity. A shutdown requested during recycling uses that existing retirement rather than losing its identity. A page timeout may use the existing per-channel backoff after confirmed cleanup; an actual source denial or uncertain cleanup still requires explicit Resume. No player-readiness or source-authentication checks are relaxed.
+
+## Storage fault journal
+
 The journal uses the database filename followed by `.diagnostics.jsonl`, beside that database, and at most one `.previous` file. Each file is limited to 64 KiB, each record to 1 KiB, and each process to 64 recorded faults. A bounded writer queue holds at most 16 records. Diagnostic I/O runs outside the SQLite worker so a diagnostic file cannot add a blocking write to an already failing collection transaction.
 
 ## Reading a fault
