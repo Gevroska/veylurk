@@ -2,8 +2,8 @@
 //! flags, cookie API, remote debugging port, or production collection.
 use crate::host::{
     AcceptedJob, Bridge, BrowserLifecycle, FaultReport, HostOptions, HostTermination,
-    HostTerminationReason, PrimaryFailure, QueuedCommand, ServiceExitGuard, SourceFailure,
-    SourceSample, Status, WindowDismissal, RECYCLE_NAVIGATIONS,
+    HostTerminationReason, NavigationFailure, PrimaryFailure, QueuedCommand, ServiceExitGuard,
+    SourceFailure, SourceSample, Status, WindowDismissal, RECYCLE_NAVIGATIONS,
 };
 use crate::{
     channel_login, is_channel_page, is_popout_page, parse_response,
@@ -147,6 +147,7 @@ struct State {
     controller_epoch: u64,
     recycling_at: Option<Instant>,
     initializing_at: Option<Instant>,
+    login_failure_reported: bool,
 }
 
 type PendingCompletion = (u64, std::result::Result<SourceSample, SourceFailure>);
@@ -243,6 +244,98 @@ impl App {
             && self.callbacks_allowed()
     }
 
+    fn owner_login_navigation_failure(&self, failure: NavigationFailure) -> bool {
+        let Some(service) = &self.service else {
+            return false;
+        };
+        if !*service.login_visible.borrow()
+            || service.active.borrow().is_some()
+            || service.bridge.control.pending_job().is_some()
+            || service.pending_result.borrow().is_some()
+            || matches!(
+                *service.pending_command.borrow(),
+                Some(QueuedCommand::Sample { .. })
+            )
+            || self.state.borrow().auto_stage.is_some()
+        {
+            return false;
+        }
+        if self.state.borrow().login_failure_reported {
+            return true;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.login_failure_reported = true;
+            state.fault.primary_failure = Some(PrimaryFailure {
+                code: "navigation_failed",
+                stage: "sign_in",
+                observed_at_unix_ms: unix_milliseconds(),
+                controller_epoch: state.controller_epoch,
+                job_id: None,
+                navigation_ready: state.navigation_ready,
+                last_player_observation: state.last_player_observation.clone(),
+                script_pending: state.script_pending,
+                network_pending: state.network_pending,
+                response_pending: state.pending,
+                trigger_pending: state.trigger_pending,
+                navigation_failure: Some(failure),
+            });
+        }
+        // A failed/cancelled sign-in navigation may accompany a normal client
+        // redirect. Keep the owner browser alive; do not stop or replay it.
+        self.publish_fault();
+        self.status("Sign-in navigation failed. Reopen sign-in from the main app to try again. Collection remains paused.");
+        service.bridge.emit(Status::LoginFailed);
+        true
+    }
+
+    fn navigation_request_failed(&self, epoch: u64, generation: u64, hresult: i32) {
+        if !self.callback_current(epoch, generation) {
+            return;
+        }
+        if !self.owner_login_navigation_failure(NavigationFailure::Navigate { hresult }) {
+            self.fail(
+                "navigation_failed",
+                "Could not open the requested native page.",
+            );
+        }
+    }
+
+    fn navigation_completed(&self, epoch: u64, id: u64, success: bool, web_error_status: i32) {
+        if !self.controller_current(epoch) || !self.callbacks_allowed() {
+            return;
+        }
+        let current = self.state.borrow().navigation_gate.completed(id);
+        if current {
+            self.state.borrow_mut().navigation_ready = success;
+        }
+        {
+            let mut evidence = self.evidence.borrow_mut();
+            evidence.browser_diagnostics.navigation_completed_count += 1;
+            if current {
+                evidence.browser_diagnostics.last_navigation_id = Some(id);
+                evidence.browser_diagnostics.last_navigation_success = Some(success);
+                evidence.browser_diagnostics.last_web_error_status =
+                    (!success).then_some(web_error_status);
+            }
+        }
+        if current && self.save() {
+            if success {
+                if !self.state.borrow().login_failure_reported {
+                    self.status("Native page loaded. Login and Community access still require their own evidence.");
+                }
+            } else if self.owner_login_navigation_failure(NavigationFailure::NavigationCompleted {
+                web_error_status,
+            }) {
+                // The owner must explicitly reopen sign-in or Resume collection.
+            } else if self.automatic() {
+                self.end_auto_attempt("navigation_failed", true);
+            } else {
+                self.status(&format!("Browser navigation failed (WebView2 error {web_error_status}). No login or Community sample is verified."));
+            }
+        }
+    }
+
     fn service_failure(&self, code: &'static str, pauses_community: bool) {
         let Some(service) = &self.service else {
             return;
@@ -286,6 +379,7 @@ impl App {
                     network_pending: state.network_pending,
                     response_pending: state.pending,
                     trigger_pending: state.trigger_pending,
+                    navigation_failure: None,
                 }),
                 host_termination: state.fault.host_termination.clone(),
                 window_dismissal: state.fault.window_dismissal.clone(),
@@ -661,13 +755,14 @@ impl App {
                             state.selected_channel = None;
                             state.auto_stage = None;
                             state.player_gate = sampling::PlayerGate::default();
+                            state.login_failure_reported = false;
                         }
                         *service.login_visible.borrow_mut() = true;
                         unsafe {
                             let _ = ShowWindow(self.hwnd, SW_RESTORE);
                         }
-                        self.navigate("https://www.twitch.tv/login".into());
                         service.bridge.emit(Status::LoginShown);
+                        self.navigate("https://www.twitch.tv/login".into());
                     }
                     QueuedCommand::Sample { job } => {
                         if !service.bridge.control.is_pending(job.ticket) {
@@ -1014,11 +1109,8 @@ impl App {
                             return Ok(());
                         }
                         let url = wide(&url);
-                        if unsafe { core.Navigate(PCWSTR(url.as_ptr())) }.is_err() {
-                            app.fail(
-                                "navigation_failed",
-                                "Could not open the requested native page.",
-                            );
+                        if let Err(error) = unsafe { core.Navigate(PCWSTR(url.as_ptr())) } {
+                            app.navigation_request_failed(epoch, generation, error.code().0);
                         }
                     }
                 }
@@ -2316,8 +2408,8 @@ unsafe fn attach(
     let mut source_token = 0;
     core.add_SourceChanged(&source_handler, &mut source_token)?;
     let weak = Rc::downgrade(app);
-    let navigation_completed_handler = NavigationCompletedEventHandler::create(Box::new(
-        move |_, args| {
+    let navigation_completed_handler =
+        NavigationCompletedEventHandler::create(Box::new(move |_, args| {
             if let (Some(app), Some(args)) = (weak.upgrade(), args) {
                 if !app.controller_current(epoch) || !app.callbacks_allowed() {
                     return Ok(());
@@ -2331,37 +2423,10 @@ unsafe fn attach(
                 args.IsSuccess(&mut success)?;
                 args.WebErrorStatus(&mut error)?;
                 args.NavigationId(&mut id)?;
-                let current = app.state.borrow().navigation_gate.completed(id);
-                if current {
-                    app.state.borrow_mut().navigation_ready = success.as_bool();
-                }
-                {
-                    let mut evidence = app.evidence.borrow_mut();
-                    evidence.browser_diagnostics.navigation_completed_count += 1;
-                    if current {
-                        evidence.browser_diagnostics.last_navigation_id = Some(id);
-                        evidence.browser_diagnostics.last_navigation_success =
-                            Some(success.as_bool());
-                        evidence.browser_diagnostics.last_web_error_status = if success.as_bool() {
-                            None
-                        } else {
-                            Some(error.0)
-                        };
-                    }
-                }
-                if current && app.save() {
-                    if success.as_bool() {
-                        app.status("Native page loaded. Login and Community access still require their own evidence.");
-                    } else if app.automatic() {
-                        app.end_auto_attempt("navigation_failed", true);
-                    } else {
-                        app.status(&format!("Browser navigation failed (WebView2 error {}). No login or Community sample is verified.", error.0));
-                    }
-                }
+                app.navigation_completed(epoch, id, success.as_bool(), error.0);
             }
             Ok(())
-        },
-    ));
+        }));
     let mut navigation_completed_token = 0;
     core.add_NavigationCompleted(
         &navigation_completed_handler,
@@ -2767,6 +2832,116 @@ mod lifecycle_tests {
             }),
         });
         (handle, app)
+    }
+
+    fn login_navigation(app: &App) {
+        *app.service.as_ref().unwrap().login_visible.borrow_mut() = true;
+        let mut state = app.state.borrow_mut();
+        let intent = state.navigation_gate.begin();
+        assert!(state.navigation_gate.issue(intent));
+        assert!(state.navigation_gate.started(50));
+    }
+
+    #[test]
+    fn owner_sign_in_navigation_failure_is_bounded_and_keeps_the_browser_and_denial() {
+        for synchronous in [false, true] {
+            let (handle, app) = fixture();
+            login_navigation(&app);
+            app.state.borrow_mut().denied = true;
+            if synchronous {
+                app.navigation_request_failed(3, 7, -2147467259);
+            } else {
+                app.navigation_completed(3, 50, false, 14);
+            }
+            let first = handle.fault_report().primary_failure.unwrap();
+            assert_eq!(
+                (first.code, first.stage, first.job_id),
+                ("navigation_failed", "sign_in", None)
+            );
+            assert_eq!(
+                first.navigation_failure,
+                Some(if synchronous {
+                    NavigationFailure::Navigate {
+                        hresult: -2147467259,
+                    }
+                } else {
+                    NavigationFailure::NavigationCompleted {
+                        web_error_status: 14,
+                    }
+                })
+            );
+            app.navigation_completed(3, 50, false, 15);
+            let retained = handle.fault_report().primary_failure.unwrap();
+            assert_eq!(retained.observed_at_unix_ms, first.observed_at_unix_ms);
+            assert_eq!(retained.navigation_failure, first.navigation_failure);
+            assert!(matches!(
+                handle.try_event(),
+                Ok(crate::host::HostEvent::LoginFailed)
+            ));
+            assert!(handle.try_event().is_err());
+            app.navigation_completed(3, 50, false, 16);
+            assert!(
+                handle.try_event().is_err(),
+                "later failures must not spam events"
+            );
+            assert_eq!((app.epoch(), app.state.borrow().generation), (3, 7));
+            assert!(app.state.borrow().denied);
+            assert!(app.state.borrow().closing_at.is_none());
+            assert!(app.state.borrow().recycling_at.is_none());
+            assert!(app.state.borrow().navigation_gate.completed(50));
+            assert!(handle.fault_report().host_termination.is_none());
+            let service = app.service.as_ref().unwrap();
+            assert!(*service.login_visible.borrow());
+            assert!(service.pending_command.borrow().is_none());
+            assert!(
+                service.bridge.commands.try_recv().is_err(),
+                "no automatic replay"
+            );
+            handle.show_login().unwrap();
+            let QueuedCommand::ShowLogin { publication } =
+                service.bridge.commands.try_recv().unwrap()
+            else {
+                panic!("expected explicit login publication");
+            };
+            assert!(service.accept_login_publication(publication));
+        }
+    }
+
+    #[test]
+    fn stale_sign_in_navigation_callbacks_cannot_publish_a_failure() {
+        let (handle, app) = fixture();
+        login_navigation(&app);
+        app.navigation_completed(2, 50, false, 14);
+        app.navigation_completed(3, 49, false, 14);
+        app.navigation_request_failed(2, 7, -1);
+        app.navigation_request_failed(3, 6, -1);
+        let intent = app.state.borrow_mut().navigation_gate.begin();
+        assert!(app.state.borrow_mut().navigation_gate.issue(intent));
+        app.navigation_completed(3, 50, false, 14);
+        handle.cancel();
+        app.navigation_request_failed(3, 7, -1);
+        assert!(handle.fault_report().primary_failure.is_none());
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn owner_sign_in_failure_path_excludes_collection_work() {
+        for pending in [false, true] {
+            let (handle, app) = fixture();
+            login_navigation(&app);
+            if pending {
+                handle.try_sample(42, "room").unwrap();
+            } else {
+                *app.service.as_ref().unwrap().login_visible.borrow_mut() = false;
+            }
+            assert!(
+                !app.owner_login_navigation_failure(NavigationFailure::NavigationCompleted {
+                    web_error_status: 14
+                })
+            );
+            assert!(handle.fault_report().primary_failure.is_none());
+            assert!(handle.try_event().is_err());
+        }
     }
 
     #[test]

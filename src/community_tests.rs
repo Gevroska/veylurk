@@ -437,6 +437,75 @@ async fn denied_pause_restores_on_startup_and_only_explicit_resume_clears_it() {
 }
 
 #[tokio::test]
+async fn sign_in_navigation_failure_keeps_owner_pause_and_denial_until_explicit_recovery() {
+    for denial in [None, Some(CommunityPauseReason::RateLimited)] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("test.sqlite3"))
+            .await
+            .unwrap();
+        store.set_community_pause(denial).await.unwrap();
+        let (service, mut runner) =
+            Community::initialize(store.clone(), directory.path().join("profile"))
+                .await
+                .unwrap();
+        runner
+            .control(Command::Settings(CommunitySettingsUpdate {
+                enabled: true,
+                target_interval_seconds: 300,
+                cadence_mode: Some(CommunityCadenceMode::Adaptive),
+            }))
+            .await
+            .unwrap();
+        runner.sync_channels(&["example".into()]);
+        runner.event(HostEvent::LoginShown).await.unwrap();
+        runner.event(HostEvent::LoginFailed).await.unwrap();
+        runner.refresh_status().await;
+        {
+            let status = service.status.read().await;
+            assert!(status.paused);
+            assert_eq!(status.state, "paused");
+            assert_eq!(status.last_error, Some("sign_in_navigation_failed"));
+            assert!(status.next_due_at_utc.is_none());
+        }
+        for _ in 0..3 {
+            runner.step().await.unwrap();
+        }
+        assert_eq!(
+            runner.host_start_attempts, 0,
+            "owner failure must not retry collection or login"
+        );
+        assert_eq!(store.community_pause().await.unwrap(), denial);
+        assert_eq!(store.community_stats().await.unwrap().run_count, 0);
+
+        // A newly shown explicit sign-in clears only its transient error and
+        // restores any persisted source-denial explanation.
+        runner.event(HostEvent::LoginShown).await.unwrap();
+        assert!(runner.paused);
+        assert_eq!(service.status.read().await.state, "sign_in");
+        assert_eq!(
+            service.status.read().await.last_error,
+            denial.map(|reason| reason.code())
+        );
+        assert_eq!(store.community_pause().await.unwrap(), denial);
+        runner.event(HostEvent::LoginFailed).await.unwrap();
+        runner.control(Command::Login).await.unwrap();
+        assert_eq!(
+            runner.host_start_attempts, 1,
+            "explicit login retains normal host creation"
+        );
+        assert!(runner.paused);
+        assert_eq!(store.community_pause().await.unwrap(), denial);
+        runner.event(HostEvent::LoginFailed).await.unwrap();
+        runner.control(Command::Resume).await.unwrap();
+        assert!(!runner.paused);
+        assert_eq!(service.status.read().await.last_error, None);
+        assert_eq!(service.status.read().await.state, "starting");
+        assert_eq!(store.community_pause().await.unwrap(), None);
+        assert!(!directory.path().join("profile").exists());
+    }
+}
+
+#[tokio::test]
 async fn unsolicited_terminal_ends_pending_or_idle_run_once_and_keeps_owner_pause() {
     for completed in [false, true] {
         let (_directory, store, mut runner) = pending_fixture().await;
@@ -577,6 +646,7 @@ async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
             network_pending: false,
             response_pending: false,
             trigger_pending: false,
+            navigation_failure: None,
         }),
         cleanup_diagnostics: Some(CleanupDiagnostics {
             controller_epoch: 7,

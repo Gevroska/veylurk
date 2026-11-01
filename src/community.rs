@@ -722,8 +722,13 @@ impl Coordinator {
             HostEvent::Ready => self.ready = true,
             HostEvent::LoginShown => {
                 self.paused = true;
-                self.service.status.write().await.state = "sign_in";
+                let mut status = self.service.status.write().await;
+                if status.last_error == Some("sign_in_navigation_failed") {
+                    status.last_error = self.persisted_pause.map(|reason| reason.code());
+                }
+                status.state = "sign_in";
             }
+            HostEvent::LoginFailed => self.pause("sign_in_navigation_failed").await,
             HostEvent::Paused { code } => self.pause_source(code).await?,
             HostEvent::SampleCompleted {
                 job_id,

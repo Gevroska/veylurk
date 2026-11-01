@@ -104,6 +104,15 @@ pub struct PrimaryFailure {
     pub network_pending: bool,
     pub response_pending: bool,
     pub trigger_pending: bool,
+    pub navigation_failure: Option<NavigationFailure>,
+}
+
+/// Fixed origin and native numbers only; never a URL or runtime error string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "origin", rename_all = "snake_case")]
+pub enum NavigationFailure {
+    Navigate { hresult: i32 },
+    NavigationCompleted { web_error_status: i32 },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -241,12 +250,13 @@ impl BrowserLifecycle {
     }
 }
 
-// Storage is fixed: four queued statuses plus one completion and one terminal
+// Storage is fixed: four queued statuses plus one login failure, completion and terminal
 // slot. Keeping the payload inline avoids an extra allocation per receipt.
 #[allow(clippy::large_enum_variant)]
 pub enum HostEvent {
     Ready,
     LoginShown,
+    LoginFailed,
     SampleCompleted {
         job_id: u64,
         channel: String,
@@ -275,6 +285,7 @@ struct Admission {
     committed_login: Option<(u64, u64)>,
     accepted: Option<AcceptedJob>,
     completion: Option<HostEvent>,
+    login_failed: bool,
     terminal: Option<HostEvent>,
     diagnostics: FaultReport,
 }
@@ -292,6 +303,7 @@ impl Default for Control {
                 committed_login: None,
                 accepted: None,
                 completion: None,
+                login_failed: false,
                 terminal: None,
                 diagnostics: FaultReport::default(),
             }),
@@ -504,6 +516,7 @@ pub(crate) enum QueuedCommand {
 pub(crate) enum Status {
     Ready,
     LoginShown,
+    LoginFailed,
     Paused { code: &'static str },
 }
 
@@ -521,6 +534,14 @@ impl Bridge {
         let event = match status {
             Status::Ready => HostEvent::Ready,
             Status::LoginShown => HostEvent::LoginShown,
+            Status::LoginFailed => {
+                self.control
+                    .admission
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .login_failed = true;
+                return;
+            }
             Status::Paused { code } => HostEvent::Paused { code },
         };
         let _ = self.events.try_send(event);
@@ -661,6 +682,10 @@ impl HostHandle {
         }
         match self.events.try_recv() {
             Ok(event) => Ok(event),
+            Err(_) if admission.login_failed => {
+                admission.login_failed = false;
+                Ok(HostEvent::LoginFailed)
+            }
             Err(error) => admission.terminal.take().ok_or(error),
         }
     }
@@ -676,6 +701,22 @@ impl Drop for HostHandle {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn login_failure_has_one_reserved_slot_after_older_login_status() {
+        let (handle, bridge) = HostHandle::channel();
+        bridge.emit(Status::LoginShown);
+        for _ in 0..8 {
+            bridge.emit(Status::Ready);
+            bridge.emit(Status::LoginFailed);
+        }
+        assert!(matches!(handle.try_event(), Ok(HostEvent::LoginShown)));
+        for _ in 0..3 {
+            assert!(matches!(handle.try_event(), Ok(HostEvent::Ready)));
+        }
+        assert!(matches!(handle.try_event(), Ok(HostEvent::LoginFailed)));
+        assert!(handle.try_event().is_err());
+    }
 
     #[test]
     fn first_termination_snapshot_survives_cleanup_and_exit_guard_with_full_status_queue() {
@@ -818,6 +859,7 @@ mod tests {
                 network_pending: false,
                 response_pending: false,
                 trigger_pending: false,
+                navigation_failure: None,
             }),
             cleanup_diagnostics: Some(CleanupDiagnostics {
                 controller_epoch: 7,

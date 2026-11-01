@@ -265,9 +265,31 @@ Collection was then re-enabled with its original settings. All 25,579 pre-update
 IRC observations, 201 Community attempts and 16,533 member receipts compared
 identically. Production port 8795 and its executable were not changed or restarted.
 
-The desktop tool could not activate either the old or restarted helper window;
-no physical Close-button input was sent. Old-behavior reproduction, the corrected
-native-button interaction and live sign-in Close/reopen remain pending desktop
-availability. The Windows tests execute the shared handler, but are distinct from
-those pending interactive checks. The original historical Close sender is still
-unrecorded and cannot be identified retrospectively from the available evidence.
+After desktop access became available, a real native title-bar Close minimized
+the service window and incremented its dismissal counter without stopping the
+host or pausing collection. Fresh durable samples followed for NormanAjari at
+13:02:44.680 UTC and strano at 13:03:20.695 UTC on November 1. A native Close in
+the owner sign-in view also minimized the window and preserved its pause.
+
+Explicit sign-in reopening restored a visible window without desktop activation,
+but a subsequent navigation failure exposed another defect: the service recycled
+its controller after consuming the login request, leaving a blank replacement
+with the initial starting label and no API error. The bounded fault confirms
+`navigation_failed`; the original underlying WebView2 error was not retained, so
+neither a runtime update nor a particular network cause is established.
+
+The correction keeps owner sign-in failures separate from collection failures:
+it retains the browser, shows an explicit reopen instruction, and publishes one
+bounded transient failure without recording a source denial or replaying login.
+An allowlisted origin and numeric HRESULT or WebView2 error status accompany the
+fault. Explicit reopening and Resume retain their existing cleanup boundaries.
+Focused native and coordinator regressions cover stale callbacks, failure
+latching, event saturation, denial preservation and recovery. Independent source
+review accepted the correction and all 110 Node tests passed; Windows CI and
+interactive acceptance of this candidate remain pending.
+
+One explicit Resume restored collection, with fresh durable samples at
+13:11:23.380 UTC for NormanAjari and 13:11:58.872 UTC for strano. Adaptive/300 was
+restored, encrypted API credentials compared identically, and production port
+8795 retained its original process identity. The original historical Close sender
+is still unrecorded and cannot be identified retrospectively from the evidence.
