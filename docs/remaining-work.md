@@ -398,12 +398,27 @@ original channels after restart. Production on 8795 remained unchanged.
 The owner requested a repair of process measurements and a fully hidden browser
 except during explicit sign-in. The integrated window previously used minimize;
 the correction uses a hidden native host while retaining WebView2 rendering.
-Native visibility transitions have independent source review and local checks;
-exact Windows CI and live sign-in/hidden collection proof remain pending.
+Native visibility transitions have independent source review and exact Windows
+CI: 99 native tests and the complete application workflow passed at source
+`881ccdd8fd3c6b5d5280df308ede5dc643ab889a`. A fresh anonymous profile loaded
+chat/Community while hidden and accepted no sample. Authenticated collection and
+the visible sign-in workflow remain unqualified: the restored profile received
+an integrity-related selected GraphQL error, and subsequent sign-in navigation
+reported WebView2 `ConnectionAborted`. The source pause remains retained; owner
+desktop observation is pending because the computer tool could not activate the
+requested sign-in window.
 
 The measurement repair uses identity-bound process handles, bounded lifecycle
 reconciliation, explicit missingness and conservative CPU/continuity rules.
-Deterministic lifecycle tests and independent review precede another bounded
-storage-isolated run. Existing resource, source and timeout guards remain in
-force. Historical measurement exceptions were not recorded, so their exact cause
-cannot be retroactively established. Production remains excluded.
+Deterministic lifecycle and native fake-child exit tests, independent review and
+five real-process measurements of the app plus seven WebViews passed. Existing
+resource, source and timeout guards remain in force; the next bounded collection
+run waits for normal sign-in validation. Historical measurement exceptions were
+not recorded, so their exact cause cannot be retroactively established.
+
+The previously running build also exited with a native WebView2 access violation
+before the new executable was installed. Its committed history and WAL are
+preserved; recovery correctly marked its unfinished sample interrupted. No
+source-supported explanation or repair of that older crash is claimed. See the
+[current results](measurement-visibility-results-2026-11-01.md). Production remains
+excluded.
