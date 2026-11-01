@@ -32,6 +32,7 @@ pub enum Operation {
     RoomState,
     Checkpoint,
     SignalRegistration,
+    CommunityHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -54,6 +55,7 @@ pub enum Phase {
 pub enum Event {
     StorageFailure,
     SignalUnavailable,
+    CommunityHostTermination,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -73,6 +75,7 @@ pub enum Category {
     Initialization,
     CheckpointBusy,
     SignalUnavailable,
+    CommunityHostTermination,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -95,6 +98,8 @@ pub struct Record {
     pub progress_interrupt_requested: bool,
     /// Observed after the operation returned; this alone does not establish rollback.
     pub autocommit_after: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_termination: Option<community_source::host::HostTermination>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -278,6 +283,7 @@ impl Diagnostics {
             os_error_code: None,
             progress_interrupt_requested,
             autocommit_after,
+            host_termination: None,
         });
     }
 
@@ -298,6 +304,33 @@ impl Diagnostics {
             os_error_code,
             progress_interrupt_requested: false,
             autocommit_after: None,
+            host_termination: None,
+        });
+    }
+
+    /// Called by the coordinator after receiving the reserved terminal report.
+    /// The native STA never performs journal I/O or publishes arbitrary strings.
+    pub(crate) fn community_host_termination(
+        &self,
+        termination: community_source::host::HostTermination,
+    ) {
+        self.record(Record {
+            schema_version: 1,
+            sequence: 0,
+            process_id: std::process::id(),
+            occurred_at_utc: crate::store::now(),
+            event: Event::CommunityHostTermination,
+            phase: Phase::Shutdown,
+            operation: Operation::CommunityHost,
+            job_class: None,
+            category: Category::CommunityHostTermination,
+            elapsed_ms: 0,
+            sqlite_primary_code: None,
+            sqlite_extended_code: None,
+            os_error_code: None,
+            progress_interrupt_requested: false,
+            autocommit_after: None,
+            host_termination: Some(termination),
         });
     }
 

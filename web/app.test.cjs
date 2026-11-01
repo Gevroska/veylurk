@@ -490,7 +490,7 @@ test("fault details preserve the first cause, distinguish callback interruption,
   await settle();
   const health = app.get("health-results");
   assert.match(health.textContent, /First storage failure/);
-  assert.match(health.textContent, /Latest recorded fault/);
+  assert.match(health.textContent, /Latest diagnostic event/);
   assert.ok(health.textContent.indexOf("Query") < health.textContent.indexOf("Checkpoint"));
   assert.match(health.textContent, /Execution policyQuery/);
   assert.match(health.textContent, /Execution policyDurable mutation/);
@@ -502,6 +502,21 @@ test("fault details preserve the first cause, distinguish callback interruption,
   assert.equal(descendants(health).some((element) => element.tagName === "IMG"), false);
   assert.match(health.textContent, /Diagnostic records not queued2/);
   assert.doesNotMatch(health.textContent, /successfully recovered|rolled back/);
+});
+
+test("normal Community shutdown is a lifecycle diagnostic and never a storage fault", async () => {
+  const app = createApp((target) => target.pathname === "/api/status" ? {
+    state: "collecting", diagnostics: { first_failure: null,
+      latest: { sequence: 1, occurred_at_utc: received, event: "community_host_termination", operation: "community_host",
+        host_termination: { reason: "shutdown_requested", observed_at_unix_ms: Date.parse(received) } },
+      persistence: { state: "ready", failure_count: 0, dropped_count: 0 } },
+  } : undefined);
+  await settle();
+  const health = app.get("health-results");
+  assert.match(health.textContent, /Local diagnostics/);
+  assert.match(health.textContent, /Latest diagnostic event/);
+  assert.match(health.textContent, /Browser stop reasonShutdown requested by Veylurk/);
+  assert.doesNotMatch(health.textContent, /First storage failure|Latest recorded fault|Fault records describe program errors|SQLite primary code/);
 });
 
 test("health refresh keeps fault details expanded and preserves keyboard focus", async () => {
@@ -519,7 +534,7 @@ test("health refresh keeps fault details expanded and preserves keyboard focus",
   const refreshed = descendants(app.get("health-results")).find((element) => element.tagName === "DETAILS");
   assert.equal(refreshed.open, true);
   assert.equal(app.document.activeElement, refreshed.children[0]);
-  assert.match(refreshed.textContent, /No fault recorded in this application run/);
+  assert.match(refreshed.textContent, /No diagnostic event recorded in this application run/);
 });
 
 test("per-room health overrides an open session and never equates recent receipts with completeness", async () => {
@@ -608,6 +623,27 @@ test("Community shows the source failure separately from cleanup and safely hand
   status = communityState();
   await app.get("refresh-status").dispatch("click"); await settle();
   assert.doesNotMatch(app.get("community-status").textContent, /Latest source failure in this run|Latest browser cleanup in this run/);
+});
+
+test("Community distinguishes browser termination from window minimization without clearing a sign-in pause", async () => {
+  let status = communityState({ paused: true, state: "sign_in", window_dismissal: { count: 2 },
+    host_termination: { reason: "shutdown_requested", observed_at_unix_ms: Date.parse(received) } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  assert.match(app.get("community-state").textContent, /Paused/);
+  assert.match(app.get("community-status").textContent, /Browser stop reasonShutdown requested by Veylurk/);
+  assert.match(app.get("community-status").textContent, /Helper window dismissals2 · window minimized/);
+  assert.doesNotMatch(app.get("community-status").textContent, /Browser stop recordedNot reported/);
+  assert.equal(app.calls.some((call) => call.options.method !== "GET"), false);
+  status = communityState({ host_termination: { reason: '<img src=x>', observed_at_unix_ms: Number.MAX_SAFE_INTEGER }, window_dismissal: { count: '<img src=x>' } });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /Unrecognized stop reason/);
+  assert.match(app.get("community-status").textContent, /Browser stop recordedNot reported/);
+  assert.doesNotMatch(app.get("community-status").textContent, /<img|Helper window dismissals/);
+  status = communityState();
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.doesNotMatch(app.get("community-status").textContent, /Browser stop reason|Helper window dismissals/);
+  assert.match(html, /Closing that helper window minimizes it/);
 });
 
 test("Community settings validate full writes and preserve unsaved values across refreshes", async () => {

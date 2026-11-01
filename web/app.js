@@ -486,8 +486,8 @@
   function diagnosticDetails(diagnostics) {
     if (!diagnostics || typeof diagnostics !== "object") return null;
     const panel = node("details", null, "card");
-    panel.append(node("summary", "Local fault diagnostics"));
-    panel.append(node("p", "Fault records describe program errors. They do not establish that missing observations were recovered.", "quiet"));
+    panel.append(node("summary", "Local diagnostics"));
+    panel.append(node("p", "Diagnostic records include program errors and browser lifecycle events. They do not establish that missing observations were recovered.", "quiet"));
     const persistence = diagnostics.persistence || {};
     const fields = node("dl", null, "detail-list");
     detail(fields, "Diagnostic file status", label(persistence.state || "unknown"));
@@ -495,14 +495,20 @@
     detail(fields, "Diagnostic records not queued", count(persistence.dropped_count));
     panel.append(fields);
     const first = diagnostics.first_failure || diagnostics.latest;
-    if (!first) panel.append(node("p", "No fault recorded in this application run."));
-    const records = first ? [[diagnostics.first_failure ? "First storage failure" : "Latest recorded fault", first]] : [];
-    if (diagnostics.latest && diagnostics.latest.sequence !== first?.sequence) records.push(["Latest recorded fault", diagnostics.latest]);
+    if (!first) panel.append(node("p", "No diagnostic event recorded in this application run."));
+    const records = first ? [[diagnostics.first_failure ? "First storage failure" : "Latest diagnostic event", first]] : [];
+    if (diagnostics.latest && diagnostics.latest.sequence !== first?.sequence) records.push(["Latest diagnostic event", diagnostics.latest]);
     for (const [heading, record] of records) {
       const fault = node("dl", null, "detail-list");
       panel.append(node("h3", heading));
       detail(fault, "Recorded", timestamp(record.occurred_at_utc));
       detail(fault, "Operation", label(record.operation));
+      if (record.event === "community_host_termination") {
+        detail(fault, "Browser stop reason", communityStopLabel(record.host_termination?.reason));
+        detail(fault, "Stop observed", communityEventTime(record.host_termination?.observed_at_unix_ms));
+        panel.append(fault);
+        continue;
+      }
       detail(fault, "Execution policy", record.job_class == null ? "Not recorded" : label(record.job_class));
       detail(fault, "Category", label(record.category));
       detail(fault, "Elapsed milliseconds", count(record.elapsed_ms));
@@ -568,6 +574,27 @@
 
   function communityCode(value) {
     return typeof value === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(value) ? value : "unknown";
+  }
+
+  function communityStopLabel(reason) {
+    switch (reason) {
+      case "shutdown_requested": return "Shutdown requested by Veylurk";
+      case "command_channel_closed": return "Browser command channel closed";
+      case "proof_window_close": return "Standalone proof window close requested";
+      case "source_failure_without_controller": return "Source failed before the browser was ready";
+      case "cleanup_unconfirmed": return "Browser cleanup was not confirmed";
+      case "startup_failed": return "Browser host startup failed";
+      case "message_pump_quit": return "Browser event loop ended";
+      case "message_pump_error": return "Browser event loop failed";
+      case "native_host_interrupted": return "Browser host was interrupted";
+      default: return "Unrecognized stop reason";
+    }
+  }
+
+  function communityEventTime(value) {
+    if (!Number.isSafeInteger(value) || value <= 0) return "Not reported";
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? timestamp(date.toISOString()) : "Not reported";
   }
 
   function communityCadence() {
@@ -636,6 +663,13 @@
     }
     if (data.cleanup_diagnostics) {
       detail(summary, "Latest browser cleanup in this run", data.cleanup_diagnostics.confirmed === true ? "Confirmed" : "Not confirmed");
+    }
+    if (data.host_termination) {
+      detail(summary, "Browser stop reason", communityStopLabel(data.host_termination.reason));
+      detail(summary, "Browser stop recorded", communityEventTime(data.host_termination.observed_at_unix_ms));
+    }
+    if (data.window_dismissal && Number.isSafeInteger(data.window_dismissal.count) && data.window_dismissal.count > 0) {
+      detail(summary, "Helper window dismissals", `${count(data.window_dismissal.count)} · window minimized`);
     }
     const oldTable = $("community-status").querySelector(".table-wrap");
     const tableScroll = oldTable ? oldTable.scrollLeft : 0;

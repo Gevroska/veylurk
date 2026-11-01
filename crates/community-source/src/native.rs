@@ -1,8 +1,9 @@
 //! Native Windows proof host. No private HTTP client, request replay, browser
 //! flags, cookie API, remote debugging port, or production collection.
 use crate::host::{
-    AcceptedJob, Bridge, BrowserLifecycle, FaultReport, HostOptions, PrimaryFailure, QueuedCommand,
-    ServiceExitGuard, SourceFailure, SourceSample, Status, RECYCLE_NAVIGATIONS,
+    AcceptedJob, Bridge, BrowserLifecycle, FaultReport, HostOptions, HostTermination,
+    HostTerminationReason, PrimaryFailure, QueuedCommand, ServiceExitGuard, SourceFailure,
+    SourceSample, Status, WindowDismissal, RECYCLE_NAVIGATIONS,
 };
 use crate::{
     channel_login, is_channel_page, is_popout_page, parse_response,
@@ -249,6 +250,14 @@ impl App {
         if self.state.borrow().closing_at.is_some() || self.state.borrow().recycling_at.is_some() {
             return;
         }
+        if self.engine.borrow().is_none() {
+            let reason = if self.state.borrow().initializing_at.is_some() {
+                HostTerminationReason::StartupFailed
+            } else {
+                HostTerminationReason::SourceFailureWithoutController
+            };
+            self.observe_termination(reason);
+        }
         if code != "operator_cancelled" {
             let mut state = self.state.borrow_mut();
             state.fault = FaultReport {
@@ -278,6 +287,8 @@ impl App {
                     response_pending: state.pending,
                     trigger_pending: state.trigger_pending,
                 }),
+                host_termination: state.fault.host_termination.clone(),
+                window_dismissal: state.fault.window_dismissal.clone(),
                 ..Default::default()
             };
             drop(state);
@@ -328,6 +339,12 @@ impl App {
             let mut state = self.state.borrow_mut();
             if state.browser.retire() {
                 state.controller_epoch += 1;
+            }
+            if let Some(service) = &self.service {
+                service
+                    .bridge
+                    .control
+                    .set_controller_epoch(state.controller_epoch);
             }
             state.recycling_at = Some(Instant::now());
             state.auto_stage = None;
@@ -432,7 +449,59 @@ impl App {
         service.bridge.control.record_fault(report);
     }
 
+    fn observe_termination(&self, reason: HostTerminationReason) {
+        if self.state.borrow().fault.host_termination.is_some() {
+            return;
+        }
+        let termination = if let Some(service) = &self.service {
+            service.bridge.control.set_controller_epoch(self.epoch());
+            service.bridge.control.observe_termination(reason)
+        } else {
+            HostTermination {
+                reason,
+                observed_at_unix_ms: unix_milliseconds(),
+                controller_epoch: self.epoch(),
+                job_id: None,
+            }
+        };
+        self.state.borrow_mut().fault.host_termination = Some(termination);
+        self.publish_fault();
+    }
+
+    fn window_close(&self) {
+        if self.service.is_some() {
+            // An auxiliary window dismissal changes presentation only. In
+            // particular sign-in remains owner-paused until explicit Resume.
+            let mut state = self.state.borrow_mut();
+            let dismissal = state.fault.window_dismissal.get_or_insert(WindowDismissal {
+                count: 0,
+                last_observed_at_unix_ms: 0,
+            });
+            dismissal.count = dismissal.count.saturating_add(1);
+            dismissal.last_observed_at_unix_ms = unix_milliseconds();
+            drop(state);
+            self.publish_fault();
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+            }
+        } else {
+            self.observe_termination(HostTerminationReason::ProofWindowClose);
+            self.close();
+        }
+    }
+
+    fn message_pump_exit(&self, result: i32) {
+        self.observe_termination(if result == 0 {
+            HostTerminationReason::MessagePumpQuit
+        } else {
+            HostTerminationReason::MessagePumpError
+        });
+    }
+
     fn finish_service(&self, cleanup_confirmed: bool) {
+        if !cleanup_confirmed {
+            self.observe_termination(HostTerminationReason::CleanupUnconfirmed);
+        }
         if let Some(service) = &self.service {
             // Close admission under the same lock used by try_sample before
             // handling queued/native state. Termination completes the ledger's
@@ -483,6 +552,7 @@ impl App {
         };
         if service.bridge.control.shutdown.load(Ordering::Acquire) {
             service.bridge.control.stop_accepting();
+            self.observe_termination(HostTerminationReason::ShutdownRequested);
             self.close();
             return;
         }
@@ -557,6 +627,7 @@ impl App {
                     Ok(command) => Some(command),
                     Err(TryRecvError::Empty) => None,
                     Err(TryRecvError::Disconnected) => {
+                        self.observe_termination(HostTerminationReason::CommandChannelClosed);
                         self.close();
                         None
                     }
@@ -1966,6 +2037,12 @@ impl App {
             if state.browser.retire() {
                 state.controller_epoch += 1;
             }
+            if let Some(service) = &self.service {
+                service
+                    .bridge
+                    .control
+                    .set_controller_epoch(state.controller_epoch);
+            }
         }
         self.detach_engine();
     }
@@ -2138,6 +2215,9 @@ unsafe fn attach(
     let mut browser_pid = 0;
     core.BrowserProcessId(&mut browser_pid)?;
     app.state.borrow_mut().browser.bind(epoch, browser_pid);
+    if let Some(service) = &app.service {
+        service.bridge.control.set_controller_epoch(epoch);
+    }
     let mut protocol_receivers = Vec::new();
     for kind in [
         "Network.requestWillBeSent",
@@ -2414,7 +2494,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_CLOSE => {
             if let Some(app) = app {
-                app.close();
+                app.window_close();
             } else {
                 let _ = DestroyWindow(hwnd);
             }
@@ -2619,6 +2699,7 @@ fn startup(
         loop {
             let result = GetMessageW(&mut message, None, 0, 0).0;
             if result <= 0 {
+                app.message_pump_exit(result);
                 break;
             }
             let _ = TranslateMessage(&message);
@@ -2646,6 +2727,7 @@ pub(crate) fn run_service(options: HostOptions, bridge: Bridge) {
     let events = bridge.events.clone();
     let _exit_guard = ServiceExitGuard(control.clone());
     if startup(None, Some((options, bridge))).is_err() {
+        control.observe_termination(HostTerminationReason::StartupFailed);
         let _ = events.try_send(crate::host::HostEvent::Paused {
             code: "native_host_start_failed",
         });
@@ -2660,6 +2742,7 @@ mod lifecycle_tests {
 
     fn fixture() -> (HostHandle, Rc<App>) {
         let (handle, bridge) = HostHandle::channel();
+        bridge.control.set_controller_epoch(3);
         let app = Rc::new(App {
             hwnd: HWND::default(),
             input: HWND::default(),
@@ -2684,6 +2767,167 @@ mod lifecycle_tests {
             }),
         });
         (handle, app)
+    }
+
+    #[test]
+    fn pump_startup_and_cleanup_stop_paths_keep_their_first_reason() {
+        for (result, reason) in [
+            (0, HostTerminationReason::MessagePumpQuit),
+            (-1, HostTerminationReason::MessagePumpError),
+        ] {
+            let (handle, app) = fixture();
+            app.message_pump_exit(result);
+            app.finish_service(false);
+            assert_eq!(
+                handle.fault_report().host_termination.unwrap().reason,
+                reason
+            );
+        }
+        for initializing in [false, true] {
+            let (handle, app) = fixture();
+            app.state.borrow_mut().initializing_at = initializing.then(Instant::now);
+            app.service_failure("runtime_start_failed", false);
+            app.finish_service(false);
+            assert_eq!(
+                handle.fault_report().host_termination.unwrap().reason,
+                if initializing {
+                    HostTerminationReason::StartupFailed
+                } else {
+                    HostTerminationReason::SourceFailureWithoutController
+                }
+            );
+        }
+        let (handle, app) = fixture();
+        app.finish_service(false);
+        assert_eq!(
+            handle.fault_report().host_termination.unwrap().reason,
+            HostTerminationReason::CleanupUnconfirmed
+        );
+    }
+
+    #[test]
+    fn service_window_close_preserves_active_work_admission_epoch_and_denial() {
+        let (handle, app) = fixture();
+        handle.try_sample(42, "room").unwrap();
+        let service = app.service.as_ref().unwrap();
+        let job = service.bridge.control.pending_job().unwrap();
+        *service.active.borrow_mut() = Some(job.clone());
+        {
+            let mut state = app.state.borrow_mut();
+            state.denied = true;
+            state.script_pending = true;
+            state.auto_stage = Some(AutoStage::Sampling);
+        }
+        let cancel_version = service
+            .bridge
+            .control
+            .cancel_version
+            .load(Ordering::Acquire);
+        app.window_close();
+        app.window_close();
+        assert_eq!(app.epoch(), 3);
+        assert_eq!(app.state.borrow().generation, 7);
+        assert!(app.state.borrow().denied && app.state.borrow().script_pending);
+        assert!(matches!(
+            app.state.borrow().auto_stage,
+            Some(AutoStage::Sampling)
+        ));
+        assert!(app.state.borrow().closing_at.is_none());
+        assert!(app.state.borrow().recycling_at.is_none());
+        assert_eq!(service.active.borrow().as_ref().unwrap().ticket, job.ticket);
+        assert!(service.bridge.control.is_pending(job.ticket));
+        assert_eq!(
+            service
+                .bridge
+                .control
+                .cancel_version
+                .load(Ordering::Acquire),
+            cancel_version
+        );
+        assert!(!service.bridge.control.shutdown.load(Ordering::Acquire));
+        assert!(handle.try_event().is_err());
+        assert_eq!(
+            handle.try_sample(43, "room"),
+            Err(crate::host::CommandError::Busy)
+        );
+        assert!(handle.fault_report().host_termination.is_none());
+        assert_eq!(handle.fault_report().window_dismissal.unwrap().count, 2);
+        service.bridge.control.complete(
+            job.ticket,
+            Err(SourceFailure {
+                code: "community_paused",
+                pauses_community: true,
+            }),
+        );
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::SampleCompleted { .. })
+        ));
+        assert_eq!(handle.try_sample(43, "room"), Ok(()));
+    }
+
+    #[test]
+    fn login_window_close_keeps_login_visible_state_and_accepts_reopen() {
+        let (handle, app) = fixture();
+        let service = app.service.as_ref().unwrap();
+        *service.login_visible.borrow_mut() = true;
+        app.window_close();
+        assert!(*service.login_visible.borrow());
+        assert!(app.state.borrow().closing_at.is_none());
+        assert!(handle.try_event().is_err());
+        handle.show_login().unwrap();
+        let QueuedCommand::ShowLogin { publication } = service.bridge.commands.try_recv().unwrap()
+        else {
+            panic!("expected reopened login publication");
+        };
+        assert!(service.accept_login_publication(publication));
+        assert!(app.callbacks_allowed());
+    }
+
+    #[test]
+    fn service_dismissal_cannot_replace_an_explicit_shutdown_or_its_cleanup() {
+        let (handle, app) = fixture();
+        handle.try_sample(42, "room").unwrap();
+        handle.shutdown();
+        let requested = handle.fault_report().host_termination.unwrap();
+        assert_eq!(requested.reason, HostTerminationReason::ShutdownRequested);
+        assert_eq!(
+            (requested.controller_epoch, requested.job_id),
+            (3, Some(42))
+        );
+        app.window_close();
+        assert!(app.state.borrow().closing_at.is_none());
+        app.service_tick();
+        assert!(app.state.borrow().closing_at.is_some());
+        app.finish_service(false);
+        assert_eq!(handle.fault_report().host_termination.unwrap(), requested);
+    }
+
+    #[test]
+    fn standalone_proof_window_close_still_closes_and_records_its_trigger() {
+        let (_handle, mut app) = fixture();
+        let path = std::env::temp_dir().join(format!(
+            "veylurk-proof-close-{}-{}.json",
+            std::process::id(),
+            unix_milliseconds()
+        ));
+        let unique = Rc::get_mut(&mut app).unwrap();
+        unique.service = None;
+        unique.evidence_path = path.clone();
+        app.window_close();
+        assert!(app.state.borrow().closing_at.is_some());
+        assert_eq!(
+            app.state
+                .borrow()
+                .fault
+                .host_termination
+                .as_ref()
+                .unwrap()
+                .reason,
+            HostTerminationReason::ProofWindowClose
+        );
+        assert!(app.state.borrow().fault.window_dismissal.is_none());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

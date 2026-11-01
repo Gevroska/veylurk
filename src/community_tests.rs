@@ -437,6 +437,128 @@ async fn denied_pause_restores_on_startup_and_only_explicit_resume_clears_it() {
 }
 
 #[tokio::test]
+async fn unsolicited_terminal_ends_pending_or_idle_run_once_and_keeps_owner_pause() {
+    for completed in [false, true] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        let run_id = runner.run_id.unwrap();
+        if completed {
+            runner
+                .event(HostEvent::SampleCompleted {
+                    job_id: 1,
+                    channel: "example".into(),
+                    outcome: Ok(source_sample()),
+                })
+                .await
+                .unwrap();
+        }
+        runner.pause_source("rate_limited").await.unwrap();
+        let termination = HostTermination {
+            reason: community_source::host::HostTerminationReason::MessagePumpQuit,
+            observed_at_unix_ms: 1234,
+            controller_epoch: 7,
+            job_id: (!completed).then_some(1),
+        };
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: true,
+                diagnostics: FaultReport {
+                    host_termination: Some(termination.clone()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert!(runner.run_id.is_none());
+        assert!(runner.pending.is_none());
+        assert!(runner.paused);
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            Some(CommunityPauseReason::RateLimited)
+        );
+        let boundary: (String, String) = store
+            .call_read(crate::diagnostics::Operation::Query, move |conn| {
+                Ok(conn.query_row(
+                    "SELECT ended_at_utc,end_reason FROM community_runs WHERE id=?1",
+                    [run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(boundary.1, "host_failure");
+        runner
+            .retire(CommunityRunEndReason::Disabled)
+            .await
+            .unwrap();
+        let retained: (String, String) = store
+            .call_read(crate::diagnostics::Operation::Query, move |conn| {
+                Ok(conn.query_row(
+                    "SELECT ended_at_utc,end_reason FROM community_runs WHERE id=?1",
+                    [run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(retained, boundary);
+        let diagnostic = store.diagnostics();
+        assert!(diagnostic.first_failure.is_none());
+        assert_eq!(
+            diagnostic.latest.unwrap().host_termination,
+            Some(termination)
+        );
+        let stats = store.community_stats().await.unwrap();
+        assert_eq!(stats.failed_count, if completed { 0 } else { 1 });
+        assert_eq!(stats.successful_count, if completed { 1 } else { 0 });
+    }
+}
+
+#[tokio::test]
+async fn terminal_during_retirement_keeps_explicit_run_boundary_and_login_pause() {
+    let (_directory, store, mut runner) = pending_fixture().await;
+    let run_id = runner.run_id.unwrap();
+    runner.paused = true;
+    runner.service.status.write().await.state = "sign_in";
+    runner
+        .record_fault(FaultReport {
+            window_dismissal: Some(WindowDismissal {
+                count: 1,
+                last_observed_at_unix_ms: 1234,
+            }),
+            ..Default::default()
+        })
+        .await;
+    assert!(runner.paused);
+    assert_eq!(runner.service.status.read().await.state, "sign_in");
+    runner.retiring = true;
+    runner
+        .event(HostEvent::Stopped {
+            cleanup_confirmed: true,
+            diagnostics: FaultReport::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(runner.run_id, Some(run_id));
+    runner.retire(CommunityRunEndReason::SignIn).await.unwrap();
+    let reason: String = store
+        .call_read(crate::diagnostics::Operation::Query, move |conn| {
+            Ok(conn.query_row(
+                "SELECT end_reason FROM community_runs WHERE id=?1",
+                [run_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(reason, "sign_in");
+    assert!(runner.paused);
+    runner
+        .retire(CommunityRunEndReason::Shutdown)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
     let (_directory, store, mut runner) = pending_fixture().await;
     let report = FaultReport {
@@ -464,6 +586,7 @@ async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
             elapsed_ms: 5000,
             ..Default::default()
         }),
+        ..Default::default()
     };
     runner.record_fault(report.clone()).await;
     runner

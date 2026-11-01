@@ -394,6 +394,13 @@ impl Store {
         self.diagnostics.snapshot()
     }
 
+    pub(crate) fn record_community_host_termination(
+        &self,
+        termination: community_source::host::HostTermination,
+    ) {
+        self.diagnostics.community_host_termination(termination);
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_work_for_test(&self) {
         *self.work_for_test.lock().unwrap() = StorageWorkForTest::default();

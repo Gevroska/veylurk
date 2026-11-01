@@ -8,8 +8,8 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use community_source::host::{
-    CleanupDiagnostics, FaultReport, HostEvent, HostHandle, HostOptions, PrimaryFailure,
-    SourceSample,
+    CleanupDiagnostics, FaultReport, HostEvent, HostHandle, HostOptions, HostTermination,
+    PrimaryFailure, SourceSample, WindowDismissal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,6 +42,8 @@ pub struct Status {
     pub cleanup_confirmed: Option<bool>,
     pub primary_failure: Option<PrimaryFailure>,
     pub cleanup_diagnostics: Option<CleanupDiagnostics>,
+    pub host_termination: Option<HostTermination>,
+    pub window_dismissal: Option<WindowDismissal>,
     pub channels: Vec<ChannelCadenceStatus>,
 }
 
@@ -279,6 +281,8 @@ impl Community {
             cleanup_confirmed: None,
             primary_failure: None,
             cleanup_diagnostics: None,
+            host_termination: None,
+            window_dismissal: None,
             channels: Vec::new(),
         }));
         let (commands, receiver) = mpsc::channel(8);
@@ -508,7 +512,10 @@ impl Coordinator {
             Ok(host) => {
                 self.host = Some(host);
                 self.ready = false;
-                self.service.status.write().await.cleanup_confirmed = None;
+                let mut status = self.service.status.write().await;
+                status.cleanup_confirmed = None;
+                status.host_termination = None;
+                status.window_dismissal = None;
                 true
             }
             Err(_) => {
@@ -702,6 +709,12 @@ impl Coordinator {
         if report.cleanup_diagnostics.is_some() {
             status.cleanup_diagnostics = report.cleanup_diagnostics;
         }
+        if report.host_termination.is_some() {
+            status.host_termination = report.host_termination;
+        }
+        if report.window_dismissal.is_some() {
+            status.window_dismissal = report.window_dismissal;
+        }
     }
 
     async fn event(&mut self, event: HostEvent) -> Result<(), StoreError> {
@@ -763,12 +776,22 @@ impl Coordinator {
                 cleanup_confirmed,
                 diagnostics,
             } => {
+                if let Some(termination) = &diagnostics.host_termination {
+                    self.service
+                        .store
+                        .record_community_host_termination(termination.clone());
+                }
                 self.record_fault(diagnostics).await;
                 self.host = None;
                 self.ready = false;
                 self.service.status.write().await.cleanup_confirmed = Some(cleanup_confirmed);
                 self.finish_failure(CommunityFailureCode::HostFailure, false)
                     .await?;
+                // An unsolicited terminal ends coverage now. Retirement already
+                // owns its explicit boundary and must retain its chosen reason.
+                if !self.retiring {
+                    self.end_run(CommunityRunEndReason::HostFailure).await?;
+                }
                 if !self.retiring || !cleanup_confirmed {
                     let code = if cleanup_confirmed {
                         "browser_closed"
@@ -905,11 +928,16 @@ impl Coordinator {
         self.ready = false;
         self.finish_failure(CommunityFailureCode::HostFailure, true)
             .await?;
+        self.end_run(reason).await?;
+        self.retiring = false;
+        Ok(())
+    }
+
+    async fn end_run(&mut self, reason: CommunityRunEndReason) -> Result<(), StoreError> {
         if let Some(run_id) = self.run_id {
             self.service.store.end_community_run(run_id, reason).await?;
             self.run_id = None;
         }
-        self.retiring = false;
         Ok(())
     }
 

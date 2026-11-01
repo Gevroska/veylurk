@@ -139,7 +139,7 @@
           <p class="help full-width">This is a target, not a guarantee. A global gap of at least 30 seconds separates job starts; 50 selected channels therefore need at least 25 minutes per round, before loading time or delays. Actual intervals can be longer than calculated targets; each channel’s cadence is reported below.</p>
           <button id="community-save" class="secondary" type="submit">Save Community settings</button>
         </form>
-        <p class="help">Twitch sign-in opens an application-owned window and pauses this collector. Sign-in is separate from optional metadata API credentials. Close the sign-in window, then explicitly resume collection. No password or token is entered in this local page.</p>
+        <p class="help">Twitch sign-in opens an application-owned window and pauses this collector. Closing that helper window minimizes it; it does not stop collection or resume a sign-in pause. Use Community settings to disable this collector, or Stop Veylurk to stop the app. After signing in, explicitly resume collection. Sign-in is separate from optional metadata API credentials. No password or token is entered in this local page.</p>
         <div class="actions-inner"><button id="community-login" class="secondary" type="button">Open Twitch sign-in</button><button id="community-resume" class="secondary" type="button">Resume Community collection</button></div>
         <p id="community-settings-message" class="inline-message" role="status" aria-live="polite"></p><div id="community-status" aria-busy="true"><p class="quiet">Loading Community status…</p></div>
       </section>

@@ -8,6 +8,60 @@ fn sqlite_error(code: i32, message: &str) -> StoreError {
 }
 
 #[test]
+fn community_termination_uses_existing_durable_bounded_journal_without_claiming_storage_failure() {
+    use community_source::host::{HostTermination, HostTerminationReason};
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("private-community-database.sqlite3");
+    let diagnostics = Diagnostics::new(&database);
+    let termination = HostTermination {
+        reason: HostTerminationReason::MessagePumpError,
+        observed_at_unix_ms: i64::MAX,
+        controller_epoch: u64::MAX,
+        job_id: Some(u64::MAX),
+    };
+    diagnostics.community_host_termination(termination.clone());
+    assert!(diagnostics.snapshot().first_failure.is_none());
+    diagnostics.storage_failure(
+        Operation::Append,
+        JobClass::DurableMutation,
+        &sqlite_error(9, "SECRET_ACCOUNT_TOKEN_URL"),
+        Duration::ZERO,
+        false,
+        None,
+    );
+    for _ in 2..RUN_RECORDS {
+        diagnostics.community_host_termination(termination.clone());
+        assert!(diagnostics.flush(Duration::from_secs(2)));
+    }
+    diagnostics.community_host_termination(termination.clone());
+    assert!(diagnostics.flush(Duration::from_secs(2)));
+    let snapshot = diagnostics.snapshot();
+    assert_eq!(snapshot.first_failure.unwrap().event, Event::StorageFailure);
+    assert_eq!(snapshot.latest.unwrap().host_termination, Some(termination));
+    assert_eq!(snapshot.persistence.state, PersistenceState::Ready);
+    assert_eq!(snapshot.persistence.dropped_count, 1);
+    let journal = fs::read_to_string(sidecar(&database)).unwrap();
+    assert!(!journal.contains("private-community-database"));
+    assert!(!journal.contains("SECRET_ACCOUNT_TOKEN_URL"));
+    assert_eq!(journal.lines().count(), RUN_RECORDS);
+    for line in journal.lines() {
+        assert!(line.len() < RECORD_BYTES);
+    }
+    let first: serde_json::Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    assert_eq!(first["schema_version"], 1);
+    assert_eq!(first["event"], "community_host_termination");
+    assert_eq!(first["host_termination"]["reason"], "message_pump_error");
+    let legacy: serde_json::Value = serde_json::from_str(journal.lines().nth(1).unwrap()).unwrap();
+    assert!(legacy.get("host_termination").is_none());
+    drop(diagnostics);
+    let reopened = Diagnostics::new(&database);
+    assert!(fs::read_to_string(sidecar(&database))
+        .unwrap()
+        .contains("message_pump_error"));
+    assert!(reopened.snapshot().first_failure.is_none());
+}
+
+#[test]
 fn diagnostics_preserve_first_storage_failure_and_never_serialize_error_messages() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("private-database-name.sqlite3");

@@ -165,7 +165,8 @@ cleanup diagnostics for the current application run. These bounded typed snapsho
 remain in memory and the reserved terminal event; they are not persisted to disk.
 Reporting does not perform disk I/O on the native thread or delay browser cleanup.
 The generic pause still persists unchanged, and the runtime does not infer a past
-primary failure from it after restart. Persistent fault reporting is deferred. Native and
+primary failure from it after restart. Persistent primary/cleanup reporting remains deferred;
+the auxiliary-window correction below adds bounded termination reporting only. Native and
 coordinator regression tests cover identity, early/stale/abnormal exits, close during
 recycling, cleanup operation failures and preservation of the primary failure.
 Source review accepted the correction. Revision `223b0501` passed Windows application
@@ -218,3 +219,37 @@ with no remaining profile processes before collection was re-enabled.
 The 24,974 original IRC observations, 182 Community attempts and 15,986 member
 receipts compared identically; encrypted API credentials and website sign-in were
 reused. Production port 8795 and its executable were not modified or restarted.
+
+## Auxiliary Community window dismissal and stop evidence
+
+The unattended test host later reported `browser_closed` with no primary source
+failure and confirmed normal cleanup, while IRC and metadata stayed active. The
+old service `WM_CLOSE` handler called the same genuine-close path as the standalone
+proof. That path fits the observed terminal state, but no initiation reason was
+recorded at the time, so the historical actor and exact stop time remain unknown.
+
+The candidate makes service `WM_CLOSE` a presentation-only minimization. Accepted
+and active work, admission, cancellation version, controller epoch, denial state
+and coordinator scheduling remain intact. Closing the sign-in window preserves
+the owner's pause; reopening sign-in and explicit Resume remain separate controls.
+Disable and shutdown still close the host, and the standalone proof still closes.
+No player, authentication, media, provenance, deadline or cadence gate changes.
+
+A typed first-wins termination snapshot now distinguishes explicit shutdown,
+command-channel loss, startup/source failure, uncertain cleanup, pump quit/error
+and the exit guard. It survives cleanup through the reserved terminal slot.
+The coordinator alone queues that allowlisted snapshot through the existing
+bounded diagnostics writer, without occupying `first_storage_failure` or adding
+a database schema or writer. The API also exposes a bounded service-window
+dismissal count and latest timestamp. New host creation resets these in-memory
+fields. Unexpected terminals close open Community runs once with `host_failure`;
+normal retirement preserves its explicit boundary reason. Historical gaps are
+not backdated.
+
+Source regressions cover the actual shared window-close handler for service,
+sign-in, standalone proof and pending shutdown; active admission and denial
+preservation; first-reason retention through cleanup and the guard; pump/startup
+paths; pending/idle run boundaries and retirement; and bounded durable diagnostic
+records, redaction and first-storage-failure isolation. Formatting and diff checks
+are complete. Windows CI and controlled test-instance acceptance remain pending
+for this candidate; these source changes alone do not establish runtime behavior.

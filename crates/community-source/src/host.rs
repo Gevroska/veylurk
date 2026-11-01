@@ -9,7 +9,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const ROLE_MASK: u8 = 63;
@@ -130,6 +130,46 @@ pub struct CleanupDiagnostics {
 pub struct FaultReport {
     pub primary_failure: Option<PrimaryFailure>,
     pub cleanup_diagnostics: Option<CleanupDiagnostics>,
+    pub host_termination: Option<HostTermination>,
+    pub window_dismissal: Option<WindowDismissal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostTerminationReason {
+    ShutdownRequested,
+    CommandChannelClosed,
+    SourceFailureWithoutController,
+    CleanupUnconfirmed,
+    StartupFailed,
+    MessagePumpQuit,
+    MessagePumpError,
+    NativeHostInterrupted,
+    ProofWindowClose,
+}
+
+/// The first observed stop trigger, before cancellation, cleanup or epoch changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HostTermination {
+    pub reason: HostTerminationReason,
+    pub observed_at_unix_ms: i64,
+    pub controller_epoch: u64,
+    pub job_id: Option<u64>,
+}
+
+/// Presentation-only dismissal of the service window; never a stop trigger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WindowDismissal {
+    pub count: u64,
+    pub last_observed_at_unix_ms: i64,
+}
+
+fn unix_milliseconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 /// An exit belongs to a browser identity, not to the time retirement was requested.
@@ -224,6 +264,7 @@ pub enum HostEvent {
 pub(crate) struct Control {
     pub shutdown: AtomicBool,
     pub cancel_version: AtomicU64,
+    controller_epoch: AtomicU64,
     admission: Mutex<Admission>,
 }
 
@@ -243,6 +284,7 @@ impl Default for Control {
         Self {
             shutdown: AtomicBool::new(false),
             cancel_version: AtomicU64::new(0),
+            controller_epoch: AtomicU64::new(0),
             admission: Mutex::new(Admission {
                 accepting: true,
                 terminated: false,
@@ -312,11 +354,41 @@ impl Admission {
 }
 
 impl Control {
-    pub fn record_fault(&self, report: FaultReport) {
-        self.admission
+    pub fn record_fault(&self, mut report: FaultReport) {
+        let mut admission = self
+            .admission
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .diagnostics = report;
+            .unwrap_or_else(|error| error.into_inner());
+        // Later cleanup snapshots cannot replace the original stop trigger.
+        if admission.diagnostics.host_termination.is_some() {
+            report.host_termination = admission.diagnostics.host_termination.clone();
+        }
+        if report.window_dismissal.is_none() {
+            report.window_dismissal = admission.diagnostics.window_dismissal.clone();
+        }
+        admission.diagnostics = report;
+    }
+
+    pub fn set_controller_epoch(&self, epoch: u64) {
+        self.controller_epoch.store(epoch, Ordering::Release);
+    }
+
+    pub fn observe_termination(&self, reason: HostTerminationReason) -> HostTermination {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(termination) = &admission.diagnostics.host_termination {
+            return termination.clone();
+        }
+        let termination = HostTermination {
+            reason,
+            observed_at_unix_ms: unix_milliseconds(),
+            controller_epoch: self.controller_epoch.load(Ordering::Acquire),
+            job_id: admission.accepted.as_ref().map(|job| job.job_id),
+        };
+        admission.diagnostics.host_termination = Some(termination.clone());
+        termination
     }
 
     pub fn login_cancel_version(&self, publication: u64) -> Option<u64> {
@@ -418,6 +490,8 @@ impl Control {
 pub(crate) struct ServiceExitGuard(pub Arc<Control>);
 impl Drop for ServiceExitGuard {
     fn drop(&mut self) {
+        self.0
+            .observe_termination(HostTerminationReason::NativeHostInterrupted);
         self.0.terminate(false, "native_host_interrupted");
     }
 }
@@ -570,6 +644,8 @@ impl HostHandle {
         self.control.cancel_version.fetch_add(1, Ordering::AcqRel);
     }
     pub fn shutdown(&self) {
+        self.control
+            .observe_termination(HostTerminationReason::ShutdownRequested);
         self.control.shutdown.store(true, Ordering::Release);
     }
 
@@ -600,6 +676,55 @@ impl Drop for HostHandle {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn first_termination_snapshot_survives_cleanup_and_exit_guard_with_full_status_queue() {
+        for reason in [
+            HostTerminationReason::ShutdownRequested,
+            HostTerminationReason::CommandChannelClosed,
+            HostTerminationReason::SourceFailureWithoutController,
+            HostTerminationReason::CleanupUnconfirmed,
+            HostTerminationReason::StartupFailed,
+            HostTerminationReason::MessagePumpQuit,
+            HostTerminationReason::MessagePumpError,
+            HostTerminationReason::NativeHostInterrupted,
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(91, "private_room").unwrap();
+            bridge.control.set_controller_epoch(7);
+            for _ in 0..8 {
+                bridge.emit(Status::Ready);
+            }
+            let first = bridge.control.observe_termination(reason);
+            assert!(first.observed_at_unix_ms > 0);
+            assert_eq!((first.controller_epoch, first.job_id), (7, Some(91)));
+            bridge.control.set_controller_epoch(8);
+            bridge.control.record_fault(FaultReport {
+                cleanup_diagnostics: Some(CleanupDiagnostics {
+                    controller_epoch: 7,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            bridge
+                .control
+                .observe_termination(HostTerminationReason::CleanupUnconfirmed);
+            bridge.control.terminate(false, "native_host_interrupted");
+            drop(ServiceExitGuard(bridge.control.clone()));
+            assert!(matches!(
+                handle.try_event(),
+                Ok(HostEvent::SampleCompleted { job_id: 91, .. })
+            ));
+            for _ in 0..4 {
+                assert!(matches!(handle.try_event(), Ok(HostEvent::Ready)));
+            }
+            let Ok(HostEvent::Stopped { diagnostics, .. }) = handle.try_event() else {
+                panic!("missing reserved terminal report");
+            };
+            assert_eq!(diagnostics.host_termination.unwrap(), first);
+            assert!(handle.try_event().is_err());
+        }
+    }
 
     #[test]
     fn early_identity_bound_exit_survives_retirement_and_close_transition() {
@@ -699,6 +824,7 @@ mod tests {
                 close_hresult: Some(-1),
                 ..Default::default()
             }),
+            ..Default::default()
         });
         bridge.control.terminate(false, "operator_cancelled");
         for _ in 0..4 {
