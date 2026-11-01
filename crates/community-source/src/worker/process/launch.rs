@@ -349,7 +349,10 @@ impl ChildProcess {
         self.process_id
     }
     pub fn try_wait(&mut self) -> io::Result<Option<ProcessExit>> {
-        match unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } {
+        self.wait_bounded(0)
+    }
+    pub fn wait_bounded(&mut self, milliseconds: u32) -> io::Result<Option<ProcessExit>> {
+        match unsafe { WaitForSingleObject(self.process.as_raw_handle(), milliseconds) } {
             0 => {
                 let mut code = 0;
                 if unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } == 0 {

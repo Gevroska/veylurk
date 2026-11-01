@@ -1,4 +1,4 @@
-//! Bounded parsing and aggregate evidence only. Account names never serialize.
+//! Bounded parsing and aggregate evidence. Account payloads use private IPC only.
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};

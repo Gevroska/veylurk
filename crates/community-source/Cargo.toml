@@ -7,7 +7,7 @@ publish = false
 
 [[example]]
 name = "community-worker-fixture"
-path = "tests/worker_fixture.rs"
+path = "examples/worker_fixture.rs"
 test = false
 
 [dependencies]

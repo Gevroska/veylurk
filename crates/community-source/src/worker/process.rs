@@ -191,24 +191,23 @@ impl OwnedWorker {
         Ok(Self { child, job })
     }
     fn finish(&mut self, allow_graceful: bool) -> (Option<u32>, bool) {
-        if allow_graceful {
-            let started = Instant::now();
-            while matches!(self.child.try_wait(), Ok(None))
-                && started.elapsed() < Duration::from_millis(500)
-            {
-                std::thread::sleep(POLL);
-            }
-        }
+        // Pipe EOF can precede final process-handle signaling. Give an already
+        // exiting worker a bounded chance to preserve its own numeric reason.
+        let _ = self
+            .child
+            .wait_bounded(if allow_graceful { 500 } else { 100 });
         self.job.terminate();
         let empty = self.job.wait_empty();
+        // Job accounting can reach zero before the process object signals.
+        // Read the reason from the retained handle, never a reused PID.
         let code = self
             .child
-            .try_wait()
+            .wait_bounded(1000)
             .ok()
             .flatten()
             .and_then(|status| status.code())
             .map(|n| n as u32);
-        (code, empty)
+        (code, empty && code.is_some())
     }
 }
 impl Drop for OwnedWorker {
@@ -870,7 +869,6 @@ mod tests {
     fn unexpected_child_exit_completes_once_and_preserves_reserved_terminal() {
         let (handle, bridge) = HostHandle::channel();
         handle.try_sample(41, "room").unwrap();
-        handle.show_login().unwrap();
         for _ in 0..16 {
             bridge.emit(Status::Ready);
         }

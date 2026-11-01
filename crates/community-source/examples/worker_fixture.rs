@@ -32,6 +32,8 @@ fn main() {
     let start = read(&mut input).unwrap();
     assert_eq!(start["kind"], "Start");
     if mode == "descendant_owner" || mode == "descendant_owner_wait" {
+        // The exact Job is the owner; exiting before this child is intentional.
+        #[allow(clippy::zombie_processes)]
         let child = Command::new(std::env::current_exe().unwrap())
             .arg("descendant")
             .stdin(Stdio::null())
