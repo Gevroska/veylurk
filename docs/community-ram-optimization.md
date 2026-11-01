@@ -38,8 +38,19 @@ Previously recorded full-page measurements are comparison evidence, not a new ma
 | Gate | Status | Evidence |
 | --- | --- | --- |
 | Astra design and scope | Verified | Explicit popout mode and dormant lifecycle; no further owner decision needed. |
-| Implementation and independent review | In progress | Native/source changes and focused fixtures. |
-| Exact Windows CI and artifact | Pending | Root operates existing application/native workflows. |
+| Implementation and independent review | Verified source | Strict route/readiness, unobservable panel phase, frozen receipt and dormant lifecycle reviewed; 124 local Node tests passed. Post-close Login and dormant disconnect findings corrected. |
+| Exact Windows CI and artifact | In progress | Native source `ef085ddf` passed 94 tests. App checks passed ordinary tests but encountered a 146.697-second scale-cap failure, then a recovery helper that treated the new 10-second read wait as failed storage before its 30-second acceptance deadline. A reviewed test-only compatibility correction preserves all deadlines/assertions. Any diagnostic artifact remains explicitly unqualified and cannot turn a failed workflow green. |
 | Anonymous negative and signed-in positive checks | Pending | Original profile remains preserved. |
 | Resource gains and breadth | Pending | No new savings claimed before measurement. |
 | History, credentials, settings and production preserved | Pending | Final independent verification required. |
+
+
+### Diagnostic build policy
+
+The full Windows workflow retains recovery/performance failures and the normal
+release artifact remains gated on complete success. When those two gates alone
+fail, a distinctly named `veylurk-diagnostic-windows-x64` artifact may support
+isolated investigation only after lint, unit/UI/operations, compilation and every
+required offline smoke/package check pass. Its manifest records the exact source,
+executable hash, failed gate outcomes and `release_qualified: false`. Building it
+does not reclassify failed qualification or authorize production deployment.

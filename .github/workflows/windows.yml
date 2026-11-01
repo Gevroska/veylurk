@@ -24,33 +24,59 @@ jobs:
         with:
           node-version: '24.13.1'
       - name: Test embedded UI behavior without a browser
+        id: ui
         run: node --test web/app.test.cjs web/theme.test.cjs crates/community-source/tests/community-ui.test.cjs
       - name: Test Windows PowerShell launcher without Twitch
+        id: launcher
         shell: powershell
         run: .\scripts\Test-VeylurkLauncher.ps1
       - name: Test offline Windows operations without real startup tasks
+        id: ops
         shell: powershell
         run: .\scripts\Test-VeylurkOperations.ps1
       - name: Test bounded local measurement without a collector
+        id: measurement
         shell: powershell
         run: .\scripts\Test-VeylurkMeasurement.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Check formatting
+        id: fmt
         run: cargo fmt --all -- --check
       - name: Lint
         id: lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
+        id: unit
         run: cargo test --locked -- --skip collector::buffer_tests::fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls
       - name: Verify fixed-time buffered storage recovery in isolation
+        id: storage_recovery
         run: cargo test --locked --lib collector::buffer_tests::fifty_room_collector_recovers_twice_from_thirteen_second_sqlite_stalls -- --exact --nocapture --test-threads=1
       - name: Exercise synthetic 10, 25 and 50 channel history workloads
+        id: scale
+        if: >-
+          always() && !cancelled() &&
+          steps.ui.outcome == 'success' && steps.launcher.outcome == 'success' &&
+          steps.ops.outcome == 'success' && steps.measurement.outcome == 'success' &&
+          steps.fmt.outcome == 'success' && steps.lint.outcome == 'success' &&
+          steps.unit.outcome == 'success' &&
+          (steps.storage_recovery.outcome == 'success' || steps.storage_recovery.outcome == 'failure')
         run: cargo test --locked scale_workload -- --ignored --nocapture --test-threads=1
       - name: Build release application and probes
+        id: app_build
+        if: >-
+          always() && !cancelled() &&
+          steps.ui.outcome == 'success' && steps.launcher.outcome == 'success' &&
+          steps.ops.outcome == 'success' && steps.measurement.outcome == 'success' &&
+          steps.fmt.outcome == 'success' && steps.lint.outcome == 'success' &&
+          steps.unit.outcome == 'success' &&
+          (steps.storage_recovery.outcome == 'success' || steps.storage_recovery.outcome == 'failure') &&
+          (steps.scale.outcome == 'success' || steps.scale.outcome == 'failure')
         run: cargo build --release --locked
       - name: Verify bounded offline presence validation and package its evidence tools
+        id: validator
+        if: always() && !cancelled() && steps.app_build.outcome == 'success'
         shell: pwsh
         run: |
           $validationDirectory = Join-Path $env:RUNNER_TEMP ('veylurk-presence-' + [guid]::NewGuid().ToString('N'))
@@ -82,6 +108,8 @@ jobs:
         if: always() && !cancelled() && steps.lint.outcome == 'success'
         run: cargo build --release --locked --bin veylurk-perf-bench
       - name: Smoke-check application help without Twitch
+        id: app_help
+        if: always() && !cancelled() && steps.app_build.outcome == 'success'
         shell: pwsh
         run: |
           .\target\release\veylurk.exe --help
@@ -97,6 +125,8 @@ jobs:
           $benchReport = Get-Content -LiteralPath (Join-Path $benchDirectory 'report.json') -Raw | ConvertFrom-Json
           if (-not $benchReport.success -or $benchReport.provenance.network_used -or $benchReport.correctness.observed.observations -ne 400 -or -not $benchReport.files.settings_unchanged_and_full_durability) { throw 'Offline performance report contract was invalid' }
       - name: Verify packaged application startup and graceful exit without Twitch
+        id: app_startup
+        if: always() && !cancelled() && steps.app_build.outcome == 'success'
         shell: pwsh
         run: |
           Remove-Item Env:\VEYLURK_TWITCH_CLIENT_ID -ErrorAction SilentlyContinue
@@ -149,11 +179,15 @@ jobs:
             $process.Dispose()
           }
       - name: Smoke-check IRC probe help without Twitch
+        id: irc_help
+        if: always() && !cancelled() && steps.app_build.outcome == 'success'
         shell: pwsh
         run: |
           .\target\release\veylurk-irc-probe.exe --help
           if ($LASTEXITCODE -ne 0) { throw 'IRC probe help check failed' }
       - name: Package standalone application and documentation
+        id: package
+        if: always() && !cancelled() && steps.app_build.outcome == 'success'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path app-package -ErrorAction Stop | Out-Null
@@ -163,6 +197,8 @@ jobs:
           New-Item -ItemType Directory -Path app-package/docs -ErrorAction Stop | Out-Null
           Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md, docs/timeline.md, docs/remaining-work.md, docs/community-cadence.md, docs/community-integration-plan.md, docs/community-presence-model.md, docs/community-ram-optimization.md -Destination app-package/docs -ErrorAction Stop
       - name: Verify packaged background shutdown and offline backup with actual SQLite
+        id: app_backup
+        if: always() && !cancelled() && steps.app_build.outcome == 'success' && steps.package.outcome == 'success'
         shell: powershell
         run: |
           Remove-Item Env:\VEYLURK_TWITCH_CLIENT_ID -ErrorAction SilentlyContinue
@@ -215,6 +251,43 @@ jobs:
             }
             $supervisor.Dispose()
           }
+      # Failed recovery/scale checks remain failed. This separate artifact is
+      # available only when every other verification and packaging check passed.
+      - name: Mark application package as diagnostic and not release qualified
+        id: diagnostic_manifest
+        if: >-
+          always() && !cancelled() &&
+          steps.ui.outcome == 'success' && steps.launcher.outcome == 'success' &&
+          steps.ops.outcome == 'success' && steps.measurement.outcome == 'success' &&
+          steps.fmt.outcome == 'success' && steps.lint.outcome == 'success' &&
+          steps.unit.outcome == 'success' && steps.app_build.outcome == 'success' &&
+          steps.validator.outcome == 'success' && steps.app_help.outcome == 'success' &&
+          steps.app_startup.outcome == 'success' && steps.irc_help.outcome == 'success' &&
+          steps.package.outcome == 'success' && steps.app_backup.outcome == 'success' &&
+          steps.performance_build.outcome == 'success' && steps.performance_smoke.outcome == 'success' &&
+          (steps.storage_recovery.outcome == 'success' || steps.storage_recovery.outcome == 'failure') &&
+          (steps.scale.outcome == 'success' || steps.scale.outcome == 'failure') &&
+          (steps.storage_recovery.outcome == 'failure' || steps.scale.outcome == 'failure')
+        shell: pwsh
+        env:
+          STORAGE_RECOVERY_OUTCOME: ${{ steps.storage_recovery.outcome }}
+          SCALE_OUTCOME: ${{ steps.scale.outcome }}
+        run: |
+          $manifest = [ordered]@{
+            source_revision = $env:GITHUB_SHA
+            executable_sha256 = (Get-FileHash -LiteralPath app-package/veylurk.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            storage_recovery_outcome = $env:STORAGE_RECOVERY_OUTCOME
+            scale_outcome = $env:SCALE_OUTCOME
+            release_qualified = $false
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'app-package/DIAGNOSTIC_MANIFEST.json'), ($manifest | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+      - name: Publish diagnostic Windows application artifact from failed qualification
+        if: always() && !cancelled() && steps.diagnostic_manifest.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: veylurk-diagnostic-windows-x64
+          path: app-package/
+          if-no-files-found: error
       - name: Publish standalone Windows application artifact
         uses: actions/upload-artifact@v4
         with:

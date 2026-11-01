@@ -174,6 +174,7 @@ struct RecoveryStats {
 struct RecoveryProgress {
     stats_requests: usize,
     stats_request_pending: bool,
+    stats_response_timeouts: usize,
     last_stats: Option<RecoveryStats>,
     last_observation_progress_elapsed_ms: Option<u64>,
 }
@@ -234,12 +235,14 @@ fn recovery_context(
         "receive_capacity": RECEIVE_UNITS,
         "stats_requests": progress.stats_requests,
         "stats_request_pending": progress.stats_request_pending,
+        "stats_response_timeouts": progress.stats_response_timeouts,
         "last_completed_stats": progress.last_stats,
         "last_completed_stats_age_ms": progress.last_stats.as_ref().map(|stats| elapsed_ms.saturating_sub(stats.completed_elapsed_ms)),
         "last_observation_progress_age_ms": progress.last_observation_progress_elapsed_ms.map(|at| elapsed_ms.saturating_sub(at)),
         "original_available_receive_permits": target.original_budget.map(|budget| budget.available_permits()),
         "collector": current,
         "diagnostics": store.diagnostics(),
+        "storage_activity": store.storage_activity(),
         "store_work": {
             "completion_window": if target.work_at_release.is_some() { "since_round_start" } else { "since_store_open" },
             "at_release": target.work_at_release,
@@ -271,12 +274,21 @@ async fn recovered(
             progress.stats_request_pending = true;
             let stats_result = store.stats().await;
             progress.stats_request_pending = false;
-            let stats = stats_result.unwrap_or_else(|_| {
-                panic!(
+            let stats = match stats_result {
+                Ok(stats) => stats,
+                Err(crate::store::StoreError::ReadWaitTimeout) => {
+                    // A bounded response wait is not a storage failure. Keep
+                    // polling under the original outer recovery deadline;
+                    // only a fresh successful read can satisfy acceptance.
+                    progress.stats_response_timeouts += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(_) => panic!(
                     "recovery storage statistics failed: {}",
                     recovery_context(store, health, target, began, &progress)
-                );
-            });
+                ),
+            };
             let elapsed_ms = began.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             if progress
                 .last_stats
