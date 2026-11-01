@@ -69,12 +69,14 @@ pub struct PlayerObservation {
     // Decoding/buffering state is diagnostic only; it does not prove pause.
     pub video_ready: bool,
     pub video_paused: Option<bool>,
+    // The ordinary control can be absent while every video remains paused.
+    // Its label is diagnostic only; it does not establish or invalidate pause.
     pub play_control: bool,
     pub pause_clicked: bool,
 }
 
 /// One ordinary pause action per navigation. Stable readiness must precede
-/// observer arming. Missing controls require reverification; actual playback
+/// observer arming. Actual playback, missing video, or unknown pause state
 /// after established readiness is terminal, never retried.
 #[derive(Default)]
 pub struct PlayerGate {
@@ -122,7 +124,6 @@ impl PlayerGate {
             return Err("signed_in_ui_lost");
         }
         if !observation.signed_in
-            || !observation.play_control
             || (require_readiness && (!observation.chat_ready || !observation.community_ready))
             || (!self.pause_verified && !require_readiness)
         {
@@ -132,7 +133,7 @@ impl PlayerGate {
         }
         let since = self.stable_since.get_or_insert(now);
         self.ready = now.saturating_sub(*since) >= PAUSED_READY_STABLE_MS;
-        // A preliminary paused/Play snapshot is not an irreversible latch.
+        // A preliminary paused snapshot is not an irreversible latch.
         self.pause_verified |= self.ready;
         Ok(self.ready)
     }
@@ -1055,6 +1056,7 @@ mod tests {
         let mut observed = paused_channel();
         // Both no decoded frame and ended media produce this diagnostic value.
         observed.video_ready = false;
+        observed.play_control = false;
         assert!(!gate.observe(0, &observed, true).unwrap());
         assert!(!gate.pause_verified());
         assert!(!gate
@@ -1071,14 +1073,13 @@ mod tests {
 
     #[test]
     fn diagnostic_decode_readiness_never_substitutes_for_actual_pause() {
-        for missing in ["video", "paused", "known_paused", "control"] {
+        for missing in ["video", "paused", "known_paused"] {
             let mut gate = PlayerGate::default();
             let mut observed = paused_channel();
             match missing {
                 "video" => observed.video_present = false,
                 "paused" => observed.video_paused = Some(false),
-                "known_paused" => observed.video_paused = None,
-                _ => observed.play_control = false,
+                _ => observed.video_paused = None,
             }
             assert!(!gate.observe(0, &observed, true).unwrap());
             assert!(!gate
@@ -1143,7 +1144,7 @@ mod tests {
 
     #[test]
     fn pause_guard_rejects_missing_video_auth_loss_and_repeated_pause_actions() {
-        for missing in ["video", "signed_in"] {
+        for missing in ["video", "known_paused", "paused", "signed_in"] {
             let mut gate = PlayerGate::default();
             let mut observed = paused_channel();
             gate.observe(0, &observed, true).unwrap();
@@ -1152,6 +1153,8 @@ mod tests {
                 .unwrap());
             match missing {
                 "video" => observed.video_present = false,
+                "known_paused" => observed.video_paused = None,
+                "paused" => observed.video_paused = Some(false),
                 _ => observed.signed_in = false,
             }
             let expected = if missing == "signed_in" {
@@ -1172,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn preliminary_pause_control_hydration_resets_stability_without_playback_loss() {
+    fn changing_play_control_does_not_reset_initial_pause_stability() {
         let mut gate = PlayerGate::default();
         let mut observed = paused_channel();
         observed.video_ready = false;
@@ -1180,14 +1183,36 @@ mod tests {
         assert!(!gate.pause_verified());
         observed.play_control = false;
         assert!(!gate.observe(250, &observed, true).unwrap());
-        assert!(!gate.observe(3_000, &observed, true).unwrap());
+        observed.play_control = true;
+        assert!(!gate.observe(1_000, &observed, true).unwrap());
+        observed.play_control = false;
+        assert!(!gate.observe(1_999, &observed, true).unwrap());
         assert!(!gate.pause_verified());
         assert!(gate.may_click_pause());
-        observed.play_control = true;
-        assert!(!gate.observe(3_250, &observed, true).unwrap());
-        assert!(!gate.observe(5_249, &observed, true).unwrap());
-        assert!(gate.observe(5_250, &observed, true).unwrap());
+        assert!(gate.observe(2_000, &observed, true).unwrap());
         assert!(gate.pause_verified());
+    }
+
+    #[test]
+    fn missing_chat_or_community_before_trigger_requires_fresh_stability() {
+        for missing in ["chat", "community"] {
+            let mut gate = PlayerGate::default();
+            let ready = paused_channel();
+            assert!(!gate.observe(0, &ready, true).unwrap());
+            assert!(gate.observe(2_000, &ready, true).unwrap());
+            let mut observed = ready.clone();
+            if missing == "chat" {
+                observed.chat_ready = false;
+            } else {
+                observed.community_ready = false;
+            }
+            assert!(!gate.observe(2_250, &observed, true).unwrap());
+            assert!(gate.pause_verified());
+            assert!(!gate.may_click_pause());
+            assert!(!gate.observe(3_000, &ready, true).unwrap());
+            assert!(!gate.observe(4_999, &ready, true).unwrap());
+            assert!(gate.observe(5_000, &ready, true).unwrap());
+        }
     }
 
     #[test]
@@ -1208,8 +1233,8 @@ mod tests {
         assert!(!gate.observe(1_000, &observed, true).unwrap());
         observed.play_control = true;
         assert!(!gate.observe(1_250, &observed, true).unwrap());
-        assert!(!gate.observe(3_249, &observed, true).unwrap());
-        assert!(gate.observe(3_250, &observed, true).unwrap());
+        assert!(!gate.observe(2_999, &observed, true).unwrap());
+        assert!(gate.observe(3_000, &observed, true).unwrap());
         assert!(gate.pause_verified());
         assert!(!gate.may_click_pause());
         observed.video_paused = Some(false);
@@ -1236,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_play_after_readiness_withholds_acceptance_until_stable_reverification() {
+    fn changing_play_after_readiness_preserves_trigger_body_and_idle_guards() {
         for require_readiness in [false, true] {
             let mut gate = PlayerGate::default();
             let mut observed = paused_channel();
@@ -1244,15 +1269,13 @@ mod tests {
             assert!(gate.observe(2_000, &observed, true).unwrap());
             observed.play_control = false;
             for now in [2_250, 5_000, 10_000] {
-                assert!(!gate.observe(now, &observed, require_readiness).unwrap());
-                assert!(!gate.ready());
+                assert!(gate.observe(now, &observed, require_readiness).unwrap());
+                assert!(gate.ready());
                 assert!(gate.pause_verified());
                 assert!(!gate.may_click_pause());
             }
             observed.play_control = true;
-            assert!(!gate.observe(10_250, &observed, require_readiness).unwrap());
-            assert!(!gate.observe(12_249, &observed, require_readiness).unwrap());
-            assert!(gate.observe(12_250, &observed, require_readiness).unwrap());
+            assert!(gate.observe(10_250, &observed, require_readiness).unwrap());
             // Losing the control cannot turn off the established playback guard.
             observed.play_control = false;
             gate.observe(12_500, &observed, require_readiness).unwrap();

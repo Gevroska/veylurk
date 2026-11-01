@@ -86,25 +86,26 @@ at most five additional seconds for browser-process exit confirmation.
 
 The existing profile is required. No automatic login is attempted. The source
 page must show the signed-in User Avatar, chat structure, Community control,
-and a video whose paused state is corroborated by the normal Play
-control. These prerequisites must remain ready for at least two seconds before
+and at least one video, with every video paused. These prerequisites must remain
+ready for at least two seconds before
 observation is enabled. Structural selectors are conservative candidates; the
 runtime must validate them. No account identity, chat content, or media URL is
 returned or retained by this UI check.
-Video decoding/buffering readiness and ended state do not gate sampling. Their
-combined `video_ready` flag is diagnostic only: the proof never loads or plays
-media to make that flag true.
-During initial page setup, a preliminary paused/Play observation does not latch
-readiness. Changing controls reset the stability interval. If playback starts,
+Video decoding/buffering readiness, ended state and the normal Play control do
+not gate sampling. The `video_ready` and `play_control` flags are diagnostic
+only: the proof never loads or plays media to make either flag true.
+During initial page setup, a preliminary paused observation does not latch
+readiness. Losing signed-in chat or Community readiness before the trigger resets
+the stability interval; changes to the Play control do not. If playback starts,
 the one allowed normal Pause action is followed by fresh confirmation and a full
 two-second stability interval; the proof does not assume the click took effect.
 
 Pause is checked again immediately before the ordinary Community click and
 after the response body arrives, before sample acceptance. The same checks
 continue during response waits and between attempts. Once stable readiness is
-established, actual resumed playback or a missing video stops the run. A missing
-Play control while all videos remain paused instead withholds the trigger or
-sample acceptance until two seconds of stable reverification. Waiting does not
+established, actual resumed playback, a missing video or an unknown paused state
+stops the run. A missing or changing Play control while all videos remain paused
+does not reset readiness or withhold the trigger or sample acceptance. Waiting does not
 reset the original deadline or repeat an actual Community click. Evidence
 distinguishes a trigger deadline, player-reverification deadline, and native
 response timeout. The next navigation gets a new pause/readiness gate. There is no

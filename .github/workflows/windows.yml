@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: '24.13.1'
       - name: Test embedded UI behavior without a browser
-        run: node --test web/app.test.cjs web/theme.test.cjs
+        run: node --test web/app.test.cjs web/theme.test.cjs crates/community-source/tests/community-ui.test.cjs
       - name: Test Windows PowerShell launcher without Twitch
         shell: powershell
         run: .\scripts\Test-VeylurkLauncher.ps1

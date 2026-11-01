@@ -180,3 +180,29 @@ All 24,858 pre-update IRC observations, 171 Community attempts and 15,742 Commun
 member receipts compared identically, and saved credentials were reused unchanged.
 Production port 8795 and its executable were not modified or restarted. This short
 check does not establish that an intermittent cleanup failure can never recur.
+
+## Paused-player readiness candidate
+
+The test instance's `strano` page reached the unchanged 25-second navigation/UI
+deadline with signed-in chat, Community and paused video present, but without the
+ordinary Play control or decoded frames. The Play-label requirement was an
+additional readiness gate even though the video elements directly reported pause.
+
+The candidate treats `play_control` as diagnostic only in both the native
+`PlayerGate` and the browser's immediate pre-click check. Initial readiness still
+requires signed-in chat, an available Community control, at least one video and
+every video paused for two seconds. Missing or changing Play controls and decode
+readiness cannot reset that interval or withhold trigger/body/idle acceptance.
+Missing video, unknown pause state or resumed playback still blocks initial
+readiness and fails closed after verification. The source can issue only one
+ordinary Pause click when actually playing and must then establish a fresh full
+stability interval. Authentication, challenge, navigation/request provenance,
+trigger deadlines and cleanup handling are unchanged.
+
+Focused Rust regressions cover these readiness and pause-action boundaries. An
+offline Node VM fixture executes the actual embedded `COMMUNITY_UI`: paused video
+without Play or decoded frames produces one ordinary Community click; playback,
+missing/unknown video, wrong pages, challenge pages, lost prerequisites and
+expired deadlines produce none. Windows Rust/CI checks and fresh isolated live
+`strano` acceptance remain separate candidate verification gates. Existing cleanup
+acceptance above does not establish this candidate's live success.

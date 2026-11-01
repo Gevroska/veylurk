@@ -82,7 +82,7 @@ const COMMUNITY_UI: &str = r#"(() => {
     }
     if (!__CLICK__) return result('observed');
     if (!before.signed_in || !before.chat_ready || !before.community_ready
-        || !before.video_present || before.video_paused !== true || !before.play_control)
+        || !before.video_present || before.video_paused !== true)
       return result('pause_or_readiness_lost');
   }
   if (!target || target.disabled) return result('waiting_ui');
