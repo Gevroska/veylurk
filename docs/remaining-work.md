@@ -392,3 +392,18 @@ Both retained-history prefixes matched, the complete latest test database was
 returned to its original location, and credentials and original settings were
 preserved. The test instance on 8796 produced fresh durable samples from both
 original channels after restart. Production on 8795 remained unchanged.
+
+## Reliable measurements and hidden collection window
+
+The owner requested a repair of process measurements and a fully hidden browser
+except during explicit sign-in. The integrated window previously used minimize;
+the correction uses a hidden native host while retaining WebView2 rendering.
+Native visibility transitions have independent source review and local checks;
+exact Windows CI and live sign-in/hidden collection proof remain pending.
+
+The measurement repair uses identity-bound process handles, bounded lifecycle
+reconciliation, explicit missingness and conservative CPU/continuity rules.
+Deterministic lifecycle tests and independent review precede another bounded
+storage-isolated run. Existing resource, source and timeout guards remain in
+force. Historical measurement exceptions were not recorded, so their exact cause
+cannot be retroactively established. Production remains excluded.

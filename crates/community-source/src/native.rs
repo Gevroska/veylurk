@@ -257,7 +257,8 @@ struct Service {
     pending_command: RefCell<Option<QueuedCommand>>,
     pending_result: RefCell<Option<PendingCompletion>>,
     last_cancel: RefCell<u64>,
-    login_visible: RefCell<bool>,
+    // Owner sign-in remains paused after its window is dismissed.
+    login_session: RefCell<bool>,
 }
 
 impl Service {
@@ -313,6 +314,54 @@ fn unix_milliseconds() -> i64 {
 }
 
 impl App {
+    fn hide_service_window(&self) -> bool {
+        if self.service.is_none() {
+            return true;
+        }
+        // Hide only the native host. Keep the controller visible with ordinary
+        // bounds so Community readiness continues to use the rendered page.
+        // No RefCell guard may cross synchronous native window messages.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+            .is_ok()
+                && IsWindow(Some(self.hwnd)).as_bool()
+                && !IsWindowVisible(self.hwnd).as_bool()
+        }
+    }
+
+    fn show_login_window(&self) {
+        let Some(service) = &self.service else {
+            return;
+        };
+        *service.login_session.borrow_mut() = true;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            // A launcher's STARTUPINFO can override the first ShowWindow call.
+            // Retry only when needed so hidden/minimized launch preferences
+            // cannot suppress this explicit owner sign-in request.
+            if !IsWindowVisible(self.hwnd).as_bool() || IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+    }
+
     fn initialization_current(&self, epoch: u64) -> bool {
         self.epoch() == epoch && self.state.borrow().initializing_at.is_some()
     }
@@ -421,7 +470,7 @@ impl App {
         let Some(service) = &self.service else {
             return false;
         };
-        if !*service.login_visible.borrow()
+        if !*service.login_session.borrow()
             || service.active.borrow().is_some()
             || service.bridge.control.pending_job().is_some()
             || service.pending_result.borrow().is_some()
@@ -612,6 +661,7 @@ impl App {
         if self.state.borrow().recycling_at.is_some() {
             return;
         }
+        self.hide_service_window();
         self.cancel_round();
         self.disable_network();
         {
@@ -761,9 +811,7 @@ impl App {
             dismissal.last_observed_at_unix_ms = unix_milliseconds();
             drop(state);
             self.publish_fault();
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
-            }
+            self.hide_service_window();
         } else {
             self.observe_termination(HostTerminationReason::ProofWindowClose);
             self.close();
@@ -844,6 +892,7 @@ impl App {
         let changed = *service.last_cancel.borrow() != cancel;
         *service.last_cancel.borrow_mut() = cancel;
         if changed {
+            self.hide_service_window();
             if service.active.borrow().is_some() || self.state.borrow().selected_channel.is_some() {
                 self.service_failure("operator_cancelled", false);
             } else {
@@ -930,7 +979,7 @@ impl App {
                 if !valid {
                     // An already-created blank controller must not survive a
                     // command that expired while initialization was pending.
-                    if self.engine.borrow().is_some() && !*service.login_visible.borrow() {
+                    if self.engine.borrow().is_some() && !*service.login_session.borrow() {
                         self.begin_recycle();
                     }
                     return;
@@ -988,10 +1037,7 @@ impl App {
                             state.player_gate = sampling::PlayerGate::for_page(state.source_page);
                             state.login_failure_reported = false;
                         }
-                        *service.login_visible.borrow_mut() = true;
-                        unsafe {
-                            let _ = ShowWindow(self.hwnd, SW_RESTORE);
-                        }
+                        self.show_login_window();
                         service.bridge.emit(Status::LoginShown);
                         self.navigate("https://www.twitch.tv/login".into());
                     }
@@ -1023,7 +1069,7 @@ impl App {
                         let navigation_deadline =
                             job.queued_at + Duration::from_millis(sampling::NAVIGATION_UI_MS);
                         self.cancel_round();
-                        *service.login_visible.borrow_mut() = false;
+                        *service.login_session.borrow_mut() = false;
                         *service.active.borrow_mut() = Some(job);
                         {
                             let mut state = self.state.borrow_mut();
@@ -1031,12 +1077,8 @@ impl App {
                             state.player_gate = sampling::PlayerGate::for_page(state.source_page);
                             state.auto_stage = Some(AutoStage::Navigating(navigation_deadline));
                         }
-                        let minimized = unsafe {
-                            let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
-                            IsIconic(self.hwnd).as_bool()
-                        };
-                        if !minimized {
-                            self.service_failure("native_minimize_unverified", false);
+                        if !self.hide_service_window() {
+                            self.service_failure("native_hide_unverified", false);
                             return;
                         }
                         self.navigate(
@@ -1081,7 +1123,7 @@ impl App {
                 self.ui_step(false)
             }
             None if self.state.borrow().player_gate.readiness_verified()
-                && !*service.login_visible.borrow() =>
+                && !*service.login_session.borrow() =>
             {
                 self.ui_step(false)
             }
@@ -2638,6 +2680,7 @@ impl App {
     }
 
     fn close(&self) {
+        self.hide_service_window();
         if let Some(service) = &self.service {
             service.bridge.control.stop_accepting();
         }
@@ -3293,7 +3336,7 @@ unsafe fn make_window(
         active: RefCell::new(None),
         pending_command: RefCell::new(None),
         pending_result: RefCell::new(None),
-        login_visible: RefCell::new(false),
+        login_session: RefCell::new(false),
     });
     let app = Rc::new(App {
         hwnd,
@@ -3320,14 +3363,11 @@ unsafe fn make_window(
         let _ = DestroyWindow(hwnd);
         return Err(windows::core::Error::from_thread());
     }
-    let _ = ShowWindow(
-        hwnd,
-        if app.service.is_some() {
-            SW_MINIMIZE
-        } else {
-            SW_SHOW
-        },
-    );
+    // The integrated host is born without WS_VISIBLE and remains hidden until
+    // an accepted owner ShowLogin command. Never briefly show or minimize it.
+    if app.service.is_none() {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
     app.save();
     Ok(app)
 }
@@ -3462,14 +3502,158 @@ mod lifecycle_tests {
                 pending_command: RefCell::new(None),
                 pending_result: RefCell::new(None),
                 last_cancel: RefCell::new(0),
-                login_visible: RefCell::new(false),
+                login_session: RefCell::new(false),
             }),
         });
         (handle, app)
     }
 
+    struct NativeWindowFixture {
+        app: Rc<App>,
+    }
+
+    impl NativeWindowFixture {
+        fn create() -> (HostHandle, Self) {
+            let (handle, bridge) = HostHandle::channel();
+            // Window creation alone never initializes COM or the browser and
+            // service evidence is kept in memory; no profile or files are made.
+            let app = unsafe {
+                make_window(
+                    PathBuf::new(),
+                    None,
+                    Some((
+                        HostOptions {
+                            profile_dir: PathBuf::new(),
+                        },
+                        bridge,
+                    )),
+                )
+                .expect("create native fixture window")
+            };
+            (handle, Self { app })
+        }
+    }
+
+    impl Drop for NativeWindowFixture {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = KillTimer(Some(self.app.hwnd), 1);
+                APP.with(|slot| slot.borrow_mut().take());
+                let _ = DestroyWindow(self.app.hwnd);
+            }
+        }
+    }
+
+    fn assert_hidden(app: &App) {
+        unsafe {
+            assert!(IsWindow(Some(app.hwnd)).as_bool());
+            assert!(!IsWindowVisible(app.hwnd).as_bool());
+            assert!(!IsIconic(app.hwnd).as_bool());
+        }
+    }
+
+    fn assert_shown(app: &App) {
+        unsafe {
+            assert!(IsWindowVisible(app.hwnd).as_bool());
+            assert!(!IsIconic(app.hwnd).as_bool());
+        }
+    }
+
+    #[test]
+    fn integrated_native_window_is_born_hidden_and_cancelled_login_cannot_show_it() {
+        let (handle, native) = NativeWindowFixture::create();
+        let app = &native.app;
+        assert_hidden(app);
+        for _ in 0..3 {
+            app.service_tick();
+            assert_hidden(app);
+        }
+        handle.show_login().unwrap();
+        {
+            let mut state = app.state.borrow_mut();
+            state.phase = BrowserPhase::Initializing;
+            state.initializing_at = Some(Instant::now());
+        }
+        handle.cancel();
+        app.service_tick();
+        app.resolve_without_controller();
+        assert_hidden(app);
+        assert_eq!(app.state.borrow().phase, BrowserPhase::Dormant);
+        assert!(!*app.service.as_ref().unwrap().login_session.borrow());
+        assert!(app.engine.borrow().is_none());
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn native_login_dismissal_hides_instead_of_minimizing_and_can_reopen() {
+        let (handle, native) = NativeWindowFixture::create();
+        let app = &native.app;
+        let service = app.service.as_ref().unwrap();
+        handle.show_login().unwrap();
+        let QueuedCommand::ShowLogin { publication } = service.bridge.commands.try_recv().unwrap()
+        else {
+            panic!("expected explicit login publication");
+        };
+        assert!(service.accept_login_publication(publication));
+        app.show_login_window();
+        assert_shown(app);
+        let generation = app.state.borrow().generation;
+        app.window_close();
+        assert_hidden(app);
+        assert!(*service.login_session.borrow());
+        assert_eq!(app.state.borrow().generation, generation);
+        assert!(app.state.borrow().closing_at.is_none());
+        assert!(handle.try_event().is_err());
+        handle.show_login().unwrap();
+        let QueuedCommand::ShowLogin { publication } = service.bridge.commands.try_recv().unwrap()
+        else {
+            panic!("expected explicit reopen publication");
+        };
+        assert!(service.accept_login_publication(publication));
+        app.show_login_window();
+        assert_shown(app);
+        app.window_close();
+        assert_hidden(app);
+        assert_eq!(handle.fault_report().window_dismissal.unwrap().count, 2);
+        assert!(app.engine.borrow().is_none());
+    }
+
+    #[test]
+    fn native_login_host_hides_on_cancel_retirement_and_shutdown() {
+        for transition in ["cancel", "retire", "shutdown"] {
+            let (handle, native) = NativeWindowFixture::create();
+            let app = &native.app;
+            app.show_login_window();
+            assert_shown(app);
+            // Initializing keeps shutdown asynchronous, letting the fixture
+            // inspect the still-owned HWND before a real callback resolves it.
+            app.state.borrow_mut().phase = BrowserPhase::Initializing;
+            app.state.borrow_mut().initializing_at = Some(Instant::now());
+            match transition {
+                "cancel" => {
+                    handle.cancel();
+                    app.service_tick();
+                }
+                "retire" => app.begin_recycle(),
+                "shutdown" => {
+                    handle.shutdown();
+                    app.service_tick();
+                }
+                _ => unreachable!(),
+            }
+            assert_hidden(app);
+            assert!(app.engine.borrow().is_none());
+            assert!(*app.service.as_ref().unwrap().login_session.borrow());
+        }
+        let (_handle, app) = fixture();
+        assert!(
+            !app.hide_service_window(),
+            "An invalid HWND is no visibility proof."
+        );
+    }
+
     fn login_navigation(app: &App) {
-        *app.service.as_ref().unwrap().login_visible.borrow_mut() = true;
+        *app.service.as_ref().unwrap().login_session.borrow_mut() = true;
         let mut state = app.state.borrow_mut();
         let intent = state.navigation_gate.begin();
         assert!(state.navigation_gate.issue(intent));
@@ -3952,7 +4136,7 @@ mod lifecycle_tests {
             handle.cancel();
             app.service_tick();
             assert!(!app.initialization_needed());
-            assert!(!*app.service.as_ref().unwrap().login_visible.borrow());
+            assert!(!*app.service.as_ref().unwrap().login_session.borrow());
             assert!(app.engine.borrow().is_none());
             assert!(handle.try_event().is_err());
             if initializing {
@@ -4085,7 +4269,7 @@ mod lifecycle_tests {
             let job = service.bridge.control.pending_job().unwrap();
             *service.pending_command.borrow_mut() =
                 Some(service.bridge.commands.try_recv().unwrap());
-            *service.login_visible.borrow_mut() = true;
+            *service.login_session.borrow_mut() = true;
             app.state.borrow_mut().denied = true;
             let started = app.state.borrow().recycling_at.unwrap();
             if show_login {
@@ -4111,7 +4295,7 @@ mod lifecycle_tests {
             assert_eq!(app.state.borrow().recycling_at, Some(started));
             assert!(app.state.borrow().closing_at.is_none());
             assert!(app.state.borrow().denied);
-            assert!(*service.login_visible.borrow());
+            assert!(*service.login_session.borrow());
             assert!(handle.try_event().is_err());
             if show_login {
                 let QueuedCommand::ShowLogin { publication } =
@@ -4297,7 +4481,7 @@ mod lifecycle_tests {
             assert!(app.state.borrow().navigation_gate.completed(50));
             assert!(handle.fault_report().host_termination.is_none());
             let service = app.service.as_ref().unwrap();
-            assert!(*service.login_visible.borrow());
+            assert!(*service.login_session.borrow());
             assert!(service.pending_command.borrow().is_none());
             assert!(
                 service.bridge.commands.try_recv().is_err(),
@@ -4338,7 +4522,7 @@ mod lifecycle_tests {
             if pending {
                 handle.try_sample(42, "room").unwrap();
             } else {
-                *app.service.as_ref().unwrap().login_visible.borrow_mut() = false;
+                *app.service.as_ref().unwrap().login_session.borrow_mut() = false;
             }
             assert!(
                 !app.owner_login_navigation_failure(NavigationFailure::NavigationCompleted {
@@ -4448,12 +4632,12 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn login_window_close_keeps_login_visible_state_and_accepts_reopen() {
+    fn login_window_close_keeps_owner_pause_and_accepts_reopen() {
         let (handle, app) = fixture();
         let service = app.service.as_ref().unwrap();
-        *service.login_visible.borrow_mut() = true;
+        *service.login_session.borrow_mut() = true;
         app.window_close();
-        assert!(*service.login_visible.borrow());
+        assert!(*service.login_session.borrow());
         assert!(app.state.borrow().closing_at.is_none());
         assert!(handle.try_event().is_err());
         handle.show_login().unwrap();
