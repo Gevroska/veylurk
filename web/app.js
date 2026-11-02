@@ -637,13 +637,29 @@
     const reason = data.persisted_pause_reason || (data.paused ? data.last_error : null);
     switch (reason) {
       case "cleanup_unconfirmed":
-      case "controller_cleanup_unconfirmed": return "Browser cleanup was not confirmed; automatic restart is paused.";
+      case "controller_cleanup_unconfirmed": return data.worker_recovery?.state === "awaiting_cleanup"
+        ? "Waiting for previous browser processes to exit; automatic recovery will continue after cleanup is confirmed."
+        : "Browser cleanup was not confirmed; automatic restart is paused.";
       case "source_denied": return "A generic source pause was retained; its original cause was not recorded.";
       case "authentication_denied": return "Authentication checks paused collection.";
       case "integrity_denied": return "Source integrity checks paused collection.";
       case "challenge_denied": return "A source challenge paused collection.";
       case "rate_limited": return "A source rate limit paused collection.";
       default: return null;
+    }
+  }
+
+  function communityRecoveryExplanation(recovery) {
+    if (!recovery || typeof recovery !== "object") return null;
+    switch (recovery.state) {
+      case "awaiting_cleanup": return "Waiting for previous browser processes to exit before restarting automatically.";
+      case "backoff": return "Automatic browser restart scheduled; no action is needed.";
+      case "restarting": return "Restarting the Community browser automatically.";
+      case "verifying": return "Browser restarted; waiting for a verified Community sample.";
+      case "recovered": return "Automatic recovery completed; Community collection resumed.";
+      case "cancelled": return "Automatic recovery was cancelled by a control change.";
+      case "blocked": return "Automatic recovery is blocked; check the pause reason.";
+      default: return "Recovery state is not recognized.";
     }
   }
 
@@ -734,6 +750,7 @@
     if (data.worker?.failure) {
       const failures = {
         start: "The browser process could not start.",
+        not_created: "The browser process could not start; no process was created.",
         unexpected_exit: "The browser process exited unexpectedly.",
         protocol: "Communication with the browser process failed.",
         stalled: "The browser process stopped responding.",
@@ -741,12 +758,27 @@
       };
       const contained = data.worker.containment_confirmed === true && data.worker.worker_tree_exited === true;
       detail(summary, "Browser process failure", Object.hasOwn(failures, data.worker.failure) ? failures[data.worker.failure] : "An unrecognized browser process failure occurred.");
-      detail(summary, "Browser failure contained", contained ? "Confirmed; all browser worker processes exited." : "Not confirmed.");
+      detail(summary, "Browser failure contained", data.worker.failure === "not_created" ? "No browser process was created." : contained ? "Confirmed; all browser worker processes exited." : "Not confirmed.");
       const exitCode = data.worker.exit_code;
       if (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 0xffffffff) {
         detail(summary, "Browser exit code", `0x${exitCode.toString(16).toUpperCase().padStart(8, "0")}`);
       }
-      detail(summary, "Community recovery", contained ? "Restart Veylurk, then choose Resume for Community collection." : "Close Veylurk and confirm its browser processes have exited before restarting.");
+      if (!data.worker_recovery) {
+        detail(summary, "Community recovery", contained ? "Restart Veylurk, then choose Resume for Community collection." : "Close Veylurk and confirm its browser processes have exited before restarting.");
+      }
+    }
+    const recoveryExplanation = communityRecoveryExplanation(data.worker_recovery);
+    if (recoveryExplanation) {
+      const recovery = data.worker_recovery;
+      detail(summary, "Community recovery", recoveryExplanation);
+      detail(summary, "Consecutive browser failures", count(recovery.attempts));
+      detail(summary, "Next automatic restart", typeof recovery.next_retry_at_utc === "string" && Number.isFinite(Date.parse(recovery.next_retry_at_utc)) ? timestamp(recovery.next_retry_at_utc) : "Not scheduled");
+      if (recovery.cleanup_confirmed === false && recovery.last_fault?.worker?.failure !== "not_created") detail(summary, "Previous browser shutdown", "Not confirmed after the abnormal exit.");
+      const previous = recovery.last_fault?.worker;
+      const exitCode = previous?.exit_code;
+      if ((!data.worker?.failure || data.worker.process_id !== previous?.process_id) && Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 0xffffffff) {
+        detail(summary, "Previous browser exit code", `0x${exitCode.toString(16).toUpperCase().padStart(8, "0")}`);
+      }
     }
     if (data.window_dismissal && Number.isSafeInteger(data.window_dismissal.count) && data.window_dismissal.count > 0) {
       detail(summary, "Helper window dismissals", `${count(data.window_dismissal.count)} · window minimized`);

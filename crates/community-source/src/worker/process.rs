@@ -23,6 +23,7 @@ const PIPE_WRITE_LIMIT: Duration = Duration::from_secs(3);
 const TREE_EXIT_LIMIT: Duration = Duration::from_secs(5);
 const EXIT_GRACE_LIMIT: Duration = Duration::from_millis(500);
 const PROCESS_EXIT_LIMIT: Duration = Duration::from_secs(1);
+const QUARANTINE_POLL: Duration = Duration::from_millis(100);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
@@ -176,11 +177,20 @@ struct OwnedWorker {
     child: ChildProcess,
     job: Job,
 }
+
+#[derive(Debug)]
+enum LaunchFailure {
+    NotCreated,
+    OwnershipUnknown,
+}
+
 impl OwnedWorker {
-    fn launch(command: &mut Command) -> io::Result<Self> {
-        let job = Job::create()?;
-        let mut child = ChildProcess::spawn(command)?;
-        if let Err(error) = job.assign(&child) {
+    fn launch(command: &mut Command) -> Result<Self, LaunchFailure> {
+        let job = Job::create().map_err(|_| LaunchFailure::NotCreated)?;
+        // ChildProcess::spawn has no fallible return after successful
+        // CreateProcessW. Every Err here proves that no child was created.
+        let mut child = ChildProcess::spawn(command).map_err(|_| LaunchFailure::NotCreated)?;
+        if job.assign(&child).is_err() {
             // Still gated on stdin: this child has never touched COM or a profile.
             let _ = child.kill();
             let started = Instant::now();
@@ -188,7 +198,7 @@ impl OwnedWorker {
             {
                 std::thread::sleep(POLL);
             }
-            return Err(error);
+            return Err(LaunchFailure::OwnershipUnknown);
         }
         Ok(Self { child, job })
     }
@@ -211,6 +221,18 @@ impl OwnedWorker {
             .flatten()
             .and_then(|status| status.code())
             .map(|n| n as u32);
+        (code, empty && code.is_some())
+    }
+
+    fn probe_containment(&mut self) -> (Option<u32>, bool) {
+        let code = self
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .and_then(|status| status.code())
+            .map(|code| code as u32);
+        let empty = self.job.active().is_ok_and(|active| active == 0);
         (code, empty && code.is_some())
     }
 }
@@ -264,7 +286,9 @@ fn supervise(options: HostOptions, bridge: Bridge) {
         refuse_environment_override(&bridge);
         return;
     }
-    let launched = worker_command().and_then(|mut command| OwnedWorker::launch(&mut command));
+    let launched = worker_command()
+        .map_err(|_| LaunchFailure::NotCreated)
+        .and_then(|mut command| OwnedWorker::launch(&mut command));
     supervise_owned(options, bridge, launched);
 }
 
@@ -316,16 +340,23 @@ fn refuse_environment_override(bridge: &Bridge) {
     bridge.control.terminate(true, code);
 }
 
-fn supervise_owned(options: HostOptions, bridge: Bridge, launched: io::Result<OwnedWorker>) {
+fn supervise_owned(
+    options: HostOptions,
+    bridge: Bridge,
+    launched: Result<OwnedWorker, LaunchFailure>,
+) {
     let control = bridge.control.clone();
     let _guard = ServiceExitGuard(control.clone());
     let mut worker = match launched {
         Ok(worker) => worker,
-        Err(_) => {
+        Err(failure) => {
             fail_worker(
                 &bridge,
                 WorkerDiagnostics {
-                    failure: Some(WorkerFailure::Start),
+                    failure: Some(match failure {
+                        LaunchFailure::NotCreated => WorkerFailure::NotCreated,
+                        LaunchFailure::OwnershipUnknown => WorkerFailure::Start,
+                    }),
                     ..Default::default()
                 },
             );
@@ -529,7 +560,7 @@ fn supervise_owned(options: HostOptions, bridge: Bridge, launched: io::Result<Ow
     drop(outbound);
     // Even after a native normal-cleanup report, physical ownership must end.
     // The exact Job, not a PID lookup, proves that no profile owner survived.
-    let (exit_code, contained) = worker.finish(failure.is_none() && terminal.is_some());
+    let (exit_code, mut contained) = worker.finish(failure.is_none() && terminal.is_some());
     worker_diagnostics.exit_code = exit_code;
     worker_diagnostics.worker_tree_exited = contained;
     worker_diagnostics.containment_confirmed = contained;
@@ -537,6 +568,18 @@ fn supervise_owned(options: HostOptions, bridge: Bridge, launched: io::Result<Ow
         failure = Some(WorkerFailure::UnexpectedExit);
     }
     worker_diagnostics.failure = failure;
+    if !contained && !control.shutdown.load(Ordering::Acquire) {
+        // Keep the exact Job and process handles while cleanup is unknown.
+        // The one failed completion is delivered now; the sole terminal waits
+        // for actual proof, so the parent cannot launch a second profile owner.
+        contained = quarantine_worker(
+            &mut worker,
+            &bridge,
+            &mut worker_diagnostics,
+            OwnedWorker::probe_containment,
+        );
+        failure = worker_diagnostics.failure;
+    }
     if failure.is_some() || !contained || terminal.is_none() {
         fail_worker(&bridge, worker_diagnostics);
     } else if let Some((cleanup_confirmed, mut report)) = terminal {
@@ -549,6 +592,40 @@ fn supervise_owned(options: HostOptions, bridge: Bridge, launched: io::Result<Ow
     drop(inbound);
     drop(writer);
     drop(reader);
+}
+
+fn quarantine_worker(
+    worker: &mut OwnedWorker,
+    bridge: &Bridge,
+    diagnostics: &mut WorkerDiagnostics,
+    mut probe: impl FnMut(&mut OwnedWorker) -> (Option<u32>, bool),
+) -> bool {
+    diagnostics
+        .failure
+        .get_or_insert(WorkerFailure::ShutdownTimeout);
+    publish_worker_failure(bridge, diagnostics.clone(), false);
+    let mut delay = Duration::from_secs(1);
+    loop {
+        if bridge.control.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let (code, contained) = probe(worker);
+        if contained {
+            diagnostics.exit_code = code;
+            diagnostics.worker_tree_exited = true;
+            diagnostics.containment_confirmed = true;
+            return true;
+        }
+        worker.job.terminate();
+        let next_probe = Instant::now() + delay;
+        while Instant::now() < next_probe {
+            if bridge.control.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+            std::thread::sleep(QUARANTINE_POLL);
+        }
+        delay = (delay * 2).min(Duration::from_secs(30));
+    }
 }
 
 fn accept_frame(
@@ -610,8 +687,12 @@ fn accept_frame(
 }
 
 fn fail_worker(bridge: &Bridge, diagnostics: WorkerDiagnostics) {
+    publish_worker_failure(bridge, diagnostics, true);
+}
+
+fn publish_worker_failure(bridge: &Bridge, diagnostics: WorkerDiagnostics, terminal: bool) {
     let code = match diagnostics.failure {
-        Some(WorkerFailure::Start) => "worker_start_failed",
+        Some(WorkerFailure::Start | WorkerFailure::NotCreated) => "worker_start_failed",
         Some(WorkerFailure::Protocol) => "worker_protocol_failure",
         Some(WorkerFailure::Stalled) => "worker_stalled",
         Some(WorkerFailure::ShutdownTimeout) => "worker_shutdown_timeout",
@@ -625,8 +706,22 @@ fn fail_worker(bridge: &Bridge, diagnostics: WorkerDiagnostics) {
     // Do not manufacture BrowserProcessExited, normal exit, Close HRESULT or
     // COM cleanup success from process containment. Preserve original source faults.
     bridge.control.record_fault(report);
+    if !terminal {
+        bridge.control.stop_accepting();
+        if let Some(job) = bridge.control.pending_job() {
+            bridge.control.complete(
+                job.ticket,
+                Err(SourceFailure {
+                    code,
+                    pauses_community: true,
+                }),
+            );
+        }
+    }
     bridge.emit(Status::Paused { code });
-    bridge.control.terminate(false, code);
+    if terminal {
+        bridge.control.terminate(false, code);
+    }
 }
 
 fn in_containment_job() -> bool {
@@ -903,6 +998,28 @@ mod tests {
     }
 
     #[test]
+    fn launch_failure_before_any_child_is_distinct_from_unknown_post_spawn_ownership() {
+        let mut missing = Command::new(r"C:\offline-worker-fixture-does-not-exist.exe");
+        assert!(matches!(
+            OwnedWorker::launch(&mut missing),
+            Err(LaunchFailure::NotCreated)
+        ));
+        for (failure, expected) in [
+            (LaunchFailure::NotCreated, WorkerFailure::NotCreated),
+            (LaunchFailure::OwnershipUnknown, WorkerFailure::Start),
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            supervise_owned(options(), bridge, Err(failure));
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup);
+            let diagnostic = report.worker.unwrap();
+            assert_eq!(diagnostic.failure, Some(expected));
+            assert!(diagnostic.process_id.is_none() && diagnostic.exit_code.is_none());
+            assert!(!diagnostic.worker_tree_exited && !diagnostic.containment_confirmed);
+        }
+    }
+
+    #[test]
     fn native_access_violation_is_contained_without_fabricated_com_cleanup() {
         let (handle, bridge) = HostHandle::channel();
         handle.try_sample(45, "room").unwrap();
@@ -920,6 +1037,75 @@ mod tests {
         let worker = report.worker.unwrap();
         assert_eq!(worker.exit_code, Some(0xC000_0005));
         assert!(worker.containment_confirmed && worker.worker_tree_exited);
+    }
+
+    #[test]
+    fn temporarily_unknown_containment_keeps_exact_handles_and_completes_only_once() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(46, "room").unwrap();
+        let mut worker = fixture("unexpected_exit");
+        let mut diagnostics = WorkerDiagnostics {
+            process_id: Some(worker.child.id()),
+            started_at_unix_ms: worker.child.started_at_unix_ms,
+            failure: Some(WorkerFailure::UnexpectedExit),
+            ..Default::default()
+        };
+        let mut probes = 0;
+        assert!(quarantine_worker(
+            &mut worker,
+            &bridge,
+            &mut diagnostics,
+            |owned| {
+                probes += 1;
+                if probes == 1 {
+                    assert!(matches!(
+                        handle.try_event(),
+                        Ok(HostEvent::SampleCompleted {
+                            job_id: 46,
+                            outcome: Err(_),
+                            ..
+                        })
+                    ));
+                    assert!(!handle.fault_report().worker.unwrap().containment_confirmed);
+                    assert!(owned.job.active().is_ok());
+                    (None, false)
+                } else {
+                    owned.probe_containment()
+                }
+            }
+        ));
+        assert!(probes >= 2);
+        assert!(diagnostics.worker_tree_exited && diagnostics.containment_confirmed);
+        assert!(diagnostics.exit_code.is_some());
+        fail_worker(&bridge, diagnostics);
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        assert!(report.worker.unwrap().containment_confirmed);
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn shutdown_cancels_quarantine_without_fabricating_late_containment() {
+        let (handle, bridge) = HostHandle::channel();
+        let mut worker = fixture("unexpected_exit");
+        let mut diagnostics = WorkerDiagnostics {
+            process_id: Some(worker.child.id()),
+            started_at_unix_ms: worker.child.started_at_unix_ms,
+            failure: Some(WorkerFailure::UnexpectedExit),
+            ..Default::default()
+        };
+        handle.shutdown();
+        assert!(!quarantine_worker(
+            &mut worker,
+            &bridge,
+            &mut diagnostics,
+            |_| { panic!("cancelled quarantine must not run another probe") }
+        ));
+        assert!(!diagnostics.containment_confirmed);
+        fail_worker(&bridge, diagnostics);
+        assert!(!terminal(&handle).1.worker.unwrap().containment_confirmed);
+        // Test cleanup observes the actual owned objects after cancellation.
+        assert!(worker.finish(false).1);
     }
 
     #[test]
@@ -954,6 +1140,42 @@ mod tests {
             "authentication_denied"
         );
         assert_eq!(report.worker.unwrap().exit_code, Some(23));
+    }
+
+    #[test]
+    fn received_pulse_or_stopped_denial_survives_empty_pulses_and_a_native_av_without_paused() {
+        for (mode, expected) in [
+            ("denial_pulse_then_av", "authentication_denied"),
+            ("source_denied_pulse_then_av", "source_denied"),
+            ("denial_stopped_then_av", "authentication_denied"),
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(52, "room").unwrap();
+            for _ in 0..16 {
+                bridge.emit(Status::Ready);
+            }
+            supervise_owned(options(), bridge, Ok(fixture(mode)));
+            assert!(matches!(
+                handle.try_event(),
+                Ok(HostEvent::SampleCompleted {
+                    job_id: 52,
+                    outcome: Err(SourceFailure {
+                        code: "worker_failed",
+                        ..
+                    }),
+                    ..
+                })
+            ));
+            assert_eq!(handle.fault_report().source_barrier.unwrap().code, expected);
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup);
+            assert_eq!(report.source_barrier.unwrap().code, expected);
+            let worker = report.worker.unwrap();
+            assert_eq!(worker.exit_code, Some(0xC000_0005));
+            assert!(worker.worker_tree_exited && worker.containment_confirmed);
+            assert!(report.cleanup_diagnostics.is_none());
+            assert!(handle.try_event().is_err());
+        }
     }
 
     #[test]

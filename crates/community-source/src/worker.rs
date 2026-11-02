@@ -448,6 +448,7 @@ const FIXED_STRINGS: &[&str] = &[
     "signed_in_ui_lost",
     "signup",
     "snake_case",
+    "source_denied",
     "source_errors",
     "source_readiness_not_verified",
     "source_reverification_deadline",

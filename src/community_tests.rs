@@ -185,6 +185,507 @@ pub(super) async fn pending_fixture() -> (tempfile::TempDir, Store, Coordinator)
     (directory, store, runner)
 }
 
+fn worker_fault(contained: bool) -> FaultReport {
+    FaultReport {
+        worker: Some(WorkerDiagnostics {
+            process_id: Some(123),
+            started_at_unix_ms: Some(456),
+            exit_code: contained.then_some(0xC000_0005),
+            worker_tree_exited: contained,
+            containment_confirmed: contained,
+            failure: Some(community_source::host::WorkerFailure::UnexpectedExit),
+        }),
+        ..Default::default()
+    }
+}
+
+async fn contained_terminal(runner: &mut Coordinator) {
+    runner
+        .event(HostEvent::Stopped {
+            cleanup_confirmed: false,
+            diagnostics: worker_fault(true),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn worker_death_while_pending_is_saved_keeps_recovery_intent_after_closed_dispatch() {
+    for source_barrier in [false, true] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        if source_barrier {
+            runner
+                .record_fault(FaultReport {
+                    source_barrier: Some(community_source::host::SourceBarrier {
+                        code: "source_errors",
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        runner
+            .failed_dispatch(Some(community_source::host::CommandError::Closed))
+            .await
+            .unwrap();
+        assert_eq!(runner.worker_fault_pending, !source_barrier);
+        assert!(runner.pending.is_none() && runner.run_id.is_none());
+        contained_terminal(&mut runner).await;
+        assert_eq!(runner.recovery_retry_at.is_some(), !source_barrier);
+        assert_eq!(runner.paused, source_barrier);
+        assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+        assert_eq!(store.community_stats().await.unwrap().pending_count, 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn contained_worker_fault_fails_once_then_retries_without_resume_and_preserves_fences() {
+    let (_directory, store, mut runner) = pending_fixture().await;
+    runner.settings.enabled = true;
+    runner.next_start = Instant::now() + START_GAP;
+    runner
+        .event(HostEvent::SampleCompleted {
+            job_id: 1,
+            channel: "example".into(),
+            outcome: Err(community_source::host::SourceFailure {
+                code: "worker_failed",
+                pauses_community: true,
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(runner.paused && runner.worker_fault_pending);
+    assert_eq!(store.community_pause().await.unwrap(), None);
+    let retry_fence = runner.schedule["example"].retry_not_before;
+    let global_fence = runner.next_start;
+    contained_terminal(&mut runner).await;
+    runner.refresh_status().await;
+    assert!(!runner.paused && runner.replacement_safe);
+    assert!(runner.run_id.is_none() && runner.pending.is_none());
+    assert_eq!(store.community_pause().await.unwrap(), None);
+    let stats = store.community_stats().await.unwrap();
+    assert_eq!((stats.failed_count, stats.pending_count), (1, 0));
+    {
+        let status = runner.service.status.read().await;
+        assert_eq!(status.state, "recovering");
+        assert_eq!(status.cleanup_confirmed, Some(false));
+        let recovery = status.worker_recovery.as_ref().unwrap();
+        assert_eq!((recovery.state, recovery.attempts), ("backoff", 1));
+        assert!(recovery.next_retry_at_utc.is_some());
+        assert!(!recovery.cleanup_confirmed);
+        assert_eq!(
+            recovery.last_fault.worker.as_ref().unwrap().exit_code,
+            Some(0xC000_0005)
+        );
+        assert!(recovery.last_fault.cleanup_diagnostics.is_none());
+    }
+    runner.step().await.unwrap();
+    assert_eq!(runner.host_start_attempts, 0);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    runner.step().await.unwrap();
+    // The test host returns a synchronous no-owner error. It must retry later,
+    // not spin or reopen a sample, and must retain both sampling fences.
+    assert_eq!(runner.host_start_attempts, 1);
+    runner.step().await.unwrap();
+    assert_eq!(runner.host_start_attempts, 1);
+    assert_eq!(runner.schedule["example"].retry_not_before, retry_fence);
+    assert_eq!(runner.next_start, global_fence);
+    assert_eq!(store.community_stats().await.unwrap().sample_count, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_contained_crashes_retry_indefinitely_at_the_cap_and_ready_does_not_reset() {
+    let (_directory, _store, mut runner) = pending_fixture().await;
+    runner.settings.enabled = true;
+    for (index, seconds) in [5, 10, 20, 40, 60, 60, 60, 60].into_iter().enumerate() {
+        contained_terminal(&mut runner).await;
+        assert_eq!(runner.worker_failures, index as u32 + 1);
+        assert_eq!(
+            runner.recovery_retry_at.unwrap() - Instant::now(),
+            Duration::from_secs(seconds)
+        );
+        runner.event(HostEvent::Ready).await.unwrap();
+        assert_eq!(runner.worker_failures, index as u32 + 1);
+        assert!(!runner.paused);
+    }
+}
+
+#[tokio::test]
+async fn durable_success_alone_resets_the_worker_streak_and_a_later_crash_opens_a_gap() {
+    let (_directory, store, mut runner) = pending_fixture().await;
+    runner.settings.enabled = true;
+    contained_terminal(&mut runner).await;
+    runner.job_id = 1;
+    assert!(runner.prepare_sample("example".into()).await.unwrap());
+    let replacement_run = runner.run_id.unwrap();
+    let mut sample = source_sample();
+    sample.received_at_unix_ms = Utc::now().timestamp_millis();
+    runner
+        .event(HostEvent::SampleCompleted {
+            job_id: 2,
+            channel: "example".into(),
+            outcome: Ok(sample),
+        })
+        .await
+        .unwrap();
+    assert_eq!(runner.worker_failures, 0);
+    assert_eq!(
+        runner
+            .service
+            .status
+            .read()
+            .await
+            .worker_recovery
+            .as_ref()
+            .unwrap()
+            .state,
+        "recovered"
+    );
+    contained_terminal(&mut runner).await;
+    assert_eq!(runner.worker_failures, 1);
+    let stats = store.community_stats().await.unwrap();
+    assert_eq!(
+        (
+            stats.failed_count,
+            stats.successful_count,
+            stats.pending_count
+        ),
+        (1, 1, 0)
+    );
+    let reason: String = store
+        .call_read(crate::diagnostics::Operation::Query, move |conn| {
+            Ok(conn.query_row(
+                "SELECT end_reason FROM community_runs WHERE id=?1",
+                [replacement_run],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(reason, "host_failure");
+    assert!(runner.run_id.is_none());
+}
+
+#[tokio::test]
+async fn invalid_or_failed_durable_completion_never_resets_worker_recovery() {
+    for invalid in [false, true] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        contained_terminal(&mut runner).await;
+        runner.job_id = 1;
+        runner.prepare_sample("example".into()).await.unwrap();
+        let mut sample = source_sample();
+        sample.received_at_unix_ms = Utc::now().timestamp_millis();
+        if invalid {
+            sample.reported_chatters = Some(u64::MAX);
+        } else {
+            store.call_write(crate::diagnostics::Operation::CommunityAppend, |conn| {
+                conn.execute_batch("CREATE TEMP TRIGGER reject_recovery_success BEFORE UPDATE OF outcome ON community_samples WHEN NEW.outcome='success' BEGIN SELECT RAISE(ABORT,'fixture success failure'); END;")?;
+                Ok(())
+            }).await.unwrap();
+        }
+        let result = runner
+            .event(HostEvent::SampleCompleted {
+                job_id: 2,
+                channel: "example".into(),
+                outcome: Ok(sample),
+            })
+            .await;
+        assert_eq!(runner.worker_failures, 1);
+        assert!(invalid || result.is_err());
+        assert_ne!(
+            runner
+                .service
+                .status
+                .read()
+                .await
+                .worker_recovery
+                .as_ref()
+                .unwrap()
+                .state,
+            "recovered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_physical_proof_component_is_required_and_legacy_cleanup_is_never_inferred_recoverable(
+) {
+    for missing in 0..6 {
+        let (directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        let mut report = worker_fault(true);
+        let worker = report.worker.as_mut().unwrap();
+        match missing {
+            0 => worker.worker_tree_exited = false,
+            1 => worker.containment_confirmed = false,
+            2 => worker.exit_code = None,
+            3 => worker.process_id = None,
+            4 => worker.started_at_unix_ms = None,
+            _ => worker.failure = None,
+        }
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: report,
+            })
+            .await
+            .unwrap();
+        assert!(runner.paused && runner.recovery_retry_at.is_none());
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            Some(CommunityPauseReason::CleanupUnconfirmed)
+        );
+        runner.step().await.unwrap();
+        assert_eq!(runner.host_start_attempts, 0);
+        let (_, restored) = Community::initialize(store, directory.path().join("profile"))
+            .await
+            .unwrap();
+        assert!(restored.paused && restored.quarantine_ticket.is_none());
+    }
+}
+
+#[tokio::test]
+async fn quarantine_persists_its_own_barrier_and_only_matching_late_proof_can_clear_it() {
+    let (directory, store, mut runner) = pending_fixture().await;
+    runner.settings.enabled = true;
+    runner.record_fault(worker_fault(false)).await.unwrap();
+    assert_eq!(runner.quarantine_ticket, Some(runner.host_generation));
+    assert_eq!(
+        store.community_pause().await.unwrap(),
+        Some(CommunityPauseReason::CleanupUnconfirmed)
+    );
+    assert_eq!(
+        runner
+            .service
+            .status
+            .read()
+            .await
+            .worker_recovery
+            .as_ref()
+            .unwrap()
+            .state,
+        "awaiting_cleanup"
+    );
+    runner
+        .event(HostEvent::SampleCompleted {
+            job_id: 1,
+            channel: "example".into(),
+            outcome: Err(community_source::host::SourceFailure {
+                code: "worker_failed",
+                pauses_community: true,
+            }),
+        })
+        .await
+        .unwrap();
+    // The bounded Paused event was dropped; the completion alone ends coverage.
+    assert!(runner.run_id.is_none());
+    let (_, restored) = Community::initialize(store.clone(), directory.path().join("profile"))
+        .await
+        .unwrap();
+    assert!(restored.paused && restored.quarantine_ticket.is_none());
+    contained_terminal(&mut runner).await;
+    assert!(!runner.paused && runner.recovery_retry_at.is_some());
+    assert_eq!(store.community_pause().await.unwrap(), None);
+    assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+}
+
+#[tokio::test]
+async fn idle_quarantine_closes_coverage_without_any_status_event_or_completion() {
+    let (_directory, store, mut runner) = pending_fixture().await;
+    runner.settings.enabled = true;
+    runner
+        .event(HostEvent::SampleCompleted {
+            job_id: 1,
+            channel: "example".into(),
+            outcome: Ok(source_sample()),
+        })
+        .await
+        .unwrap();
+    assert!(runner.pending.is_none() && runner.run_id.is_some());
+    runner.record_fault(worker_fault(false)).await.unwrap();
+    assert!(runner.run_id.is_none());
+    assert_eq!(store.community_stats().await.unwrap().successful_count, 1);
+    assert_eq!(store.community_stats().await.unwrap().failed_count, 0);
+    contained_terminal(&mut runner).await;
+    assert!(!runner.paused && runner.recovery_retry_at.is_some());
+}
+
+#[tokio::test]
+async fn shutdown_during_terminal_storage_never_commits_recovery_or_clears_owned_cleanup() {
+    for quarantine in [false, true] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        if quarantine {
+            runner.record_fault(worker_fault(false)).await.unwrap();
+        }
+        let (stop, shutdown) = watch::channel(false);
+        runner.shutdown = Some(shutdown);
+        let (release, blocker) = block_worker(store.clone()).await;
+        {
+            let terminal = runner.event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: worker_fault(true),
+            });
+            tokio::pin!(terminal);
+            assert!(futures_util::poll!(terminal.as_mut()).is_pending());
+            stop.send_replace(true);
+            release.send(()).unwrap();
+            terminal.await.unwrap();
+        }
+        blocker.await.unwrap().unwrap();
+        assert!(
+            runner.paused
+                && runner.recovery_retry_at.is_none()
+                && runner.quarantine_ticket.is_none()
+        );
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            quarantine.then_some(CommunityPauseReason::CleanupUnconfirmed)
+        );
+        runner.step().await.unwrap();
+        assert_eq!(runner.host_start_attempts, 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn proved_no_child_launch_failures_retry_but_ambiguous_start_failures_stay_blocked() {
+    for (failure, retries) in [
+        (community_source::host::WorkerFailure::NotCreated, true),
+        (community_source::host::WorkerFailure::Start, false),
+    ] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: FaultReport {
+                    worker: Some(WorkerDiagnostics {
+                        failure: Some(failure),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(runner.recovery_retry_at.is_some(), retries);
+        assert_eq!(runner.paused, !retries);
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            (!retries).then_some(CommunityPauseReason::CleanupUnconfirmed)
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        runner.step().await.unwrap();
+        assert_eq!(runner.host_start_attempts, usize::from(retries));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_disable_login_and_shutdown_cancel_backoff_and_quarantine_without_late_resurrection()
+{
+    for quarantined in [false, true] {
+        for command in ["disable", "login", "shutdown"] {
+            let (_directory, _store, mut runner) = pending_fixture().await;
+            runner.settings.enabled = true;
+            if quarantined {
+                runner.record_fault(worker_fault(false)).await.unwrap();
+            } else {
+                contained_terminal(&mut runner).await;
+            }
+            match command {
+                "disable" => {
+                    runner
+                        .control(Command::Settings(CommunitySettingsUpdate {
+                            enabled: false,
+                            target_interval_seconds: 300,
+                            cadence_mode: None,
+                        }))
+                        .await
+                        .unwrap();
+                }
+                "login" => {
+                    runner.control(Command::Login).await.unwrap();
+                }
+                _ => {
+                    let (_, shutdown) = watch::channel(true);
+                    runner.shutdown = Some(shutdown);
+                    runner.step().await.unwrap();
+                }
+            }
+            let starts = runner.host_start_attempts;
+            assert!(runner.quarantine_ticket.is_none() && runner.recovery_retry_at.is_none());
+            if quarantined {
+                contained_terminal(&mut runner).await;
+            }
+            tokio::time::advance(Duration::from_secs(600)).await;
+            runner.step().await.unwrap();
+            assert_eq!(
+                runner.host_start_attempts, starts,
+                "{command}, quarantine={quarantined}"
+            );
+            assert!(runner.recovery_retry_at.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn parent_received_source_barriers_always_outrank_worker_recovery_in_every_order() {
+    for code in [
+        "authentication_denied",
+        "signed_in_ui_lost",
+        "integrity_denied",
+        "challenge_denied",
+        "rate_limited",
+        "http_denied",
+        "source_denied",
+    ] {
+        for arrival in [
+            "diagnostic_first",
+            "terminal_only",
+            "quarantined",
+            "after_contained",
+        ] {
+            let (_directory, store, mut runner) = pending_fixture().await;
+            runner.settings.enabled = true;
+            if arrival == "quarantined" {
+                runner.record_fault(worker_fault(false)).await.unwrap();
+            }
+            if arrival == "after_contained" {
+                contained_terminal(&mut runner).await;
+            }
+            let mut report = worker_fault(true);
+            report.primary_failure = Some(primary_fixture(code, 1));
+            if arrival == "diagnostic_first" || arrival == "quarantined" {
+                runner.record_fault(report.clone()).await.unwrap();
+                report.primary_failure = None;
+            }
+            runner
+                .event(HostEvent::Stopped {
+                    cleanup_confirmed: false,
+                    diagnostics: report,
+                })
+                .await
+                .unwrap();
+            assert!(
+                runner.paused
+                    && runner.quarantine_ticket.is_none()
+                    && runner.recovery_retry_at.is_none(),
+                "{code} {arrival}"
+            );
+            assert!(store
+                .community_pause()
+                .await
+                .unwrap()
+                .is_some_and(|reason| reason != CommunityPauseReason::CleanupUnconfirmed));
+            runner.step().await.unwrap();
+            assert_eq!(runner.host_start_attempts, 0);
+            assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+        }
+    }
+}
+
 #[tokio::test]
 async fn durable_completion_is_source_separate_and_wrong_job_cannot_commit() {
     let (_directory, store, mut runner) = pending_fixture().await;
@@ -603,7 +1104,8 @@ async fn terminal_during_retirement_keeps_explicit_run_boundary_and_login_pause(
             }),
             ..Default::default()
         })
-        .await;
+        .await
+        .unwrap();
     assert!(runner.paused);
     assert_eq!(runner.service.status.read().await.state, "sign_in");
     runner.retiring = true;
@@ -665,7 +1167,7 @@ async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
         }),
         ..Default::default()
     };
-    runner.record_fault(report.clone()).await;
+    runner.record_fault(report.clone()).await.unwrap();
     runner
         .event(HostEvent::SampleCompleted {
             job_id: 1,
@@ -704,64 +1206,6 @@ async fn cleanup_terminal_cannot_erase_primary_source_failure_diagnostics() {
         Some(CommunityPauseReason::CleanupUnconfirmed)
     );
     runner.retire(CommunityRunEndReason::Paused).await.unwrap();
-}
-
-#[tokio::test]
-async fn abnormal_worker_exit_keeps_numeric_containment_separate_from_cleanup_and_blocks_resume() {
-    for earlier_source in [None, Some(CommunityPauseReason::RateLimited)] {
-        let (_directory, store, mut runner) = pending_fixture().await;
-        if earlier_source.is_some() {
-            runner.pause_source("rate_limited").await.unwrap();
-        }
-        let worker = WorkerDiagnostics {
-            process_id: Some(123),
-            started_at_unix_ms: Some(456),
-            exit_code: Some(0xC000_0005),
-            worker_tree_exited: true,
-            containment_confirmed: true,
-            failure: Some(community_source::host::WorkerFailure::UnexpectedExit),
-        };
-        runner
-            .event(HostEvent::SampleCompleted {
-                job_id: 1,
-                channel: "example".into(),
-                outcome: Err(community_source::host::SourceFailure {
-                    code: "worker_failed",
-                    pauses_community: true,
-                }),
-            })
-            .await
-            .unwrap();
-        runner
-            .event(HostEvent::Stopped {
-                cleanup_confirmed: false,
-                diagnostics: FaultReport {
-                    worker: Some(worker),
-                    ..Default::default()
-                },
-            })
-            .await
-            .unwrap();
-        let status = runner.service.status.read().await.clone();
-        assert!(status.paused);
-        assert_eq!(status.cleanup_confirmed, Some(false));
-        assert!(status.cleanup_diagnostics.is_none());
-        let diagnostic = status.worker.unwrap();
-        assert_eq!(diagnostic.exit_code, Some(0xC000_0005));
-        assert!(diagnostic.containment_confirmed && diagnostic.worker_tree_exited);
-        assert_eq!(
-            store.community_pause().await.unwrap(),
-            earlier_source.or(Some(CommunityPauseReason::CleanupUnconfirmed))
-        );
-        assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
-        assert!(runner.pending.is_none());
-        let starts = runner.host_start_attempts;
-        runner.control(Command::Resume).await.unwrap();
-        assert_eq!(runner.host_start_attempts, starts);
-        assert!(runner.paused);
-        assert!(runner.host.is_none());
-        assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
-    }
 }
 
 #[tokio::test]
@@ -996,7 +1440,8 @@ async fn every_source_barrier_precedes_later_cleanup_and_retains_first_source_ev
                 primary_failure: Some(primary_fixture(code, 1)),
                 ..Default::default()
             })
-            .await;
+            .await
+            .unwrap();
         runner.pause_source(code).await.unwrap();
         runner
             .event(HostEvent::SampleCompleted {
@@ -1159,7 +1604,8 @@ async fn confirmed_retirement_and_recovered_sample_keep_raw_diagnostics_without_
             primary_failure: Some(primary_fixture("verified_player_pause_lost", 1)),
             ..Default::default()
         })
-        .await;
+        .await
+        .unwrap();
     let mut recovered = source_sample();
     recovered.received_at_unix_ms = 2;
     runner

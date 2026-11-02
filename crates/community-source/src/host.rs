@@ -147,11 +147,54 @@ pub struct CleanupDiagnostics {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct FaultReport {
+    /// First received source barrier. Unlike the bounded status queue, this
+    /// latch survives later progress, cleanup and synthetic worker failures.
+    pub source_barrier: Option<SourceBarrier>,
     pub primary_failure: Option<PrimaryFailure>,
     pub cleanup_diagnostics: Option<CleanupDiagnostics>,
     pub host_termination: Option<HostTermination>,
     pub window_dismissal: Option<WindowDismissal>,
     pub worker: Option<WorkerDiagnostics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SourceBarrier {
+    #[serde(deserialize_with = "crate::worker::fixed_string")]
+    pub code: StructuralCode,
+}
+
+pub fn is_worker_failure(code: &str) -> bool {
+    matches!(
+        code,
+        "worker_failed"
+            | "worker_start_failed"
+            | "worker_protocol_failure"
+            | "worker_stalled"
+            | "worker_shutdown_timeout"
+    )
+}
+
+fn is_source_pause(code: &str) -> bool {
+    !is_worker_failure(code)
+        && !matches!(
+            code,
+            "cleanup_unconfirmed" | "controller_cleanup_unconfirmed" | "operator_cancelled"
+        )
+}
+
+/// Only these diagnostic codes independently prove a source denial. Other
+/// generic barriers are latched when a pausing event or completion is received.
+pub fn is_source_denial(code: &str) -> bool {
+    matches!(
+        code,
+        "authentication_denied"
+            | "signed_in_ui_lost"
+            | "integrity_denied"
+            | "challenge_denied"
+            | "rate_limited"
+            | "http_denied"
+            | "source_denied"
+    )
 }
 
 /// Process containment is independent of normal WebView2 cleanup evidence.
@@ -168,6 +211,9 @@ pub struct WorkerDiagnostics {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerFailure {
+    /// Launch failed before CreateProcessW created any child. Parent-authored
+    /// evidence only; no child/native report can supply worker diagnostics.
+    NotCreated,
     Start,
     UnexpectedExit,
     Protocol,
@@ -457,6 +503,21 @@ impl Control {
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        report.source_barrier = admission
+            .diagnostics
+            .source_barrier
+            .clone()
+            .or(report.source_barrier)
+            .or_else(|| {
+                report
+                    .primary_failure
+                    .as_ref()
+                    .filter(|failure| is_source_denial(failure.code))
+                    .map(|failure| SourceBarrier { code: failure.code })
+            });
+        if report.source_barrier.is_some() {
+            admission.accepting = false;
+        }
         // Later cleanup snapshots cannot replace the original stop trigger.
         if admission.diagnostics.host_termination.is_some() {
             report.host_termination = admission.diagnostics.host_termination.clone();
@@ -546,6 +607,15 @@ impl Control {
         {
             return false;
         }
+        if let Err(failure) = &outcome {
+            if failure.pauses_community
+                && is_source_pause(failure.code)
+                && admission.diagnostics.source_barrier.is_none()
+            {
+                admission.diagnostics.source_barrier = Some(SourceBarrier { code: failure.code });
+                admission.accepting = false;
+            }
+        }
         let job = admission.accepted.as_ref().unwrap();
         admission.completion = Some(HostEvent::SampleCompleted {
             job_id: job.job_id,
@@ -631,7 +701,20 @@ impl Bridge {
                     .login_failed = true;
                 return;
             }
-            Status::Paused { code } => HostEvent::Paused { code },
+            Status::Paused { code } => {
+                if is_source_pause(code) {
+                    let mut admission = self
+                        .control
+                        .admission
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if admission.diagnostics.source_barrier.is_none() {
+                        admission.diagnostics.source_barrier = Some(SourceBarrier { code });
+                    }
+                    admission.accepting = false;
+                }
+                HostEvent::Paused { code }
+            }
         };
         let _ = self.events.try_send(event);
     }
@@ -799,6 +882,91 @@ impl Drop for HostHandle {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    fn denial_report(code: &'static str) -> FaultReport {
+        FaultReport {
+            primary_failure: Some(PrimaryFailure {
+                code,
+                stage: "sampling",
+                observed_at_unix_ms: 1,
+                controller_epoch: 1,
+                job_id: Some(1),
+                navigation_ready: true,
+                last_player_observation: None,
+                script_pending: false,
+                network_pending: false,
+                response_pending: false,
+                trigger_pending: false,
+                navigation_failure: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn received_denial_diagnostics_latch_before_later_snapshots_and_worker_termination() {
+        for code in [
+            "authentication_denied",
+            "signed_in_ui_lost",
+            "integrity_denied",
+            "challenge_denied",
+            "rate_limited",
+            "http_denied",
+            "source_denied",
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(1, "room").unwrap();
+            bridge.control.record_fault(denial_report(code));
+            bridge.control.record_fault(FaultReport::default());
+            assert_eq!(handle.try_sample(2, "room"), Err(CommandError::Closed));
+            bridge.control.terminate(false, "worker_failed");
+            assert!(matches!(
+                handle.try_event(),
+                Ok(HostEvent::SampleCompleted { .. })
+            ));
+            let Ok(HostEvent::Stopped { diagnostics, .. }) = handle.try_event() else {
+                panic!("terminal")
+            };
+            assert_eq!(diagnostics.source_barrier.unwrap().code, code);
+        }
+    }
+
+    #[test]
+    fn coalesced_pause_and_pausing_completion_keep_the_first_generic_source_barrier() {
+        for completion_first in [false, true] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(1, "room").unwrap();
+            let job = take_job(&bridge);
+            for _ in 0..16 {
+                bridge.emit(Status::Ready);
+            }
+            if completion_first {
+                assert!(bridge.control.complete(
+                    job.ticket,
+                    Err(SourceFailure {
+                        code: "source_errors",
+                        pauses_community: true,
+                    })
+                ));
+            } else {
+                bridge.emit(Status::Paused {
+                    code: "source_errors",
+                });
+            }
+            bridge.emit(Status::Paused {
+                code: "worker_failed",
+            });
+            bridge
+                .control
+                .record_fault(denial_report("authentication_denied"));
+            bridge.control.terminate(false, "worker_failed");
+            assert_eq!(
+                handle.fault_report().source_barrier.unwrap().code,
+                "source_errors"
+            );
+            assert_eq!(handle.try_sample(2, "room"), Err(CommandError::Closed));
+        }
+    }
 
     #[test]
     fn worker_completion_consumes_its_ticket_atomically_after_late_adoption() {

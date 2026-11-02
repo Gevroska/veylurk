@@ -21,6 +21,20 @@ fn write(output: &mut impl Write, value: &Value) {
     output.write_all(&body).unwrap();
     output.flush().unwrap();
 }
+
+#[cfg(windows)]
+fn access_violation() -> ! {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetErrorMode(mode: u32) -> u32;
+        fn RaiseException(code: u32, flags: u32, count: u32, arguments: *const usize);
+    }
+    unsafe {
+        SetErrorMode(3);
+        RaiseException(0xC000_0005, 0, 0, std::ptr::null());
+    }
+    unreachable!("unhandled native exception returned");
+}
 fn main() {
     let mode = std::env::args().nth(1).unwrap();
     if mode == "descendant" || mode == "never_reads" {
@@ -53,6 +67,45 @@ fn main() {
     if mode == "unexpected_exit" {
         std::process::exit(23);
     }
+    #[cfg(windows)]
+    if matches!(
+        mode.as_str(),
+        "denial_pulse_then_av" | "source_denied_pulse_then_av" | "denial_stopped_then_av"
+    ) {
+        let code = if mode == "source_denied_pulse_then_av" {
+            "source_denied"
+        } else {
+            "authentication_denied"
+        };
+        let diagnostics = json!({
+            "primary_failure":{
+                "code":code,"stage":"preparing","observed_at_unix_ms":11,
+                "controller_epoch":7,"job_id":null,"navigation_ready":false,"last_player_observation":null,
+                "script_pending":false,"network_pending":false,"response_pending":false,"trigger_pending":false,
+                "navigation_failure":null
+            },"cleanup_diagnostics":null,"host_termination":null,"window_dismissal":null,"worker":null
+        });
+        if mode == "denial_stopped_then_av" {
+            write(
+                &mut output,
+                &json!({"kind":"Stopped","cleanup_confirmed":true,"diagnostics":diagnostics}),
+            );
+        } else {
+            // No Paused or Completed frame is ever sent. A later empty pulse
+            // must not erase the fully received source denial before the AV.
+            write(
+                &mut output,
+                &json!({"kind":"Pulse","native_progress":1,"diagnostics":diagnostics}),
+            );
+            write(
+                &mut output,
+                &json!({"kind":"Pulse","native_progress":2,"diagnostics":{
+                    "primary_failure":null,"cleanup_diagnostics":null,"host_termination":null,"window_dismissal":null,"worker":null
+                }}),
+            );
+        }
+        access_violation();
+    }
     if mode == "stopped_then_exit" {
         write(
             &mut output,
@@ -69,16 +122,7 @@ fn main() {
     }
     #[cfg(windows)]
     if mode == "access_violation" {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn SetErrorMode(mode: u32) -> u32;
-            fn RaiseException(code: u32, flags: u32, count: u32, arguments: *const usize);
-        }
-        unsafe {
-            SetErrorMode(3);
-            RaiseException(0xC000_0005, 0, 0, std::ptr::null());
-        }
-        unreachable!("unhandled native exception returned");
+        access_violation();
     }
     #[cfg(windows)]
     if mode == "sentinel" {

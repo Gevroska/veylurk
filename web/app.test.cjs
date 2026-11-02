@@ -695,6 +695,76 @@ test("Community does not claim containment from partial diagnostics or render ar
   assert.doesNotMatch(app.get("community-status").textContent, /Browser process failure|Browser failure contained|Community recovery/);
 });
 
+test("Community shows automatic crash recovery without requesting manual restart or sending Resume", async () => {
+  const crash = { process_id: 41, failure: "unexpected_exit", exit_code: 0xc0000005, containment_confirmed: true, worker_tree_exited: true };
+  let status = communityState({ cleanup_confirmed: false, worker: crash,
+    worker_recovery: { state: "backoff", attempts: 2, next_retry_at_utc: received, cleanup_confirmed: false, last_fault: { worker: crash } } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  let text = app.get("community-status").textContent;
+  assert.match(text, /Automatic browser restart scheduled; no action is needed/);
+  assert.match(text, /Consecutive browser failures2/);
+  assert.match(text, /Browser shutdown confirmationNot confirmed/);
+  assert.doesNotMatch(text, /Restart Veylurk|choose Resume|Close Veylurk/);
+  status = communityState({ worker: { process_id: 42, failure: null },
+    worker_recovery: { state: "verifying", attempts: 2, next_retry_at_utc: null, cleanup_confirmed: false, last_fault: { worker: crash } } });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  text = app.get("community-status").textContent;
+  assert.match(text, /waiting for a verified Community sample/);
+  assert.match(text, /Previous browser exit code0xC0000005/);
+  assert.doesNotMatch(text, /Automatic recovery completed/);
+  status.worker_recovery.state = "recovered";
+  status.worker_recovery.attempts = 0;
+  await app.get("refresh-status").dispatch("click"); await settle();
+  text = app.get("community-status").textContent;
+  assert.match(text, /Automatic recovery completed; Community collection resumed/);
+  assert.match(text, /Consecutive browser failures0/);
+  assert.match(text, /Previous browser shutdownNot confirmed after the abnormal exit/);
+  assert.equal(app.calls.some((call) => call.target.pathname === "/api/community/resume"), false);
+});
+
+test("Community distinguishes automatic cleanup waits, source blocks and cancelled recovery", async () => {
+  let status = communityState({ paused: true, cleanup_confirmed: false, persisted_pause_reason: "cleanup_unconfirmed",
+    worker_recovery: { state: "awaiting_cleanup", attempts: 1, next_retry_at_utc: null, cleanup_confirmed: false } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  let text = app.get("community-status").textContent;
+  assert.match(text, /automatic recovery will continue after cleanup is confirmed/);
+  assert.match(text, /Next automatic restartNot scheduled/);
+  assert.doesNotMatch(text, /Restart Veylurk|choose Resume/);
+  status = communityState({ paused: true, persisted_pause_reason: "rate_limited",
+    worker_recovery: { state: "blocked", attempts: 1, next_retry_at_utc: null } });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  text = app.get("community-status").textContent;
+  assert.match(text, /A source rate limit paused collection/);
+  assert.match(text, /Automatic recovery is blocked; check the pause reason/);
+  status = communityState({ worker_recovery: { state: "cancelled", attempts: 1 } });
+  await app.get("refresh-status").dispatch("click"); await settle();
+  assert.match(app.get("community-status").textContent, /Automatic recovery was cancelled by a control change/);
+  assert.equal(app.calls.some((call) => call.options.method === "POST"), false);
+});
+
+test("Community explains a proved pre-process launch failure without inventing a browser shutdown", async () => {
+  const failure = { failure: "not_created", process_id: null, exit_code: null, containment_confirmed: false, worker_tree_exited: false };
+  const status = communityState({ worker: failure,
+    worker_recovery: { state: "backoff", attempts: 3, cleanup_confirmed: false, last_fault: { worker: failure } } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  const text = app.get("community-status").textContent;
+  assert.match(text, /no process was created/);
+  assert.match(text, /Automatic browser restart scheduled/);
+  assert.doesNotMatch(text, /Previous browser shutdown|Browser exit code|Restart Veylurk|choose Resume/);
+});
+
+test("Community recovery rejects arbitrary status text and malformed numeric or date fields", async () => {
+  const status = communityState({ worker_recovery: { state: "<img src=x>", attempts: "<img src=x>", next_retry_at_utc: "<img src=x>", last_fault: { worker: { exit_code: -1 } } } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  const text = app.get("community-status").textContent;
+  assert.match(text, /Recovery state is not recognized/);
+  assert.doesNotMatch(text, /<img|Previous browser exit code|Automatic recovery completed/);
+});
+
 test("Community explains saved cleanup and ambiguous legacy pauses without attributing a Twitch denial", async () => {
   let status = communityState({ paused: true, last_error: "cleanup_unconfirmed", persisted_pause_reason: "cleanup_unconfirmed" });
   const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);

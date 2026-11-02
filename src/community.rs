@@ -24,6 +24,13 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(85);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(14);
 
+fn worker_retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs(
+        5u64.saturating_mul(1u64 << attempts.saturating_sub(1).min(4))
+            .min(60),
+    )
+}
+
 #[derive(Clone, Serialize)]
 pub struct Status {
     pub settings: CommunitySettings,
@@ -47,7 +54,17 @@ pub struct Status {
     pub host_termination: Option<HostTermination>,
     pub window_dismissal: Option<WindowDismissal>,
     pub worker: Option<WorkerDiagnostics>,
+    pub worker_recovery: Option<WorkerRecoveryStatus>,
     pub channels: Vec<ChannelCadenceStatus>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct WorkerRecoveryStatus {
+    pub state: &'static str,
+    pub attempts: u32,
+    pub next_retry_at_utc: Option<String>,
+    pub cleanup_confirmed: bool,
+    pub last_fault: FaultReport,
 }
 
 #[derive(Clone, Serialize)]
@@ -128,6 +145,15 @@ pub struct Coordinator {
     next_start: Instant,
     job_id: u64,
     retiring: bool,
+    // All recovery work runs in this coordinator, never in a detached timer.
+    // Dropping a host also drops its private event receiver/generation.
+    recovery_retry_at: Option<Instant>,
+    worker_failures: u32,
+    worker_fault_pending: bool,
+    replacement_safe: bool,
+    host_generation: u64,
+    quarantine_observed: bool,
+    quarantine_ticket: Option<u64>,
     shutdown: Option<watch::Receiver<bool>>,
     #[cfg(test)]
     host_start_attempts: usize,
@@ -289,6 +315,7 @@ impl Community {
             host_termination: None,
             window_dismissal: None,
             worker: None,
+            worker_recovery: None,
             channels: Vec::new(),
         }));
         let (commands, receiver) = mpsc::channel(8);
@@ -312,6 +339,13 @@ impl Community {
             next_start: Instant::now(),
             job_id: 0,
             retiring: false,
+            recovery_retry_at: None,
+            worker_failures: 0,
+            worker_fault_pending: false,
+            replacement_safe: false,
+            host_generation: 0,
+            quarantine_observed: false,
+            quarantine_ticket: None,
             shutdown: None,
             #[cfg(test)]
             host_start_attempts: 0,
@@ -425,8 +459,13 @@ impl Coordinator {
                             continue;
                         }
                         if !matches!(command, Command::Settings(CommunitySettingsUpdate { enabled: false, .. }))
-                            && self.service.status.read().await.cleanup_confirmed == Some(false)
+                            && self.cleanup_blocks_host().await
                         {
+                            if matches!(command, Command::Login) {
+                                self.cancel_recovery().await;
+                                self.worker_fault_pending = false;
+                                self.paused = true;
+                            }
                             let _ = reply.send(Err("cleanup_unconfirmed"));
                             continue;
                         }
@@ -473,6 +512,7 @@ impl Coordinator {
     }
 
     async fn pause(&mut self, code: &'static str) {
+        self.cancel_recovery().await;
         self.paused = true;
         let mut status = self.service.status.write().await;
         status.last_error = Some(code);
@@ -481,6 +521,8 @@ impl Coordinator {
     }
 
     async fn pause_source(&mut self, code: &'static str) -> Result<(), StoreError> {
+        self.quarantine_ticket = None;
+        self.worker_fault_pending = false;
         let requested = match code {
             "authentication_denied" | "signed_in_ui_lost" => {
                 CommunityPauseReason::AuthenticationDenied
@@ -514,9 +556,15 @@ impl Coordinator {
         // Close admission even if the durable barrier cannot be committed.
         // The caller propagates that storage failure and the coordinator stops.
         if requested == CommunityPauseReason::CleanupUnconfirmed {
+            self.replacement_safe = false;
             self.service.status.write().await.cleanup_confirmed = Some(false);
         }
         self.pause(pause_code).await;
+        if let Some(recovery) = &mut self.service.status.write().await.worker_recovery {
+            if recovery.state == "cancelled" {
+                recovery.state = "blocked";
+            }
+        }
         if self.persisted_pause != Some(reason) {
             self.service.store.set_community_pause(Some(reason)).await?;
             self.persisted_pause = Some(reason);
@@ -529,7 +577,7 @@ impl Coordinator {
         if self.host.is_some() {
             return true;
         }
-        if self.service.status.read().await.cleanup_confirmed == Some(false) {
+        if self.cleanup_blocks_host().await {
             return false;
         }
         if self.stopping() {
@@ -544,16 +592,37 @@ impl Coordinator {
         }) {
             Ok(host) => {
                 self.host = Some(host);
+                self.host_generation = self.host_generation.wrapping_add(1);
+                self.quarantine_observed = false;
                 self.ready = false;
+                self.replacement_safe = false;
                 let mut status = self.service.status.write().await;
                 status.cleanup_confirmed = None;
                 status.host_termination = None;
                 status.window_dismissal = None;
                 status.worker = None;
+                if let Some(recovery) = &mut status.worker_recovery {
+                    if recovery.state == "backoff" {
+                        recovery.state = "restarting";
+                        recovery.next_retry_at_utc = None;
+                    }
+                }
                 true
             }
             Err(_) => {
-                self.pause("host_unavailable").await;
+                if self.recovery_retry_at.is_some() {
+                    // spawn returned no host, so it transferred no live owner.
+                    self.worker_failures = self.worker_failures.saturating_add(1);
+                    self.recovery_retry_at =
+                        Some(Instant::now() + worker_retry_delay(self.worker_failures));
+                    let mut status = self.service.status.write().await;
+                    status.last_error = Some("host_unavailable");
+                    if let Some(recovery) = &mut status.worker_recovery {
+                        recovery.attempts = self.worker_failures;
+                    }
+                } else {
+                    self.pause("host_unavailable").await;
+                }
                 false
             }
         }
@@ -613,7 +682,7 @@ impl Coordinator {
                     return Ok(ControlReply::Accepted);
                 }
                 self.retire(CommunityRunEndReason::Paused).await?;
-                if self.service.status.read().await.cleanup_confirmed == Some(false) {
+                if self.cleanup_blocks_host().await {
                     self.pause_source("cleanup_unconfirmed").await?;
                     return Ok(ControlReply::Accepted);
                 }
@@ -630,6 +699,10 @@ impl Coordinator {
     }
 
     async fn step(&mut self) -> Result<(), StoreError> {
+        if self.stopping() {
+            self.cancel_recovery().await;
+            return Ok(());
+        }
         if self
             .pending
             .as_ref()
@@ -645,7 +718,14 @@ impl Coordinator {
         {
             return Ok(());
         }
-        if !self.ensure_host().await || !self.ready || Instant::now() < self.next_start {
+        if self.recovery_retry_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(());
+        }
+        if !self.ensure_host().await {
+            return Ok(());
+        }
+        self.recovery_retry_at = None;
+        if !self.ready || Instant::now() < self.next_start {
             return Ok(());
         }
         let Some(channel) = next_channel(&self.schedule, Instant::now()) else {
@@ -665,11 +745,31 @@ impl Coordinator {
             schedule.cadence_due =
                 now + Duration::from_secs(cadence(self.settings, schedule.counts).seconds.into());
         }
-        if self
+        let dispatch = self
             .host
             .as_ref()
-            .is_none_or(|host| host.try_sample(self.job_id, &channel).is_err())
-        {
+            .map(|host| host.try_sample(self.job_id, &channel));
+        if !matches!(dispatch, Some(Ok(()))) {
+            self.failed_dispatch(dispatch.and_then(Result::err)).await?;
+        }
+        Ok(())
+    }
+
+    async fn failed_dispatch(
+        &mut self,
+        error: Option<community_source::host::CommandError>,
+    ) -> Result<(), StoreError> {
+        if error == Some(community_source::host::CommandError::Closed) {
+            // A crash or received denial may close admission while the durable
+            // pending write is awaited. Preserve recovery intent until this
+            // exact host's terminal proof is consumed.
+            if let Some(report) = self.host.as_ref().map(HostHandle::fault_report) {
+                self.record_fault(report).await?;
+            }
+            self.finish_failure(CommunityFailureCode::HostUnavailable, false)
+                .await?;
+            self.pause_event("worker_failed").await?;
+        } else {
             self.finish_failure(CommunityFailureCode::HostUnavailable, false)
                 .await?;
             self.pause("host_unavailable").await;
@@ -726,7 +826,7 @@ impl Coordinator {
         // Native status is bounded, and one outstanding job has one reserved completion slot.
         for _ in 0..8 {
             if let Some(report) = self.host.as_ref().map(HostHandle::fault_report) {
-                self.record_fault(report).await;
+                self.record_fault(report).await?;
             }
             let Some(event) = self.host.as_ref().and_then(|host| host.try_event().ok()) else {
                 break;
@@ -736,7 +836,68 @@ impl Coordinator {
         Ok(())
     }
 
-    async fn record_fault(&mut self, report: FaultReport) {
+    async fn record_fault(&mut self, report: FaultReport) -> Result<(), StoreError> {
+        // A received source denial outranks infrastructure recovery, even when
+        // the coalescing Paused queue or native completion did not survive.
+        let barrier = report
+            .source_barrier
+            .as_ref()
+            .map(|barrier| barrier.code)
+            .or_else(|| {
+                report
+                    .primary_failure
+                    .as_ref()
+                    .filter(|failure| community_source::host::is_source_denial(failure.code))
+                    .map(|failure| failure.code)
+            });
+        if let Some(code) = barrier {
+            self.pause_source(code).await?;
+        }
+        let unknown_worker = report.worker.as_ref().is_some_and(|worker| {
+            worker.failure.is_some()
+                && !worker_contained(worker)
+                && worker.process_id.is_some()
+                && worker.started_at_unix_ms.is_some()
+        });
+        if unknown_worker && !self.quarantine_observed {
+            self.quarantine_observed = true;
+            let allowed = (!self.paused || self.worker_fault_pending)
+                && self.persisted_pause.is_none()
+                && self.settings.enabled
+                && !self.retiring
+                && !self.stopping();
+            if allowed {
+                // This runtime ticket owns only the cleanup marker it installs.
+                // A protected denial or owner control destroys the ticket; an
+                // old/ambiguous startup marker can never acquire one.
+                self.quarantine_ticket = Some(self.host_generation);
+                self.worker_fault_pending = true;
+                self.paused = true;
+                self.replacement_safe = false;
+                {
+                    let mut status = self.service.status.write().await;
+                    status.cleanup_confirmed = Some(false);
+                    status.paused = true;
+                    status.last_error = Some("cleanup_unconfirmed");
+                    status.worker_recovery = Some(WorkerRecoveryStatus {
+                        state: "awaiting_cleanup",
+                        attempts: self.worker_failures.saturating_add(1),
+                        next_retry_at_utc: None,
+                        cleanup_confirmed: false,
+                        last_fault: report.clone(),
+                    });
+                }
+                self.service
+                    .store
+                    .set_community_pause(Some(CommunityPauseReason::CleanupUnconfirmed))
+                    .await?;
+                self.persisted_pause = Some(CommunityPauseReason::CleanupUnconfirmed);
+                self.service.status.write().await.persisted_pause_reason = self.persisted_pause;
+                if self.pending.is_none() {
+                    self.end_run(CommunityRunEndReason::HostFailure).await?;
+                }
+            }
+        }
         let mut status = self.service.status.write().await;
         if report.primary_failure.is_some()
             && !(status.primary_failure.is_some()
@@ -766,11 +927,19 @@ impl Coordinator {
         if report.worker.is_some() {
             status.worker = report.worker;
         }
+        Ok(())
     }
 
     async fn event(&mut self, event: HostEvent) -> Result<(), StoreError> {
         match event {
-            HostEvent::Ready => self.ready = true,
+            HostEvent::Ready => {
+                self.ready = true;
+                if let Some(recovery) = &mut self.service.status.write().await.worker_recovery {
+                    if recovery.state == "restarting" {
+                        recovery.state = "verifying";
+                    }
+                }
+            }
             HostEvent::LoginShown => {
                 self.paused = true;
                 let mut status = self.service.status.write().await;
@@ -780,7 +949,7 @@ impl Coordinator {
                 status.state = "sign_in";
             }
             HostEvent::LoginFailed => self.pause("sign_in_navigation_failed").await,
-            HostEvent::Paused { code } => self.pause_source(code).await?,
+            HostEvent::Paused { code } => self.pause_event(code).await?,
             HostEvent::SampleCompleted {
                 job_id,
                 channel,
@@ -804,7 +973,7 @@ impl Coordinator {
                 // A crash at either later write must still require explicit Resume.
                 if let Err(failure) = &outcome {
                     if failure.pauses_community {
-                        self.pause_source(failure.code).await?;
+                        self.pause_event(failure.code).await?;
                     }
                 }
                 if self
@@ -814,6 +983,9 @@ impl Coordinator {
                 {
                     self.finish_failure(CommunityFailureCode::HostFailure, true)
                         .await?;
+                    if self.worker_fault_pending && !self.retiring {
+                        self.end_run(CommunityRunEndReason::HostFailure).await?;
+                    }
                     return Ok(());
                 }
                 match outcome {
@@ -829,6 +1001,9 @@ impl Coordinator {
                         }
                     }
                 }
+                if self.worker_fault_pending && !self.retiring {
+                    self.end_run(CommunityRunEndReason::HostFailure).await?;
+                }
             }
             HostEvent::Stopped {
                 cleanup_confirmed,
@@ -839,12 +1014,33 @@ impl Coordinator {
                         .store
                         .record_community_host_termination(termination.clone());
                 }
-                self.record_fault(diagnostics).await;
+                self.record_fault(diagnostics.clone()).await?;
                 self.host = None;
                 self.ready = false;
                 self.service.status.write().await.cleanup_confirmed = Some(cleanup_confirmed);
+                let contained_fault = diagnostics.worker.as_ref().is_some_and(worker_contained);
+                let replaceable = contained_fault
+                    || diagnostics.worker.as_ref().is_some_and(|worker| {
+                        worker.failure == Some(community_source::host::WorkerFailure::NotCreated)
+                            && worker.process_id.is_none()
+                            && worker.started_at_unix_ms.is_none()
+                            && worker.exit_code.is_none()
+                            && !worker.worker_tree_exited
+                            && !worker.containment_confirmed
+                    });
+                self.replacement_safe = cleanup_confirmed || replaceable;
+                let own_cleanup = self.quarantine_ticket == Some(self.host_generation)
+                    && self.persisted_pause == Some(CommunityPauseReason::CleanupUnconfirmed);
+                let recovery_generation = self.host_generation;
+                let mut recover = replaceable
+                    && (!self.paused || self.worker_fault_pending)
+                    && (self.persisted_pause.is_none() || own_cleanup)
+                    && self.settings.enabled
+                    && !self.retiring
+                    && !self.stopping();
+                self.worker_fault_pending = false;
                 // Persist the cleanup barrier before attempt/run closure can fail.
-                if !cleanup_confirmed {
+                if !cleanup_confirmed && !replaceable {
                     self.pause_source("cleanup_unconfirmed").await?;
                 }
                 self.finish_failure(CommunityFailureCode::HostFailure, false)
@@ -854,7 +1050,42 @@ impl Coordinator {
                 if !self.retiring {
                     self.end_run(CommunityRunEndReason::HostFailure).await?;
                 }
-                if !self.retiring && cleanup_confirmed {
+                // Storage can yield while a shutdown signal arrives. Recheck
+                // the same generation at the final recovery commit boundary.
+                recover &= !self.stopping() && recovery_generation == self.host_generation;
+                if recover && own_cleanup {
+                    recover &= self.quarantine_ticket == Some(recovery_generation);
+                    if recover {
+                        self.service.store.set_community_pause(None).await?;
+                        if self.stopping() {
+                            self.service
+                                .store
+                                .set_community_pause(Some(CommunityPauseReason::CleanupUnconfirmed))
+                                .await?;
+                            recover = false;
+                        } else {
+                            self.persisted_pause = None;
+                            self.service.status.write().await.persisted_pause_reason = None;
+                        }
+                    }
+                }
+                self.quarantine_ticket = None;
+                if recover {
+                    self.worker_failures = self.worker_failures.saturating_add(1);
+                    self.recovery_retry_at =
+                        Some(Instant::now() + worker_retry_delay(self.worker_failures));
+                    self.paused = false;
+                    let mut status = self.service.status.write().await;
+                    status.paused = false;
+                    status.last_error = Some("worker_failed");
+                    status.worker_recovery = Some(WorkerRecoveryStatus {
+                        state: "backoff",
+                        attempts: self.worker_failures,
+                        next_retry_at_utc: None,
+                        cleanup_confirmed,
+                        last_fault: diagnostics,
+                    });
+                } else if !self.retiring && (cleanup_confirmed || replaceable) {
                     self.pause(
                         self.persisted_pause
                             .map_or("browser_closed", |reason| reason.code()),
@@ -904,8 +1135,18 @@ impl Coordinator {
             Err(error) => return Err(error),
         }
         let pending = self.pending.take().ok_or(StoreError::Invalid)?;
+        // A Ready pulse is insufficient. Reset only after the verified sample
+        // and its complete membership/provenance transaction committed.
+        self.worker_failures = 0;
+        self.recovery_retry_at = None;
         self.next_start = self.next_start.max(Instant::now() + START_GAP);
         let mut status = self.service.status.write().await;
+        if let Some(recovery) = &mut status.worker_recovery {
+            if matches!(recovery.state, "restarting" | "verifying" | "backoff") {
+                recovery.state = "recovered";
+                recovery.next_retry_at_utc = None;
+            }
+        }
         status.last_received_at_utc = received_at_utc.clone();
         status.last_received_channel = Some(pending.channel.clone());
         status.last_returned_accounts = Some(count);
@@ -964,6 +1205,9 @@ impl Coordinator {
     }
 
     async fn retire(&mut self, reason: CommunityRunEndReason) -> Result<(), StoreError> {
+        self.cancel_recovery().await;
+        self.quarantine_ticket = None;
+        self.worker_fault_pending = false;
         self.retiring = true;
         if let Some(pending) = &mut self.pending {
             pending.cancelled = true;
@@ -1013,6 +1257,51 @@ impl Coordinator {
             .is_some_and(|shutdown| *shutdown.borrow())
     }
 
+    async fn cleanup_blocks_host(&self) -> bool {
+        self.service.status.read().await.cleanup_confirmed == Some(false) && !self.replacement_safe
+    }
+
+    async fn cancel_recovery(&mut self) {
+        self.recovery_retry_at = None;
+        self.quarantine_ticket = None;
+        if let Some(recovery) = &mut self.service.status.write().await.worker_recovery {
+            if matches!(
+                recovery.state,
+                "backoff" | "restarting" | "verifying" | "awaiting_cleanup"
+            ) {
+                recovery.state = "cancelled";
+                recovery.next_retry_at_utc = None;
+            }
+        }
+    }
+
+    async fn pause_event(&mut self, code: &'static str) -> Result<(), StoreError> {
+        if community_source::host::is_worker_failure(code) {
+            // Await this generation's terminal physical proof. A worker failure
+            // by itself never grants replacement or creates a source denial.
+            let allowed = (!self.paused || self.worker_fault_pending)
+                && (self.persisted_pause.is_none()
+                    || self.quarantine_ticket == Some(self.host_generation))
+                && !self.retiring
+                && !self.stopping();
+            self.recovery_retry_at = None;
+            self.paused = true;
+            {
+                let mut status = self.service.status.write().await;
+                status.last_error = Some(self.persisted_pause.map_or(code, |reason| reason.code()));
+                status.paused = true;
+                status.state = "paused";
+            }
+            self.worker_fault_pending = allowed;
+            if self.pending.is_none() && !self.retiring {
+                self.end_run(CommunityRunEndReason::HostFailure).await?;
+            }
+            Ok(())
+        } else {
+            self.pause_source(code).await
+        }
+    }
+
     async fn refresh_status(&mut self) {
         let now = Instant::now();
         let next = self
@@ -1025,7 +1314,8 @@ impl Coordinator {
             self.next_start.max(now + START_GAP)
         } else {
             self.next_start
-        };
+        }
+        .max(self.recovery_retry_at.unwrap_or(self.next_start));
         let allowed = self.settings.enabled && !self.paused;
         let wall_now = Utc::now();
         let estimate = |due: Instant| {
@@ -1034,6 +1324,14 @@ impl Coordinator {
                 .to_rfc3339_opts(SecondsFormat::Millis, true)
         };
         let mut status = self.service.status.write().await;
+        if let Some(recovery) = &mut status.worker_recovery {
+            recovery.next_retry_at_utc = self.recovery_retry_at.map(|due| {
+                (wall_now
+                    + chrono::Duration::from_std(due.saturating_duration_since(now))
+                        .unwrap_or_default())
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+            });
+        }
         status.settings = self.settings;
         status.paused = self.paused;
         status.active_channel = self.pending.as_ref().map(|pending| pending.channel.clone());
@@ -1073,7 +1371,17 @@ impl Coordinator {
             status.state = if !self.settings.enabled {
                 "disabled"
             } else if self.paused {
-                "paused"
+                if status
+                    .worker_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.state == "awaiting_cleanup")
+                {
+                    "recovering"
+                } else {
+                    "paused"
+                }
+            } else if self.recovery_retry_at.is_some() {
+                "recovering"
             } else if self.pending.is_some() {
                 "sampling"
             } else if self.schedule.is_empty() {
@@ -1093,6 +1401,15 @@ fn next_channel(schedule: &BTreeMap<String, Schedule>, now: Instant) -> Option<S
         .filter(|(_, schedule)| schedule.eligible() <= now)
         .min_by_key(|(channel, schedule)| (schedule.eligible(), *channel))
         .map(|(channel, _)| channel.clone())
+}
+
+fn worker_contained(worker: &WorkerDiagnostics) -> bool {
+    worker.worker_tree_exited
+        && worker.containment_confirmed
+        && worker.exit_code.is_some()
+        && worker.process_id.is_some()
+        && worker.started_at_unix_ms.is_some()
+        && worker.failure.is_some()
 }
 
 fn completion(

@@ -458,3 +458,14 @@ The normal signed-in test on 8796 retained its settings, all 28 channel flags,
 history and encrypted credentials. Both original channels produced fresh durable
 samples; all eight pre-upgrade history prefixes and integrity checks passed.
 Production on 8795 was unchanged. See the [plan and verified results](native-worker-crash.md).
+
+## Autonomous Community recovery
+
+The owner explicitly superseded manual restart/Resume after worker crashes on
+November 2. Automatic replacement is being implemented behind exact containment
+and protected source-barrier checks, with capped retry delays and eventual cleanup
+rechecks. Known source denials and legacy ambiguous cleanup pauses remain protected.
+Disable, owner Login and shutdown must invalidate delayed recovery. Independent
+review, exact Windows checks and authenticated automatic-recovery fault injection
+are pending. See the [written plan](community-autorecovery.md). Production remains
+excluded.
