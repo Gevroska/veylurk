@@ -1257,7 +1257,7 @@ impl Coordinator {
             .is_some_and(|shutdown| *shutdown.borrow())
     }
 
-    async fn cleanup_blocks_host(&self) -> bool {
+    async fn cleanup_blocks_host(&mut self) -> bool {
         self.service.status.read().await.cleanup_confirmed == Some(false) && !self.replacement_safe
     }
 

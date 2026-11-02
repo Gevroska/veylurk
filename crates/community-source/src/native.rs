@@ -4569,63 +4569,96 @@ mod lifecycle_tests {
 
     #[test]
     fn service_window_close_preserves_active_work_admission_epoch_and_denial() {
-        let (handle, app) = fixture();
-        handle.try_sample(42, "room").unwrap();
-        let service = app.service.as_ref().unwrap();
-        let job = service.bridge.control.pending_job().unwrap();
-        *service.active.borrow_mut() = Some(job.clone());
-        {
-            let mut state = app.state.borrow_mut();
-            state.denied = true;
-            state.script_pending = true;
-            state.auto_stage = Some(AutoStage::Sampling);
-        }
-        let cancel_version = service
-            .bridge
-            .control
-            .cancel_version
-            .load(Ordering::Acquire);
-        app.window_close();
-        app.window_close();
-        assert_eq!(app.epoch(), 3);
-        assert_eq!(app.state.borrow().generation, 7);
-        assert!(app.state.borrow().denied && app.state.borrow().script_pending);
-        assert!(matches!(
-            app.state.borrow().auto_stage,
-            Some(AutoStage::Sampling)
-        ));
-        assert!(app.state.borrow().closing_at.is_none());
-        assert!(app.state.borrow().recycling_at.is_none());
-        assert_eq!(service.active.borrow().as_ref().unwrap().ticket, job.ticket);
-        assert!(service.bridge.control.is_pending(job.ticket));
-        assert_eq!(
-            service
+        for protected_denial in [false, true] {
+            let (handle, app) = fixture();
+            handle.try_sample(42, "room").unwrap();
+            let service = app.service.as_ref().unwrap();
+            let job = service.bridge.control.pending_job().unwrap();
+            *service.active.borrow_mut() = Some(job.clone());
+            {
+                let mut state = app.state.borrow_mut();
+                state.denied = protected_denial;
+                state.script_pending = true;
+                state.auto_stage = Some(AutoStage::Sampling);
+            }
+            let cancel_version = service
                 .bridge
                 .control
                 .cancel_version
-                .load(Ordering::Acquire),
-            cancel_version
-        );
-        assert!(!service.bridge.control.shutdown.load(Ordering::Acquire));
-        assert!(handle.try_event().is_err());
-        assert_eq!(
-            handle.try_sample(43, "room"),
-            Err(crate::host::CommandError::Busy)
-        );
-        assert!(handle.fault_report().host_termination.is_none());
-        assert_eq!(handle.fault_report().window_dismissal.unwrap().count, 2);
-        service.bridge.control.complete(
-            job.ticket,
-            Err(SourceFailure {
-                code: "community_paused",
-                pauses_community: true,
-            }),
-        );
-        assert!(matches!(
-            handle.try_event(),
-            Ok(crate::host::HostEvent::SampleCompleted { .. })
-        ));
-        assert_eq!(handle.try_sample(43, "room"), Ok(()));
+                .load(Ordering::Acquire);
+            if protected_denial {
+                service.bridge.control.record_fault(FaultReport {
+                    source_barrier: Some(crate::host::SourceBarrier {
+                        code: "authentication_denied",
+                    }),
+                    ..Default::default()
+                });
+            }
+            let expected_admission = if protected_denial {
+                Err(crate::host::CommandError::Closed)
+            } else {
+                Err(crate::host::CommandError::Busy)
+            };
+            assert_eq!(handle.try_sample(43, "room"), expected_admission);
+            app.window_close();
+            app.window_close();
+            assert_eq!(app.epoch(), 3);
+            assert_eq!(app.state.borrow().generation, 7);
+            assert_eq!(app.state.borrow().denied, protected_denial);
+            assert!(app.state.borrow().script_pending);
+            assert!(matches!(
+                app.state.borrow().auto_stage,
+                Some(AutoStage::Sampling)
+            ));
+            assert!(app.state.borrow().closing_at.is_none());
+            assert!(app.state.borrow().recycling_at.is_none());
+            assert_eq!(service.active.borrow().as_ref().unwrap().ticket, job.ticket);
+            assert!(service.bridge.control.is_pending(job.ticket));
+            assert_eq!(
+                service
+                    .bridge
+                    .control
+                    .cancel_version
+                    .load(Ordering::Acquire),
+                cancel_version
+            );
+            assert!(!service.bridge.control.shutdown.load(Ordering::Acquire));
+            assert!(handle.try_event().is_err());
+            assert_eq!(handle.try_sample(43, "room"), expected_admission);
+            assert!(handle.fault_report().host_termination.is_none());
+            assert_eq!(handle.fault_report().window_dismissal.unwrap().count, 2);
+            service.bridge.control.complete(
+                job.ticket,
+                Err(SourceFailure {
+                    code: if protected_denial {
+                        "authentication_denied"
+                    } else {
+                        "operator_cancelled"
+                    },
+                    pauses_community: protected_denial,
+                }),
+            );
+            assert!(matches!(
+                handle.try_event(),
+                Ok(crate::host::HostEvent::SampleCompleted { .. })
+            ));
+            assert_eq!(
+                handle.try_sample(43, "room"),
+                if protected_denial {
+                    Err(crate::host::CommandError::Closed)
+                } else {
+                    Ok(())
+                }
+            );
+            assert_eq!(
+                handle
+                    .fault_report()
+                    .source_barrier
+                    .as_ref()
+                    .map(|barrier| barrier.code),
+                protected_denial.then_some("authentication_denied")
+            );
+        }
     }
 
     #[test]
