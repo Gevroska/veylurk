@@ -11,6 +11,10 @@ excluded; rollout and fault injection use the test installation on port 8796.
 
 - Keep the main application, IRC sessions and database running after a worker
   failure. Complete an interrupted sample once and retain completed samples.
+- Treat current WebView2 subprocess failures as infrastructure faults. Retire the
+  complete native host before replacement, including a matching known failed
+  browser exit observed during controller retirement. Missing, mismatched, normal
+  or unknown exit evidence does not establish that classification.
 - Start a replacement only after the exact owned Job is empty and its retained
   worker-process handle has reported exit. Physical containment remains distinct
   from normal browser cleanup; a crash never becomes a fabricated normal exit.
@@ -49,7 +53,7 @@ validation on every replacement, not recovery of untransmitted information.
    Run exact Windows native/application CI and relevant interface tests.
 4. Normally stop the old test, preserve and verify its latest history, credentials
    and signed-in profile, then install at the existing approved executable path.
-5. Inject a worker failure during authenticated test collection. Verify automatic
+5. Inject worker and owned browser failures during authenticated test collection. Verify automatic
    replacement and fresh durable Community receipts with the same main instance,
    without a Resume/Login request or application restart. Verify exactly-once
    failure, retained successful evidence and IRC continuity across the gap.

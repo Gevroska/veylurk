@@ -199,6 +199,181 @@ fn worker_fault(contained: bool) -> FaultReport {
     }
 }
 
+fn browser_fault(contained: bool) -> FaultReport {
+    let mut report = worker_fault(contained);
+    report.worker.as_mut().unwrap().failure =
+        Some(community_source::host::WorkerFailure::BrowserProcess);
+    report.primary_failure = Some(primary_fixture("browser_process_failed", 1));
+    report
+}
+
+#[tokio::test]
+async fn positive_receipt_then_a_known_failed_browser_exit_keeps_coverage_and_source_barriers_honest(
+) {
+    for source_denied in [false, true] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        runner
+            .event(HostEvent::SampleCompleted {
+                job_id: 1,
+                channel: "example".into(),
+                outcome: Ok(source_sample()),
+            })
+            .await
+            .unwrap();
+        if source_denied {
+            runner.pause_source("source_denied").await.unwrap();
+        }
+        let fault = |contained| {
+            let mut report = browser_fault(contained);
+            report.primary_failure = None;
+            report.cleanup_diagnostics = Some(CleanupDiagnostics {
+                expected_browser_pid: Some(100),
+                observed_exit_pid: Some(100),
+                observed_exit_kind: Some(1),
+                ..Default::default()
+            });
+            report
+        };
+        runner.record_fault(fault(false)).await.unwrap();
+        assert!(runner.run_id.is_none());
+        assert!(runner.recovery_retry_at.is_none());
+        runner.step().await.unwrap();
+        assert_eq!(runner.host_start_attempts, 0);
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: fault(true),
+            })
+            .await
+            .unwrap();
+        assert_eq!(runner.recovery_retry_at.is_some(), !source_denied);
+        assert_eq!(runner.paused, source_denied);
+        let stats = store.community_stats().await.unwrap();
+        assert_eq!(
+            (
+                stats.successful_count,
+                stats.failed_count,
+                stats.pending_count
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            source_denied.then_some(CommunityPauseReason::SourceDenied)
+        );
+        let status = runner.service.status.read().await;
+        assert!(status.primary_failure.is_none());
+        assert_eq!(status.cleanup_confirmed, Some(false));
+        assert!(!status.cleanup_diagnostics.as_ref().unwrap().confirmed);
+    }
+}
+
+#[tokio::test]
+async fn new_browser_subprocess_failure_waits_for_physical_proof_and_never_clears_an_existing_source_barrier(
+) {
+    for source in [None, Some("source_denied"), Some("authentication_denied")] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        if let Some(code) = source {
+            runner.pause_source(code).await.unwrap();
+        }
+        runner.record_fault(browser_fault(false)).await.unwrap();
+        runner
+            .event(HostEvent::SampleCompleted {
+                job_id: 1,
+                channel: "example".into(),
+                outcome: Err(community_source::host::SourceFailure {
+                    code: "browser_process_failed",
+                    pauses_community: false,
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(runner.recovery_retry_at.is_none());
+        assert_eq!(runner.quarantine_ticket.is_some(), source.is_none());
+        assert!(runner.run_id.is_none());
+        let next_start = runner.next_start;
+        let channel_retry = runner.schedule["example"].retry_not_before;
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: browser_fault(true),
+            })
+            .await
+            .unwrap();
+        assert_eq!(runner.recovery_retry_at.is_some(), source.is_none());
+        assert_eq!(runner.paused, source.is_some());
+        assert_eq!(runner.next_start, next_start);
+        assert_eq!(runner.schedule["example"].retry_not_before, channel_retry);
+        assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+        assert_eq!(
+            store.community_pause().await.unwrap().is_some(),
+            source.is_some()
+        );
+        if source.is_none() {
+            runner.job_id = 1;
+            runner.prepare_sample("example".into()).await.unwrap();
+            let mut sample = source_sample();
+            sample.received_at_unix_ms = Utc::now().timestamp_millis();
+            runner
+                .event(HostEvent::SampleCompleted {
+                    job_id: 2,
+                    channel: "example".into(),
+                    outcome: Ok(sample),
+                })
+                .await
+                .unwrap();
+            assert_eq!(runner.worker_failures, 0);
+            assert_eq!(store.community_stats().await.unwrap().successful_count, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn owner_controls_cancel_browser_failure_recovery_before_late_containment() {
+    for command in ["disable", "login", "shutdown"] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        runner.record_fault(browser_fault(false)).await.unwrap();
+        match command {
+            "disable" => {
+                runner
+                    .control(Command::Settings(CommunitySettingsUpdate {
+                        enabled: false,
+                        target_interval_seconds: 300,
+                        cadence_mode: None,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            "login" => {
+                runner.control(Command::Login).await.unwrap();
+            }
+            _ => {
+                let (_, shutdown) = watch::channel(true);
+                runner.shutdown = Some(shutdown);
+                runner.step().await.unwrap();
+            }
+        }
+        let starts = runner.host_start_attempts;
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: browser_fault(true),
+            })
+            .await
+            .unwrap();
+        runner.step().await.unwrap();
+        assert!(runner.quarantine_ticket.is_none() && runner.recovery_retry_at.is_none());
+        assert_eq!(runner.host_start_attempts, starts);
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            Some(CommunityPauseReason::CleanupUnconfirmed)
+        );
+    }
+}
+
 async fn contained_terminal(runner: &mut Coordinator) {
     runner
         .event(HostEvent::Stopped {

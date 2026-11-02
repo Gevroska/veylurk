@@ -911,7 +911,18 @@ impl App {
                 let confirmed = self.complete_cleanup(started);
                 if !confirmed {
                     service.bridge.emit(Status::Paused {
-                        code: "controller_cleanup_unconfirmed",
+                        code: if self
+                            .state
+                            .borrow()
+                            .fault
+                            .cleanup_diagnostics
+                            .as_ref()
+                            .is_some_and(crate::host::CleanupDiagnostics::browser_process_failed)
+                        {
+                            "browser_process_failed"
+                        } else {
+                            "controller_cleanup_unconfirmed"
+                        },
                     });
                     self.finish_service(false);
                     return;
@@ -1160,6 +1171,21 @@ impl App {
             false
         } else {
             true
+        }
+    }
+
+    fn browser_process_failed(&self) {
+        if self.service.is_some() {
+            self.service_failure("browser_process_failed", false);
+            // A native subprocess failure retires this entire service host.
+            // The parent owns process-tree proof and the next recovery attempt.
+            self.close();
+            self.status("An embedded browser process failed. Retiring this browser.");
+        } else {
+            self.fail(
+                "browser_process_failed",
+                "An embedded browser process failed. No automatic retry.",
+            );
         }
     }
 
@@ -3135,10 +3161,7 @@ unsafe fn attach(
                 .borrow_mut()
                 .browser_diagnostics
                 .process_failure_kind = Some(kind.0);
-            app.fail(
-                "browser_process_failed",
-                "An embedded browser process failed. No automatic retry.",
-            );
+            app.browser_process_failed();
         }
         Ok(())
     }));
@@ -4255,6 +4278,53 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn known_failed_browser_exit_during_recycle_keeps_the_success_and_signals_infrastructure_failure(
+    ) {
+        assert_eq!(COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND_FAILED.0, 1);
+        assert_eq!(COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND_NORMAL.0, 0);
+        let (handle, app) = fixture();
+        activate_sample(&handle, &app, 49);
+        deliver_sample(&app);
+        {
+            let mut state = app.state.borrow_mut();
+            state.browser.observe_exit(
+                3,
+                100,
+                COREWEBVIEW2_BROWSER_PROCESS_EXIT_KIND_FAILED.0,
+                false,
+            );
+            state.recycling_at = Some(Instant::now() - FLUSH_TIME);
+        }
+        app.service_tick();
+        expect_success(&handle, 49);
+        assert!(matches!(
+            handle.try_event(),
+            Ok(crate::host::HostEvent::Paused {
+                code: "browser_process_failed"
+            })
+        ));
+        let Ok(crate::host::HostEvent::Stopped {
+            cleanup_confirmed,
+            diagnostics,
+        }) = handle.try_event()
+        else {
+            panic!("expected failed-exit terminal");
+        };
+        assert!(!cleanup_confirmed);
+        assert!(diagnostics.primary_failure.is_none());
+        assert!(diagnostics.source_barrier.is_none());
+        assert!(diagnostics
+            .cleanup_diagnostics
+            .unwrap()
+            .browser_process_failed());
+        assert!(handle.try_event().is_err());
+        assert_eq!(
+            handle.try_sample(50, "room"),
+            Err(crate::host::CommandError::Closed)
+        );
+    }
+
+    #[test]
     fn cancel_and_owner_login_during_success_recycle_retain_pending_job_and_pause() {
         for show_login in [false, true] {
             let (handle, app) = fixture();
@@ -4776,6 +4846,84 @@ mod lifecycle_tests {
             "navigation_ui_deadline"
         );
         assert!(!handle.fault_report().cleanup_diagnostics.unwrap().confirmed);
+    }
+
+    #[test]
+    fn native_process_failure_closes_the_service_host_and_preserves_one_pending_result() {
+        for source_denied in [false, true] {
+            let (handle, app) = fixture();
+            handle.try_sample(45, "room").unwrap();
+            let service = app.service.as_ref().unwrap();
+            let job = service.bridge.control.pending_job().unwrap();
+            *service.active.borrow_mut() = Some(job.clone());
+            {
+                let mut state = app.state.borrow_mut();
+                state.phase = BrowserPhase::Attached;
+                state.browser.bind(3, 100);
+                state.auto_stage = Some(AutoStage::Sampling);
+                state.script_pending = true;
+            }
+            if source_denied {
+                service.bridge.control.record_fault(FaultReport {
+                    source_barrier: Some(crate::host::SourceBarrier {
+                        code: "authentication_denied",
+                    }),
+                    ..Default::default()
+                });
+            }
+            app.browser_process_failed();
+            assert!(app.state.borrow().closing_at.is_some());
+            assert!(app.state.borrow().recycling_at.is_none());
+            assert!(matches!(app.state.borrow().phase, BrowserPhase::Closing));
+            assert!(service.pending_result.borrow().is_some());
+            assert_eq!(
+                handle.try_sample(46, "room"),
+                Err(crate::host::CommandError::Closed)
+            );
+            assert!(!service.bridge.control.shutdown.load(Ordering::Acquire));
+            let report = handle.fault_report();
+            assert_eq!(
+                report.primary_failure.unwrap().code,
+                "browser_process_failed"
+            );
+            assert_eq!(
+                report.source_barrier.as_ref().map(|barrier| barrier.code),
+                source_denied.then_some("authentication_denied")
+            );
+            app.finish_service(false);
+            let mut completions = 0;
+            let mut terminals = 0;
+            while let Ok(event) = handle.try_event() {
+                match event {
+                    crate::host::HostEvent::SampleCompleted {
+                        job_id: 45,
+                        outcome: Err(failure),
+                        ..
+                    } => {
+                        completions += 1;
+                        assert_eq!(failure.code, "browser_process_failed");
+                        assert!(!failure.pauses_community);
+                    }
+                    crate::host::HostEvent::Stopped {
+                        cleanup_confirmed,
+                        diagnostics,
+                    } => {
+                        terminals += 1;
+                        assert!(!cleanup_confirmed);
+                        assert_eq!(
+                            diagnostics.primary_failure.unwrap().code,
+                            "browser_process_failed"
+                        );
+                    }
+                    crate::host::HostEvent::Paused {
+                        code: "browser_process_failed",
+                    } => {}
+                    _ => panic!("unexpected ProcessFailed event"),
+                }
+            }
+            assert_eq!((completions, terminals), (1, 1));
+            assert!(service.pending_result.borrow().is_none());
+        }
     }
 
     #[test]

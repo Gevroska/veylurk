@@ -752,6 +752,7 @@
         start: "The browser process could not start.",
         not_created: "The browser process could not start; no process was created.",
         unexpected_exit: "The browser process exited unexpectedly.",
+        browser_process: "An embedded browser process failed.",
         protocol: "Communication with the browser process failed.",
         stalled: "The browser process stopped responding.",
         shutdown_timeout: "The browser process did not close in time.",

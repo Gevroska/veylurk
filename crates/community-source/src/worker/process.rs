@@ -426,13 +426,24 @@ fn supervise_owned(
     let mut shutdown_started = None;
     let mut last_progress = (0, Instant::now());
     let mut process_exited_at = None;
+    let mut browser_process_failed = false;
     while failure.is_none() {
         // FIFO pipe delivery is consumed before examining process exit. A full
         // valid receipt remains completed even if the worker then crashes.
         match inbound.recv_timeout(POLL) {
             Ok(Inbound::Frame(frame)) => {
                 match accept_frame(&bridge, frame, &mut last_progress, &mut terminal) {
-                    Ok(()) => {}
+                    Ok(observed_browser_failure) => {
+                        if observed_browser_failure && !browser_process_failed {
+                            browser_process_failed = true;
+                            shutdown_started.get_or_insert_with(Instant::now);
+                            worker_diagnostics.failure = Some(WorkerFailure::BrowserProcess);
+                            control.stop_accepting();
+                            let mut report = control.fault_report();
+                            report.worker = Some(worker_diagnostics.clone());
+                            control.record_fault(report);
+                        }
+                    }
                     Err(()) => {
                         failure = Some(WorkerFailure::Protocol);
                         break;
@@ -506,7 +517,7 @@ fn supervise_owned(
                 continue;
             }
         }
-        if terminal.is_some() || shutdown {
+        if terminal.is_some() || shutdown || browser_process_failed {
             continue;
         }
         if pending_command.is_none() {
@@ -567,7 +578,12 @@ fn supervise_owned(
     if failure.is_none() && exit_code != Some(0) {
         failure = Some(WorkerFailure::UnexpectedExit);
     }
-    worker_diagnostics.failure = failure;
+    worker_diagnostics.failure = if browser_process_failed {
+        Some(WorkerFailure::BrowserProcess)
+    } else {
+        failure
+    };
+    failure = worker_diagnostics.failure;
     if !contained && !control.shutdown.load(Ordering::Acquire) {
         // Keep the exact Job and process handles while cleanup is unknown.
         // The one failed completion is delivered now; the sole terminal waits
@@ -633,7 +649,8 @@ fn accept_frame(
     frame: WorkerFrame,
     progress: &mut (u64, Instant),
     terminal: &mut Option<(bool, FaultReport)>,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
+    let mut browser_process_failed = false;
     match frame {
         WorkerFrame::Pulse {
             native_progress,
@@ -646,13 +663,23 @@ fn accept_frame(
                 *progress = (native_progress, Instant::now());
             }
             // Only this supervisor owns process identity and containment proof.
+            browser_process_failed = reported_browser_failure(&diagnostics);
+            if browser_process_failed {
+                bridge.control.stop_accepting();
+            }
             diagnostics.worker = None;
             bridge.control.record_fault(diagnostics);
         }
         WorkerFrame::Ready if terminal.is_none() => bridge.emit(Status::Ready),
         WorkerFrame::LoginShown if terminal.is_none() => bridge.emit(Status::LoginShown),
         WorkerFrame::LoginFailed if terminal.is_none() => bridge.emit(Status::LoginFailed),
-        WorkerFrame::Paused { code } if terminal.is_none() => bridge.emit(Status::Paused { code }),
+        WorkerFrame::Paused { code } if terminal.is_none() => {
+            browser_process_failed = code == "browser_process_failed";
+            if browser_process_failed {
+                bridge.control.stop_accepting();
+            }
+            bridge.emit(Status::Paused { code });
+        }
         WorkerFrame::Completed {
             ticket,
             job_id,
@@ -666,6 +693,13 @@ fn accept_frame(
                 return Err(());
             }
             let outcome = outcome.into_source().map_err(|_| ())?;
+            browser_process_failed = outcome
+                .as_ref()
+                .err()
+                .is_some_and(|failure| failure.code == "browser_process_failed");
+            if browser_process_failed {
+                bridge.control.stop_accepting();
+            }
             if !bridge.control.complete(ticket, outcome) {
                 return Err(());
             }
@@ -675,6 +709,7 @@ fn accept_frame(
             mut diagnostics,
         } if terminal.is_none() => {
             bridge.control.stop_accepting();
+            browser_process_failed = reported_browser_failure(&diagnostics);
             diagnostics.worker = None;
             // Preserve a completely received final source/cleanup snapshot even
             // if the worker then crashes in its remaining native teardown.
@@ -683,7 +718,18 @@ fn accept_frame(
         }
         _ => return Err(()),
     }
-    Ok(())
+    Ok(browser_process_failed)
+}
+
+fn reported_browser_failure(report: &FaultReport) -> bool {
+    report
+        .primary_failure
+        .as_ref()
+        .is_some_and(|failure| failure.code == "browser_process_failed")
+        || report
+            .cleanup_diagnostics
+            .as_ref()
+            .is_some_and(crate::host::CleanupDiagnostics::browser_process_failed)
 }
 
 fn fail_worker(bridge: &Bridge, diagnostics: WorkerDiagnostics) {
@@ -693,6 +739,7 @@ fn fail_worker(bridge: &Bridge, diagnostics: WorkerDiagnostics) {
 fn publish_worker_failure(bridge: &Bridge, diagnostics: WorkerDiagnostics, terminal: bool) {
     let code = match diagnostics.failure {
         Some(WorkerFailure::Start | WorkerFailure::NotCreated) => "worker_start_failed",
+        Some(WorkerFailure::BrowserProcess) => "browser_process_failed",
         Some(WorkerFailure::Protocol) => "worker_protocol_failure",
         Some(WorkerFailure::Stalled) => "worker_stalled",
         Some(WorkerFailure::ShutdownTimeout) => "worker_shutdown_timeout",
@@ -1041,71 +1088,75 @@ mod tests {
 
     #[test]
     fn temporarily_unknown_containment_keeps_exact_handles_and_completes_only_once() {
-        let (handle, bridge) = HostHandle::channel();
-        handle.try_sample(46, "room").unwrap();
-        let mut worker = fixture("unexpected_exit");
-        let mut diagnostics = WorkerDiagnostics {
-            process_id: Some(worker.child.id()),
-            started_at_unix_ms: worker.child.started_at_unix_ms,
-            failure: Some(WorkerFailure::UnexpectedExit),
-            ..Default::default()
-        };
-        let mut probes = 0;
-        assert!(quarantine_worker(
-            &mut worker,
-            &bridge,
-            &mut diagnostics,
-            |owned| {
-                probes += 1;
-                if probes == 1 {
-                    assert!(matches!(
-                        handle.try_event(),
-                        Ok(HostEvent::SampleCompleted {
-                            job_id: 46,
-                            outcome: Err(_),
-                            ..
-                        })
-                    ));
-                    assert!(!handle.fault_report().worker.unwrap().containment_confirmed);
-                    assert!(owned.job.active().is_ok());
-                    (None, false)
-                } else {
-                    owned.probe_containment()
+        for failure in [WorkerFailure::UnexpectedExit, WorkerFailure::BrowserProcess] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(46, "room").unwrap();
+            let mut worker = fixture("unexpected_exit");
+            let mut diagnostics = WorkerDiagnostics {
+                process_id: Some(worker.child.id()),
+                started_at_unix_ms: worker.child.started_at_unix_ms,
+                failure: Some(failure),
+                ..Default::default()
+            };
+            let mut probes = 0;
+            assert!(quarantine_worker(
+                &mut worker,
+                &bridge,
+                &mut diagnostics,
+                |owned| {
+                    probes += 1;
+                    if probes == 1 {
+                        assert!(matches!(
+                            handle.try_event(),
+                            Ok(HostEvent::SampleCompleted {
+                                job_id: 46,
+                                outcome: Err(_),
+                                ..
+                            })
+                        ));
+                        assert!(!handle.fault_report().worker.unwrap().containment_confirmed);
+                        assert!(owned.job.active().is_ok());
+                        (None, false)
+                    } else {
+                        owned.probe_containment()
+                    }
                 }
-            }
-        ));
-        assert!(probes >= 2);
-        assert!(diagnostics.worker_tree_exited && diagnostics.containment_confirmed);
-        assert!(diagnostics.exit_code.is_some());
-        fail_worker(&bridge, diagnostics);
-        let (cleanup, report) = terminal(&handle);
-        assert!(!cleanup);
-        assert!(report.worker.unwrap().containment_confirmed);
-        assert!(handle.try_event().is_err());
+            ));
+            assert!(probes >= 2);
+            assert!(diagnostics.worker_tree_exited && diagnostics.containment_confirmed);
+            assert!(diagnostics.exit_code.is_some());
+            fail_worker(&bridge, diagnostics);
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup);
+            assert!(report.worker.unwrap().containment_confirmed);
+            assert!(handle.try_event().is_err());
+        }
     }
 
     #[test]
     fn shutdown_cancels_quarantine_without_fabricating_late_containment() {
-        let (handle, bridge) = HostHandle::channel();
-        let mut worker = fixture("unexpected_exit");
-        let mut diagnostics = WorkerDiagnostics {
-            process_id: Some(worker.child.id()),
-            started_at_unix_ms: worker.child.started_at_unix_ms,
-            failure: Some(WorkerFailure::UnexpectedExit),
-            ..Default::default()
-        };
-        handle.shutdown();
-        assert!(!quarantine_worker(
-            &mut worker,
-            &bridge,
-            &mut diagnostics,
-            |_| { panic!("cancelled quarantine must not run another probe") }
-        ));
-        assert!(!diagnostics.containment_confirmed);
-        fail_worker(&bridge, diagnostics);
-        assert!(!terminal(&handle).1.worker.unwrap().containment_confirmed);
-        // Test cleanup observes the actual owned objects after cancellation.
-        assert!(worker.finish(false).1);
+        for failure in [WorkerFailure::UnexpectedExit, WorkerFailure::BrowserProcess] {
+            let (handle, bridge) = HostHandle::channel();
+            let mut worker = fixture("unexpected_exit");
+            let mut diagnostics = WorkerDiagnostics {
+                process_id: Some(worker.child.id()),
+                started_at_unix_ms: worker.child.started_at_unix_ms,
+                failure: Some(failure),
+                ..Default::default()
+            };
+            handle.shutdown();
+            assert!(!quarantine_worker(
+                &mut worker,
+                &bridge,
+                &mut diagnostics,
+                |_| { panic!("cancelled quarantine must not run another probe") }
+            ));
+            assert!(!diagnostics.containment_confirmed);
+            fail_worker(&bridge, diagnostics);
+            assert!(!terminal(&handle).1.worker.unwrap().containment_confirmed);
+            // Test cleanup observes the actual owned objects after cancellation.
+            assert!(worker.finish(false).1);
+        }
     }
 
     #[test]
@@ -1127,6 +1178,214 @@ mod tests {
         assert!(!cleanup);
         assert_eq!(report.worker.unwrap().exit_code, Some(23));
         assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn validated_browser_failure_frames_retire_even_an_exit_zero_worker_and_keep_source_barriers() {
+        for mode in [
+            "browser_pulse_exit0",
+            "browser_stopped_exit0",
+            "browser_paused_exit0",
+            "browser_completed_exit0",
+            "browser_denial_before",
+            "browser_denial_after",
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            let control = bridge.control.clone();
+            handle.try_sample(53, "room").unwrap();
+            for _ in 0..16 {
+                bridge.emit(Status::Ready);
+            }
+            supervise_owned(options(), bridge, Ok(fixture(mode)));
+            assert!(
+                matches!(
+                    handle.try_event(),
+                    Ok(HostEvent::SampleCompleted {
+                        job_id: 53,
+                        outcome: Err(SourceFailure {
+                            code: "browser_process_failed",
+                            ..
+                        }),
+                        ..
+                    })
+                ),
+                "{mode}"
+            );
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup);
+            assert!(!control.shutdown.load(Ordering::Acquire));
+            let worker = report.worker.unwrap();
+            assert_eq!(
+                worker.failure,
+                Some(WorkerFailure::BrowserProcess),
+                "{mode}"
+            );
+            assert_eq!(worker.exit_code, Some(0), "{mode}");
+            assert!(worker.worker_tree_exited && worker.containment_confirmed);
+            assert_eq!(
+                report.source_barrier.as_ref().map(|barrier| barrier.code),
+                mode.starts_with("browser_denial_")
+                    .then_some("authentication_denied")
+            );
+            assert_eq!(
+                handle.try_sample(54, "room"),
+                Err(crate::host::CommandError::Closed)
+            );
+            assert!(handle.try_event().is_err());
+        }
+    }
+
+    #[test]
+    fn browser_failure_pulse_with_no_paused_frame_bounds_stuck_teardown_before_exact_job_retirement(
+    ) {
+        let (handle, bridge) = HostHandle::channel();
+        let control = bridge.control.clone();
+        handle.try_sample(55, "room").unwrap();
+        let started = Instant::now();
+        let supervisor = std::thread::spawn(move || {
+            supervise_owned(options(), bridge, Ok(fixture("browser_pulse_hang")));
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let report = handle.fault_report();
+            if report
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.failure == Some(WorkerFailure::BrowserProcess))
+            {
+                let worker = report.worker.unwrap();
+                assert!(!worker.worker_tree_exited && !worker.containment_confirmed);
+                assert!(worker.exit_code.is_none());
+                assert!(report.source_barrier.is_none());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "browser failure was not published before retirement"
+            );
+            std::thread::sleep(POLL);
+        }
+        assert!(!control.shutdown.load(Ordering::Acquire));
+        assert_eq!(
+            handle.try_sample(56, "room"),
+            Err(crate::host::CommandError::Closed)
+        );
+        supervisor.join().unwrap();
+        assert!(started.elapsed() < SHUTDOWN_LIMIT + TREE_EXIT_LIMIT + Duration::from_secs(3));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                job_id: 55,
+                outcome: Err(SourceFailure {
+                    code: "browser_process_failed",
+                    ..
+                }),
+                ..
+            })
+        ));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        let worker = report.worker.unwrap();
+        assert_eq!(worker.failure, Some(WorkerFailure::BrowserProcess));
+        assert!(worker.worker_tree_exited && worker.containment_confirmed);
+        assert!(worker.exit_code.is_some());
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn delivered_positive_receipt_survives_a_later_browser_subprocess_failure() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(57, "room").unwrap();
+        supervise_owned(options(), bridge, Ok(fixture("success_then_browser_exit0")));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                job_id: 57,
+                outcome: Ok(_),
+                ..
+            })
+        ));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        let worker = report.worker.unwrap();
+        assert_eq!(worker.failure, Some(WorkerFailure::BrowserProcess));
+        assert_eq!(worker.exit_code, Some(0));
+        assert!(worker.worker_tree_exited && worker.containment_confirmed);
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn a_positive_then_matched_failed_browser_exit_retires_the_worker_without_a_browser_primary() {
+        for mode in [
+            "success_then_failed_cleanup_exit0",
+            "success_then_failed_cleanup_pulse_exit0",
+            "success_then_failed_cleanup_paused_exit0",
+            "success_then_failed_cleanup_pulse_denial_before_exit0",
+            "success_then_failed_cleanup_pulse_denial_after_exit0",
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(58, "room").unwrap();
+            supervise_owned(options(), bridge, Ok(fixture(mode)));
+            assert!(matches!(
+                handle.try_event(),
+                Ok(HostEvent::SampleCompleted {
+                    job_id: 58,
+                    outcome: Ok(_),
+                    ..
+                })
+            ));
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup);
+            assert!(report.primary_failure.is_none());
+            assert!(report.cleanup_diagnostics.unwrap().browser_process_failed());
+            let worker = report.worker.unwrap();
+            assert_eq!(
+                worker.failure,
+                Some(WorkerFailure::BrowserProcess),
+                "{mode}"
+            );
+            assert_eq!(worker.exit_code, Some(0));
+            assert!(worker.worker_tree_exited && worker.containment_confirmed);
+            assert_eq!(
+                report.source_barrier.as_ref().map(|barrier| barrier.code),
+                mode.contains("denial_").then_some("authentication_denied")
+            );
+            assert!(handle.try_event().is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_mismatched_or_normal_cleanup_after_success_never_acquires_a_browser_failure_cause() {
+        for negative in [
+            "mismatch",
+            "zero",
+            "missing",
+            "normal",
+            "unknown",
+            "contradictory",
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(59, "room").unwrap();
+            let mode = format!("success_then_cleanup_{negative}_exit0");
+            supervise_owned(options(), bridge, Ok(fixture(&mode)));
+            assert!(matches!(
+                handle.try_event(),
+                Ok(HostEvent::SampleCompleted {
+                    job_id: 59,
+                    outcome: Ok(_),
+                    ..
+                })
+            ));
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup);
+            assert!(!report.cleanup_diagnostics.unwrap().browser_process_failed());
+            assert!(report.primary_failure.is_none() && report.source_barrier.is_none());
+            let worker = report.worker.unwrap();
+            assert_eq!(worker.failure, None, "{negative}");
+            assert_eq!(worker.exit_code, Some(0));
+            assert!(worker.worker_tree_exited && worker.containment_confirmed);
+            assert!(handle.try_event().is_err());
+        }
     }
 
     #[test]

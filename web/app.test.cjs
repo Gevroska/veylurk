@@ -744,6 +744,18 @@ test("Community distinguishes automatic cleanup waits, source blocks and cancell
   assert.equal(app.calls.some((call) => call.options.method === "POST"), false);
 });
 
+test("Community explains an embedded browser failure with automatic host recovery", async () => {
+  const failure = { failure: "browser_process", process_id: 41, exit_code: 0, containment_confirmed: true, worker_tree_exited: true };
+  const status = communityState({ worker: failure,
+    worker_recovery: { state: "backoff", attempts: 1, cleanup_confirmed: false, last_fault: { worker: failure } } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  const text = app.get("community-status").textContent;
+  assert.match(text, /An embedded browser process failed/);
+  assert.match(text, /Automatic browser restart scheduled/);
+  assert.doesNotMatch(text, /Restart Veylurk|choose Resume/);
+});
+
 test("Community explains a proved pre-process launch failure without inventing a browser shutdown", async () => {
   const failure = { failure: "not_created", process_id: null, exit_code: null, containment_confirmed: false, worker_tree_exited: false };
   const status = communityState({ worker: failure,

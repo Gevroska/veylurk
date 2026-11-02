@@ -893,9 +893,9 @@ impl Coordinator {
                     .await?;
                 self.persisted_pause = Some(CommunityPauseReason::CleanupUnconfirmed);
                 self.service.status.write().await.persisted_pause_reason = self.persisted_pause;
-                if self.pending.is_none() {
-                    self.end_run(CommunityRunEndReason::HostFailure).await?;
-                }
+            }
+            if self.pending.is_none() && !self.retiring {
+                self.end_run(CommunityRunEndReason::HostFailure).await?;
             }
         }
         let mut status = self.service.status.write().await;
@@ -971,6 +971,10 @@ impl Coordinator {
                 }
                 // Persist a denial before any terminal/cancelled attempt write.
                 // A crash at either later write must still require explicit Resume.
+                let infrastructure_failure = outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|failure| community_source::host::is_worker_failure(failure.code));
                 if let Err(failure) = &outcome {
                     if failure.pauses_community {
                         self.pause_event(failure.code).await?;
@@ -983,7 +987,11 @@ impl Coordinator {
                 {
                     self.finish_failure(CommunityFailureCode::HostFailure, true)
                         .await?;
-                    if self.worker_fault_pending && !self.retiring {
+                    if (infrastructure_failure
+                        || self.worker_fault_pending
+                        || self.quarantine_observed && !self.replacement_safe)
+                        && !self.retiring
+                    {
                         self.end_run(CommunityRunEndReason::HostFailure).await?;
                     }
                     return Ok(());
@@ -1001,7 +1009,11 @@ impl Coordinator {
                         }
                     }
                 }
-                if self.worker_fault_pending && !self.retiring {
+                if (infrastructure_failure
+                    || self.worker_fault_pending
+                    || self.quarantine_observed && !self.replacement_safe)
+                    && !self.retiring
+                {
                     self.end_run(CommunityRunEndReason::HostFailure).await?;
                 }
             }

@@ -145,6 +145,20 @@ pub struct CleanupDiagnostics {
     pub confirmed: bool,
 }
 
+impl CleanupDiagnostics {
+    /// The fixed WebView2 FAILED kind is 1 (NORMAL is 0). Native tests bind
+    /// this vocabulary to the pinned SDK constant. Unknown cleanup is never
+    /// inferred to be a crash from a timeout or an unmatched process identity.
+    pub fn browser_process_failed(&self) -> bool {
+        self.expected_browser_pid
+            .is_some_and(|pid| pid != 0 && self.observed_exit_pid == Some(pid))
+            && self.observed_exit_kind == Some(1)
+            && !self.normal_exit_observed
+            && !self.confirmed
+            && !self.no_browser_cleanup_required
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct FaultReport {
     /// First received source barrier. Unlike the bounded status queue, this
@@ -167,6 +181,7 @@ pub fn is_worker_failure(code: &str) -> bool {
     matches!(
         code,
         "worker_failed"
+            | "browser_process_failed"
             | "worker_start_failed"
             | "worker_protocol_failure"
             | "worker_stalled"
@@ -214,6 +229,9 @@ pub enum WorkerFailure {
     /// Launch failed before CreateProcessW created any child. Parent-authored
     /// evidence only; no child/native report can supply worker diagnostics.
     NotCreated,
+    /// A validated native ProcessFailed observation requires whole-host
+    /// retirement before this browser profile may be used again.
+    BrowserProcess,
     Start,
     UnexpectedExit,
     Protocol,
@@ -882,6 +900,36 @@ impl Drop for HostHandle {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn only_an_exact_known_abnormal_browser_exit_classifies_as_process_failure() {
+        let matched = CleanupDiagnostics {
+            expected_browser_pid: Some(100),
+            observed_exit_pid: Some(100),
+            observed_exit_kind: Some(1),
+            ..Default::default()
+        };
+        assert!(matched.browser_process_failed());
+        for missing in 0..10 {
+            let mut diagnostic = matched.clone();
+            match missing {
+                0 => diagnostic.expected_browser_pid = None,
+                1 => diagnostic.observed_exit_pid = None,
+                2 => {
+                    diagnostic.expected_browser_pid = Some(0);
+                    diagnostic.observed_exit_pid = Some(0);
+                }
+                3 => diagnostic.observed_exit_pid = Some(101),
+                4 => diagnostic.observed_exit_kind = None,
+                5 => diagnostic.observed_exit_kind = Some(0),
+                6 => diagnostic.observed_exit_kind = Some(99),
+                7 => diagnostic.normal_exit_observed = true,
+                8 => diagnostic.confirmed = true,
+                _ => diagnostic.no_browser_cleanup_required = true,
+            }
+            assert!(!diagnostic.browser_process_failed(), "negative {missing}");
+        }
+    }
 
     fn denial_report(code: &'static str) -> FaultReport {
         FaultReport {

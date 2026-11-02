@@ -22,6 +22,118 @@ fn write(output: &mut impl Write, value: &Value) {
     output.flush().unwrap();
 }
 
+fn fault_diagnostics(code: Option<&str>) -> Value {
+    json!({
+        "primary_failure":code.map(|code| json!({
+            "code":code,"stage":"preparing","observed_at_unix_ms":11,
+            "controller_epoch":7,"job_id":null,"navigation_ready":false,"last_player_observation":null,
+            "script_pending":false,"network_pending":false,"response_pending":false,"trigger_pending":false,
+            "navigation_failure":null
+        })),"cleanup_diagnostics":null,"host_termination":null,"window_dismissal":null,"worker":null
+    })
+}
+
+fn browser_failure_frames(output: &mut impl Write, mode: &str) {
+    if mode == "browser_denial_before" {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":1,"diagnostics":fault_diagnostics(Some("authentication_denied"))}),
+        );
+    }
+    if mode == "browser_paused_exit0" {
+        write(
+            output,
+            &json!({"kind":"Paused","code":"browser_process_failed"}),
+        );
+    } else if mode != "browser_stopped_exit0" {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":2,"diagnostics":fault_diagnostics(Some("browser_process_failed"))}),
+        );
+    }
+    if mode == "browser_denial_after" {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":3,"diagnostics":fault_diagnostics(Some("authentication_denied"))}),
+        );
+    }
+    write(
+        output,
+        &json!({"kind":"Pulse","native_progress":4,"diagnostics":fault_diagnostics(None)}),
+    );
+    if mode == "browser_pulse_hang" {
+        std::thread::sleep(Duration::from_secs(30));
+    } else {
+        let code = (mode == "browser_stopped_exit0").then_some("browser_process_failed");
+        write(
+            output,
+            &json!({"kind":"Stopped","cleanup_confirmed":true,"diagnostics":fault_diagnostics(code)}),
+        );
+    }
+}
+
+fn cleanup_after_success(output: &mut impl Write, mode: &str) {
+    if mode.contains("denial_before") {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":0,"diagnostics":fault_diagnostics(Some("authentication_denied"))}),
+        );
+    }
+    let mut report = fault_diagnostics(None);
+    let mut cleanup = json!({
+        "no_browser_cleanup_required":false,"controller_epoch":7,
+        "expected_browser_pid":100,"observed_exit_pid":100,"observed_exit_kind":1,
+        "normal_exit_observed":false,"close_hresult":0,"first_detach_failure":null,
+        "unsubscribe_hresult":0,"elapsed_ms":5000,"confirmed":false
+    });
+    if mode.contains("mismatch") {
+        cleanup["observed_exit_pid"] = json!(101);
+    }
+    if mode.contains("zero") {
+        cleanup["expected_browser_pid"] = json!(0);
+        cleanup["observed_exit_pid"] = json!(0);
+    }
+    if mode.contains("missing") {
+        cleanup["observed_exit_pid"] = Value::Null;
+    }
+    if mode.contains("normal") {
+        cleanup["observed_exit_kind"] = json!(0);
+    }
+    if mode.contains("unknown") {
+        cleanup["observed_exit_kind"] = json!(99);
+    }
+    if mode.contains("contradictory") {
+        cleanup["normal_exit_observed"] = json!(true);
+    }
+    report["cleanup_diagnostics"] = cleanup;
+    if mode.contains("pulse") {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":1,"diagnostics":report}),
+        );
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":2,"diagnostics":fault_diagnostics(None)}),
+        );
+    }
+    if mode.contains("denial_after") {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":3,"diagnostics":fault_diagnostics(Some("authentication_denied"))}),
+        );
+    }
+    if mode.contains("paused") {
+        write(
+            output,
+            &json!({"kind":"Paused","code":"browser_process_failed"}),
+        );
+    }
+    write(
+        output,
+        &json!({"kind":"Stopped","cleanup_confirmed":false,"diagnostics":report}),
+    );
+}
+
 #[cfg(windows)]
 fn access_violation() -> ! {
     #[link(name = "kernel32")]
@@ -66,6 +178,10 @@ fn main() {
     }
     if mode == "unexpected_exit" {
         std::process::exit(23);
+    }
+    if mode.starts_with("browser_") && mode != "browser_completed_exit0" {
+        browser_failure_frames(&mut output, &mode);
+        return;
     }
     #[cfg(windows)]
     if matches!(
@@ -180,7 +296,12 @@ fn main() {
                 );
                 return;
             }
-            "Sample" if mode == "success_then_exit" => {
+            "Sample"
+                if mode == "success_then_exit"
+                    || mode == "success_then_browser_exit0"
+                    || mode.starts_with("success_then_failed_cleanup")
+                    || mode.starts_with("success_then_cleanup_") =>
+            {
                 write(
                     &mut output,
                     &json!({"kind":"Completed","ticket":frame["ticket"],"job_id":frame["job_id"],"channel":frame["channel"],"outcome":{
@@ -200,7 +321,31 @@ fn main() {
                         }
                     }}),
                 );
+                if mode == "success_then_browser_exit0" {
+                    browser_failure_frames(&mut output, &mode);
+                    return;
+                }
+                if mode.starts_with("success_then_failed_cleanup")
+                    || mode.starts_with("success_then_cleanup_")
+                {
+                    cleanup_after_success(&mut output, &mode);
+                    return;
+                }
                 std::process::exit(23);
+            }
+            "Sample" if mode == "browser_completed_exit0" => {
+                write(
+                    &mut output,
+                    &json!({"kind":"Completed","ticket":frame["ticket"],
+                    "job_id":frame["job_id"],"channel":frame["channel"],"outcome":{
+                        "kind":"Failure","code":"browser_process_failed","pauses_community":false
+                    }}),
+                );
+                write(
+                    &mut output,
+                    &json!({"kind":"Stopped","cleanup_confirmed":true,"diagnostics":fault_diagnostics(None)}),
+                );
+                return;
             }
             "Sample" if mode == "wrong_ticket" => {
                 write(
