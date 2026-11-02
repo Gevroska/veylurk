@@ -259,13 +259,13 @@ async fn contained_worker_fault_fails_once_then_retries_without_resume_and_prese
     assert_eq!(store.community_pause().await.unwrap(), None);
     let retry_fence = runner.schedule["example"].retry_not_before;
     let global_fence = runner.next_start;
+    // Freeze before arming recovery so real SQLite I/O cannot consume its
+    // five-second deadline. Durable writes have no read-response timeout.
+    tokio::time::pause();
     contained_terminal(&mut runner).await;
     runner.refresh_status().await;
     assert!(!runner.paused && runner.replacement_safe);
     assert!(runner.run_id.is_none() && runner.pending.is_none());
-    assert_eq!(store.community_pause().await.unwrap(), None);
-    let stats = store.community_stats().await.unwrap();
-    assert_eq!((stats.failed_count, stats.pending_count), (1, 0));
     {
         let status = runner.service.status.read().await;
         assert_eq!(status.state, "recovering");
@@ -280,10 +280,6 @@ async fn contained_worker_fault_fails_once_then_retries_without_resume_and_prese
         );
         assert!(recovery.last_fault.cleanup_diagnostics.is_none());
     }
-    // SQLite runs on a real thread. Pause only the scheduling-only portion;
-    // otherwise Tokio may advance a read-response timeout before that thread
-    // has a chance to answer an ordinary fixture query.
-    tokio::time::pause();
     runner.step().await.unwrap();
     assert_eq!(runner.host_start_attempts, 0);
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -296,6 +292,11 @@ async fn contained_worker_fault_fails_once_then_retries_without_resume_and_prese
     assert_eq!(runner.schedule["example"].retry_not_before, retry_fence);
     assert_eq!(runner.next_start, global_fence);
     tokio::time::resume();
+    // Reads use the real clock while the SQLite OS thread answers; a paused
+    // runtime could otherwise auto-advance their response timeout.
+    assert_eq!(store.community_pause().await.unwrap(), None);
+    let stats = store.community_stats().await.unwrap();
+    assert_eq!((stats.failed_count, stats.pending_count), (1, 0));
     assert_eq!(store.community_stats().await.unwrap().sample_count, 1);
 }
 
