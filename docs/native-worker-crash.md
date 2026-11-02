@@ -1,6 +1,7 @@
 # Native browser crash containment
 
-Status: implementation and verification in progress, November 2, 2026.
+Status: implemented and verified on the isolated test installation, November 2,
+2026. Native faults are contained; the original DLL defect is not identified.
 
 ## Problem and scope
 
@@ -63,9 +64,107 @@ restart retains the durable pause; it does not silently clear source denials.
    Preserve all history and settings, restart normally, and check both original
    channels. Recheck production identity without modifying it.
 
-Fault injection can establish containment and finite live samples can establish
+Fault injection establishes containment and finite live samples establish
 compatibility. Neither identifies or proves elimination of the original native
-DLL defect. Evidence and exact outcomes will be added after verification.
+DLL defect.
+
+## Verified build and review
+
+| Item | Evidence |
+| --- | --- |
+| Application code revision | `20ddb45f8b97843e57b0f7e43f8a4a35ece70561` |
+| Native Windows checks | [Run 41365032907](https://github.com/Gevroska/veylurk/actions/runs/41365032907), job `125023273061`: 121 tests, formatting, strict lint, proof build and offline CLI checks passed |
+| Complete Windows application checks | [Run 41365032917](https://github.com/Gevroska/veylurk/actions/runs/41365032917), job `125023273169`: tests, isolated storage recovery, 10/25/50-channel scale checks, release build, packaging and lifecycle checks passed |
+| UI regressions | 129 tests passed, including separate containment/normal-cleanup presentation and recovery guidance |
+| Supplementary local process tests | 86 passed against a copied tree with the native browser body explicitly stubbed; real Windows Job, pipe, process and fault fixtures ran |
+| Normal release artifact | `13107565623`, `veylurk-windows-x64` |
+| ZIP SHA-256 | `6a7286ffc0709d2866174bacb320ed90f335fd696ca4025259a0dbee00f9b25a` |
+| Executable SHA-256 | `71d216a2ce872cffe093b2961647bbb8cf3b7087d3fe80eda548c2bc12cd7ef9` |
+
+Independent review corrected a ticket/dequeue race, unrestricted inherited
+handles, lost final diagnostics, post-terminal publications and override-refusal
+semantics. An actual Windows fixture exposed Job accounting reaching zero before
+the retained process handle signalled; containment now requires both proofs and
+retains the numeric exit reason. No material static-review finding remained.
+
+Worker retirement has a shared 13-second wait budget. The tested maximum combines
+six seconds for requested shutdown, 500 ms exit grace, five seconds for Job
+retirement, one second for the retained process and 100 ms polling/publication
+margin. That 12.6-second calculation fits the existing 14-second control reply and
+15-second coordinator deadline. The ordinary native cleanup allowance is retained.
+
+## Isolated application fault acceptance
+
+The approved test executable path was reused. Fault tests used a separate empty
+database and anonymous browser profile, with metadata credentials omitted. The
+normal signed-in profile and original history stayed offline throughout injection.
+
+Both idle-worker and active-sample cases injected numeric exit `0xc0000005` into
+an exact, retained worker-process handle. Before injection, the native DLL was
+loaded in the worker and absent from the parent. The private role, executable,
+parent and creation identity were verified; no main application was terminated.
+This injected termination is not a reproduction of the original DLL fault.
+
+For the active case, the final pre-injection status confirmed a `strano` sample.
+Sample 3 then became `failed/host_failure` exactly once, with no unfinished sample.
+The server kept its PID and instance, reported numeric exit `3221225477`, confirmed
+the worker tree exited and preserved `cleanup_confirmed=false` plus the durable
+`cleanup_unconfirmed` pause. No replacement worker or sample appeared during the
+bounded observation. Adding `normanajari` afterward established a new durable IRC
+session while the database stayed available and collection remained healthy.
+
+Earlier anonymous UI-readiness timeouts remain separate failed rows. They are not
+signed-in compatibility results or successful samples. Both fault-test application
+lifetimes ended normally with code 0 and no remaining profile owners. The stopped
+fault database had integrity `ok` and zero pending samples.
+
+## History preservation and final authenticated acceptance
+
+The previous test ended normally before replacement. Its complete latest database,
+encrypted credentials and executable were backed up, flushed and hash-verified
+under the offline ownership lock; a nonempty WAL would have prevented copying.
+The executable was replaced atomically at the existing approved path. Original
+data and profiles were not overwritten by fault-test data.
+
+After returning to the original database/profile, the new test retained all 28
+channel flags, All collection policy and enabled Adaptive/300 Community settings.
+Saved API credentials were unchanged; metadata was configured and ready. Both
+original channels collected successfully, without a new sign-in:
+
+| Channel | Durable sample | UTC receipt | Committed accounts |
+| --- | --- | --- | --- |
+| `normanajari` | 522 | November 2, 00:23:46.551 | 7 |
+| `strano` | 523 | November 2, 00:24:26.402 | 68 |
+
+Independent SQLite checks matched every member count and verified HTTP 200,
+`network_response`, request-after-trigger provenance and all four cache flags
+false. Current source status was unpaused, with no channel failures or collection
+error. The test runs on port 8796; production on port 8795 retained its original
+process, executable, creation identity and listener.
+
+All eight retained-history prefixes matched exactly: 46,819 observations, 220
+sessions, 228 session-channel rows, 36,947 visits, zero boundaries, 43 Community
+runs, 521 samples and 32,805 member rows. Integrity was `ok`; the preservation check
+also found zero pending samples at its snapshot. New rows remain outside those
+immutable prefix bounds.
+
+Private evidence is under `veylurk-crash-isolation-20261102` in the local temporary
+area: pre-upgrade backups/baseline, `fault` and `fault-active` injection reports,
+and `final/health.json`, `final/durable-receipts.json`, `final/history-prefix.json`
+and `final/preserved-identities.json`. Databases, profiles, encrypted credentials
+and pipe contents are not published.
+
+## Remaining limits and recovery
+
+A future native DLL fault can still terminate the worker. The correction prevents
+that failure from taking down the server, IRC and database process; it does not
+patch Microsoft's DLL or establish long-duration reliability. After an abnormal
+worker exit, Community pauses. Once all worker processes are confirmed gone,
+restart Veylurk and explicitly choose Resume. Normal cleanup is never fabricated,
+and source-denial barriers remain intact.
+
+R: storage responsiveness, statistical calibration and historical sampling limits
+are unchanged by this correction.
 
 Microsoft references: [process events](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-related-events),
 [threading model](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/threading-model)

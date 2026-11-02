@@ -441,9 +441,20 @@ excluded.
 
 The owner requested correction of the earlier WebView2 access violation on
 November 2. Independent scoping found no source-supported causal repair from the
-retained event metadata. A same-executable isolated native worker is being
-implemented to prevent a browser DLL fault from terminating the server, IRC and
-database process. Bounded transport, Job containment and explicit failure barriers
-are required; no normal-cleanup evidence may be fabricated. Implementation,
-independent review, exact Windows CI and isolated fault-injection/live acceptance
-are pending. See the [written plan](native-worker-crash.md). Production is excluded.
+retained event metadata. A same-executable isolated native worker is implemented
+and verified at `20ddb45f8b97843e57b0f7e43f8a4a35ece70561`. Exact native Windows
+checks passed 121 tests, and the complete application workflow passed, including
+storage recovery, scale workloads and normal release packaging. Independent review
+has no remaining material findings; the supplementary local process suite passed
+86 tests with its native browser body explicitly stubbed.
+
+Isolated idle and active-sample worker failures preserved the main HTTP/IRC/database
+process. The active sample failed exactly once, the worker tree exited with numeric
+`0xc0000005`, and a new IRC session was durably created afterward. Community retains
+its pause and unconfirmed normal cleanup; recovery requires restart and explicit
+Resume. This contains the native crash without claiming its DLL cause is fixed.
+
+The normal signed-in test on 8796 retained its settings, all 28 channel flags,
+history and encrypted credentials. Both original channels produced fresh durable
+samples; all eight pre-upgrade history prefixes and integrity checks passed.
+Production on 8795 was unchanged. See the [plan and verified results](native-worker-crash.md).
