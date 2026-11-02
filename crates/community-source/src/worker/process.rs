@@ -18,9 +18,11 @@ use launch::ChildProcess;
 
 const POLL: Duration = Duration::from_millis(25);
 const STALL_LIMIT: Duration = Duration::from_secs(15);
-const SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
+const SHUTDOWN_LIMIT: Duration = Duration::from_secs(6);
 const PIPE_WRITE_LIMIT: Duration = Duration::from_secs(3);
 const TREE_EXIT_LIMIT: Duration = Duration::from_secs(5);
+const EXIT_GRACE_LIMIT: Duration = Duration::from_millis(500);
+const PROCESS_EXIT_LIMIT: Duration = Duration::from_secs(1);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const KILL_ON_JOB_CLOSE: u32 = 0x2000;
 
@@ -193,16 +195,18 @@ impl OwnedWorker {
     fn finish(&mut self, allow_graceful: bool) -> (Option<u32>, bool) {
         // Pipe EOF can precede final process-handle signaling. Give an already
         // exiting worker a bounded chance to preserve its own numeric reason.
-        let _ = self
-            .child
-            .wait_bounded(if allow_graceful { 500 } else { 100 });
+        let _ = self.child.wait_bounded(if allow_graceful {
+            EXIT_GRACE_LIMIT.as_millis() as u32
+        } else {
+            100
+        });
         self.job.terminate();
         let empty = self.job.wait_empty();
         // Job accounting can reach zero before the process object signals.
         // Read the reason from the retained handle, never a reused PID.
         let code = self
             .child
-            .wait_bounded(1000)
+            .wait_bounded(PROCESS_EXIT_LIMIT.as_millis() as u32)
             .ok()
             .flatten()
             .and_then(|status| status.code())
@@ -1165,6 +1169,26 @@ mod tests {
         let (cleanup, report) = terminal(&handle);
         assert!(!cleanup);
         assert_eq!(report.worker.unwrap().failure, Some(WorkerFailure::Stalled));
+    }
+
+    #[test]
+    fn supervisor_retirement_budget_includes_all_exit_barriers_and_publication_margin() {
+        let worst_case = SHUTDOWN_LIMIT + EXIT_GRACE_LIMIT + TREE_EXIT_LIMIT + PROCESS_EXIT_LIMIT;
+        assert!(worst_case + POLL * 4 <= crate::host::MAX_WORKER_RETIREMENT);
+    }
+
+    #[test]
+    fn ignored_shutdown_is_forced_within_the_shared_retirement_budget() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.shutdown();
+        let started = Instant::now();
+        supervise_owned(options(), bridge, Ok(fixture("shutdown_ignored")));
+        assert!(started.elapsed() < crate::host::MAX_WORKER_RETIREMENT);
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        let worker = report.worker.unwrap();
+        assert_eq!(worker.failure, Some(WorkerFailure::ShutdownTimeout));
+        assert!(worker.containment_confirmed && worker.worker_tree_exited);
     }
 
     #[test]

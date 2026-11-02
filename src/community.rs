@@ -22,6 +22,7 @@ use tokio::{
 const START_GAP: Duration = Duration::from_secs(30);
 const JOB_TIMEOUT: Duration = Duration::from_secs(85);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(14);
 
 #[derive(Clone, Serialize)]
 pub struct Status {
@@ -335,7 +336,7 @@ impl Community {
         self.commands
             .try_send((command, reply))
             .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "busy"))?;
-        match tokio::time::timeout(Duration::from_secs(14), response).await {
+        match tokio::time::timeout(CONTROL_REPLY_TIMEOUT, response).await {
             Ok(Ok(Ok(ControlReply::Accepted))) => Ok(Json(json!({"accepted":true}))),
             Ok(Ok(Ok(ControlReply::Settings(settings)))) => Ok(Json(json!(settings))),
             Ok(Ok(Err(code))) => Err(error(StatusCode::SERVICE_UNAVAILABLE, code)),

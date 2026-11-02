@@ -126,6 +126,7 @@ fn main() {
     write(&mut output, &json!({"kind":"Ready"}));
     while let Some(frame) = read(&mut input) {
         match frame["kind"].as_str().unwrap() {
+            "Control" if frame["shutdown"] == true && mode == "shutdown_ignored" => {}
             "Control" if frame["shutdown"] == true => {
                 write(
                     &mut output,

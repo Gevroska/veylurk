@@ -2,6 +2,13 @@ use super::*;
 use axum::{body::Body, http::Request};
 use tower::ServiceExt;
 
+#[test]
+fn coordinator_keeps_the_worker_terminal_consumer_alive_beyond_all_worker_exit_barriers() {
+    let budget = community_source::host::MAX_WORKER_RETIREMENT;
+    assert!(budget + Duration::from_secs(1) <= CLEANUP_TIMEOUT);
+    assert!(budget < CONTROL_REPLY_TIMEOUT);
+}
+
 #[tokio::test(start_paused = true)]
 async fn serial_schedule_is_fair_and_backoff_does_not_block_other_rooms() {
     let now = Instant::now();

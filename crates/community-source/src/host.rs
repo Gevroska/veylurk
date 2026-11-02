@@ -15,6 +15,10 @@ use std::{
 
 pub const ROLE_MASK: u8 = 63;
 pub const RECYCLE_NAVIGATIONS: usize = 48;
+/// Upper budget for the supervisor after shutdown is requested, including
+/// forced tree termination and retained-process exit observation. Coordinators
+/// must keep consuming the reserved terminal event for longer than this.
+pub const MAX_WORKER_RETIREMENT: Duration = Duration::from_secs(13);
 
 #[derive(Clone, Debug)]
 pub struct HostOptions {
