@@ -239,7 +239,7 @@ async fn worker_death_while_pending_is_saved_keeps_recovery_intent_after_closed_
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn contained_worker_fault_fails_once_then_retries_without_resume_and_preserves_fences() {
     let (_directory, store, mut runner) = pending_fixture().await;
     runner.settings.enabled = true;
@@ -280,6 +280,10 @@ async fn contained_worker_fault_fails_once_then_retries_without_resume_and_prese
         );
         assert!(recovery.last_fault.cleanup_diagnostics.is_none());
     }
+    // SQLite runs on a real thread. Pause only the scheduling-only portion;
+    // otherwise Tokio may advance a read-response timeout before that thread
+    // has a chance to answer an ordinary fixture query.
+    tokio::time::pause();
     runner.step().await.unwrap();
     assert_eq!(runner.host_start_attempts, 0);
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -291,12 +295,15 @@ async fn contained_worker_fault_fails_once_then_retries_without_resume_and_prese
     assert_eq!(runner.host_start_attempts, 1);
     assert_eq!(runner.schedule["example"].retry_not_before, retry_fence);
     assert_eq!(runner.next_start, global_fence);
+    tokio::time::resume();
     assert_eq!(store.community_stats().await.unwrap().sample_count, 1);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn repeated_contained_crashes_retry_indefinitely_at_the_cap_and_ready_does_not_reset() {
     let (_directory, _store, mut runner) = pending_fixture().await;
+    // Fixture initialization reads SQLite before virtual scheduling begins.
+    tokio::time::pause();
     runner.settings.enabled = true;
     for (index, seconds) in [5, 10, 20, 40, 60, 60, 60, 60].into_iter().enumerate() {
         contained_terminal(&mut runner).await;
@@ -549,7 +556,7 @@ async fn shutdown_during_terminal_storage_never_commits_recovery_or_clears_owned
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn proved_no_child_launch_failures_retry_but_ambiguous_start_failures_stay_blocked() {
     for (failure, retries) in [
         (community_source::host::WorkerFailure::NotCreated, true),
@@ -576,13 +583,15 @@ async fn proved_no_child_launch_failures_retry_but_ambiguous_start_failures_stay
             store.community_pause().await.unwrap(),
             (!retries).then_some(CommunityPauseReason::CleanupUnconfirmed)
         );
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(5)).await;
         runner.step().await.unwrap();
         assert_eq!(runner.host_start_attempts, usize::from(retries));
+        tokio::time::resume();
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn owner_disable_login_and_shutdown_cancel_backoff_and_quarantine_without_late_resurrection()
 {
     for quarantined in [false, true] {
@@ -619,6 +628,7 @@ async fn owner_disable_login_and_shutdown_cancel_backoff_and_quarantine_without_
             if quarantined {
                 contained_terminal(&mut runner).await;
             }
+            tokio::time::pause();
             tokio::time::advance(Duration::from_secs(600)).await;
             runner.step().await.unwrap();
             assert_eq!(
@@ -626,6 +636,7 @@ async fn owner_disable_login_and_shutdown_cancel_backoff_and_quarantine_without_
                 "{command}, quarantine={quarantined}"
             );
             assert!(runner.recovery_retry_at.is_none());
+            tokio::time::resume();
         }
     }
 }
