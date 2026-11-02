@@ -3,6 +3,11 @@
 Status: implemented and verified on the isolated test installation, November 2,
 2026. Native faults are contained; the original DLL defect is not identified.
 
+This report describes the initial containment revision and its manual recovery
+policy. The subsequent [autonomous recovery change](community-autorecovery.md)
+supersedes that policy. Its separate verification establishes automatic worker
+replacement; the tests below must not be read as evidence of automatic recovery.
+
 ## Problem and scope
 
 The November 1 test crash was Windows Application Error event 64657 at

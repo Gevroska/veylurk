@@ -462,10 +462,20 @@ Production on 8795 was unchanged. See the [plan and verified results](native-wor
 ## Autonomous Community recovery
 
 The owner explicitly superseded manual restart/Resume after worker crashes on
-November 2. Automatic replacement is being implemented behind exact containment
-and protected source-barrier checks, with capped retry delays and eventual cleanup
-rechecks. Known source denials and legacy ambiguous cleanup pauses remain protected.
-Disable, owner Login and shutdown must invalidate delayed recovery. Independent
-review, exact Windows checks and authenticated automatic-recovery fault injection
-are pending. See the [written plan](community-autorecovery.md). Production remains
-excluded.
+November 2. Implemented and verified at
+`3968a5be0861112f898d3674bcfac9c829c5d157`: automatic replacement follows exact
+worker exit and an empty owned Job. Unknown ownership is quarantined and rechecked;
+retry delays grow through 5, 10, 20, 40 and 60 seconds, capped at 60 indefinitely.
+Normal sampling fences remain. Only a validated, durably saved receipt resets the
+failure streak. Received source denials, legacy ambiguous pauses and intentional
+disable/Login/shutdown remain protected.
+
+Independent review accepted the change. Exact native Windows checks passed 135
+tests; the full application workflow passed its interface, launcher, storage,
+scale, release and packaged-operation checks. Injected worker and browser-process
+failures on test port 8796 produced fresh durable samples automatically after
+36.5 and 41.3 seconds, without restarting Veylurk or sending Resume/Login after
+either fault. Main/IRC continuity, failed-sample uniqueness, run boundaries and
+receipt provenance passed. All eight immutable history prefixes, saved encrypted
+credentials, 28 channel flags and original collection settings were preserved.
+Production port 8795 was unchanged. See the [plan and verified results](community-autorecovery.md).

@@ -10,7 +10,7 @@ Community schema version 3 adds the distinct persisted reason `cleanup_unconfirm
 
 The coordinator persists cleanup uncertainty before terminal attempt and run writes, including its retirement-deadline fallback and a pending terminal cancellation whose cleanup is unconfirmed. An existing authentication, integrity, challenge, rate-limit or generic source barrier keeps precedence: cleanup never replaces that first persisted source cause or its primary diagnostic. `persisted_pause_reason` identifies the durable barrier separately from transient `last_error`, `cleanup_confirmed` and cleanup diagnostics. If saving the barrier fails, the coordinator closes admission and returns the storage failure; it does not claim the pause was saved or launch a replacement browser.
 
-Disable, re-enable, sign-in and application restart do not clear the durable pause. Current-process unconfirmed cleanup blocks sign-in, Resume and new host creation under the existing cleanup checks. Restart restores the pause without fabricating current-process cleanup measurements, primary failures or termination times. After old process/profile ownership is verified clear, the owner must explicitly Resume through the existing retirement boundary. No automatic retry is introduced.
+Disable, re-enable, sign-in and application restart do not clear a protected durable pause. Unknown process ownership blocks replacement and is rechecked through retained process/Job handles. Only an authorized recovery generation may clear its own cleanup-uncertainty marker after exact containment is proved. Existing ambiguous cleanup markers and source denials remain protected; they require explicit owner recovery through the existing retirement boundary. Restart does not fabricate cleanup measurements, primary failures or termination times.
 
 The current Community diagnostic snapshot contains fixed failure and phase codes, structural readiness flags, browser identity, numeric exit and operation results, and elapsed cleanup time. It contains no account names, page text, URLs, cookies or credentials. These details are held in bounded memory and carried with the reserved terminal event. The primary failure and cleanup details are not saved across application restarts; the persisted pause remains separate. Browser cleanup performs no diagnostic file writes.
 
@@ -20,7 +20,7 @@ The service window is auxiliary. Its Close button hides it without cancelling an
 
 After receiving the terminal report, the coordinator queues only the typed termination snapshot in the existing fault journal as `community_host_termination`. No native-thread file write or additional writer is introduced. This event can become the latest diagnostic but never occupies the first storage failure. Existing record, queue, rotation and process limits still apply. An unexpected host terminal also ends an open Community run with `host_failure` at the observed coordinator boundary; explicit retirement keeps its own end reason. An older unrecorded stop cannot be reconstructed retrospectively.
 
-Browser cleanup requires a matching normal browser-exit notification and successful controller and observer cleanup. An event received before retirement is retained for the same browser identity. A shutdown requested during recycling uses that existing retirement rather than losing its identity. A page timeout may use the existing per-channel backoff after confirmed cleanup; an actual source denial or uncertain cleanup still requires explicit Resume. No player-readiness or source-authentication checks are relaxed.
+Normal browser cleanup requires a matching normal browser-exit notification and successful controller and observer cleanup. An event received before retirement is retained for the same browser identity. A shutdown requested during recycling uses that existing retirement rather than losing its identity. A page timeout may use the existing per-channel backoff after confirmed cleanup. Infrastructure crash recovery uses separate physical-containment evidence and never reports an abnormal exit as normal cleanup. Actual source denials remain protected. No player-readiness or source-authentication checks are relaxed.
 
 ## Isolated browser process
 
@@ -31,17 +31,32 @@ worker's process identity, numeric exit code, failure classification and separat
 `worker_tree_exited`/`containment_confirmed` fields. These describe physical
 process containment, not a normal WebView2 exit or source/authentication success.
 
-After abnormal worker exit, Community retains unconfirmed normal cleanup and its
-durable pause. It does not automatically restart or resample. The interface shows
-the contained failure separately from browser shutdown confirmation. Once all
-worker processes are confirmed exited, restart Veylurk and explicitly choose
-Resume. Source-denial barriers remain separate and are not silently cleared.
+After a worker crash or a recognized browser subprocess failure, Community retires
+the complete owned host. Exact worker exit plus an empty owned Job permits
+automatic replacement without restarting Veylurk or choosing Resume. The retry
+delay grows through 5, 10, 20, 40 and 60 seconds, capped at 60 seconds indefinitely;
+normal global and per-channel sampling deadlines still apply. A validated receipt
+must be durably saved before the failure streak resets.
+
+Uncertain physical cleanup is quarantined and rechecked at bounded intervals,
+without overlapping another browser. Source barriers already received by the
+parent survive diagnostics coalescing and worker failure. Authentication,
+integrity, challenge, rate-limit and other source denials block automatic
+replacement. Disable, owner Login and shutdown cancel delayed recovery.
+
+`worker_recovery` reports the recovery stage, attempt count, next retry and
+retained fault separately from the current `worker`. A recovered collector can
+therefore retain `cleanup_confirmed=false` for the crashed lifetime while its new
+worker has independent current diagnostics. A proved failure before a worker was
+created is labelled `not_created`; it does not invent an exit or containment
+measurement. A recognized embedded browser failure is labelled `browser_process`.
 
 The worker details are a bounded current-process snapshot and must be captured
 before restart if needed for investigation. The durable pause and existing host
 termination journal are separate; this change does not persist raw pipe data,
 accounts, profiles, credentials or full memory dumps. See the
-[native crash plan and results](native-worker-crash.md).
+[native crash plan and results](native-worker-crash.md) and the
+[automatic recovery contract and results](community-autorecovery.md).
 
 ## Storage fault journal
 
