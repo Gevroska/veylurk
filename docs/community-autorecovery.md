@@ -3,6 +3,11 @@
 Status: implemented and verified on the isolated test installation, November 2,
 2026. Production was not changed.
 
+This report covers the initial crash/browser-failure recovery revision. A later
+[cleanup-only retirement correction](community-cleanup-recovery.md) extends it to
+missing browser-exit notifications followed by exact physical containment. The
+original fault-injection results below remain scoped to their recorded revision.
+
 The owner requested automatic recovery after a Community worker crash without
 restarting Veylurk or selecting Resume. This supersedes the manual recovery policy
 of the initial [crash-containment revision](native-worker-crash.md). Production is

@@ -485,6 +485,19 @@ Production port 8795 was unchanged. See the [plan and verified results](communit
 The November 3 production inspection confirmed that Community was paused after
 a missing browser-exit notification, despite a later worker exit 0 and exact
 empty-Job confirmation. The crash/browser-failure recovery path did not classify
-this cleanup-only retirement. A correction is in progress in the test version
-only; production inspection and subsequent preservation checks are read-only.
-See the [diagnosis and acceptance plan](community-cleanup-recovery.md).
+this cleanup-only retirement. Corrected and verified in the test version at
+`73e078f8514d914fe650bdfeb8d2727ae3b006f0`: a fresh parent-authored cleanup failure
+enters bounded retirement/quarantine and automatic retry only after exact physical
+containment. Existing source/legacy pauses and owner cancellation remain protected;
+normal cleanup is never fabricated from worker exit 0.
+
+Independent review accepted the change. The exact native workflow passed 139
+tests and the complete application workflow passed, including 279 principal
+library tests, storage recovery, all three scale workloads and release packaging.
+Four fresh signed-in OuaisEddy samples were saved with valid network provenance
+after the owner's normal recovery from a separate Twitch integrity denial. The
+target missing-callback failure is covered by deterministic native/process and
+coordinator regressions; the live browser was not forced into that condition.
+Eight immutable history prefixes, credentials and original test flags/cadence were
+preserved. Production remained unchanged and paused. See the
+[diagnosis and verified results](community-cleanup-recovery.md).

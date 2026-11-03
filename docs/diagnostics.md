@@ -31,8 +31,9 @@ worker's process identity, numeric exit code, failure classification and separat
 `worker_tree_exited`/`containment_confirmed` fields. These describe physical
 process containment, not a normal WebView2 exit or source/authentication success.
 
-After a worker crash or a recognized browser subprocess failure, Community retires
-the complete owned host. Exact worker exit plus an empty owned Job permits
+After a worker crash, a recognized browser subprocess failure or a fresh failed
+native cleanup retirement, Community retires the complete owned host. Exact
+worker exit plus an empty owned Job permits
 automatic replacement without restarting Veylurk or choosing Resume. The retry
 delay grows through 5, 10, 20, 40 and 60 seconds, capped at 60 seconds indefinitely;
 normal global and per-channel sampling deadlines still apply. A validated receipt
@@ -46,10 +47,16 @@ replacement. Disable, owner Login and shutdown cancel delayed recovery.
 
 `worker_recovery` reports the recovery stage, attempt count, next retry and
 retained fault separately from the current `worker`. A recovered collector can
-therefore retain `cleanup_confirmed=false` for the crashed lifetime while its new
+therefore retain `cleanup_confirmed=false` for the failed lifetime while its new
 worker has independent current diagnostics. A proved failure before a worker was
 created is labelled `not_created`; it does not invent an exit or containment
 measurement. A recognized embedded browser failure is labelled `browser_process`.
+A fresh cleanup-only retirement is labelled `cleanup_unconfirmed`, even if its
+worker exits with code 0. It does not imply a browser crash or a normal-exit
+notification. Classification requires an explicit live cleanup status/completion,
+or an unconfirmed terminal carrying its own cleanup-failure stop reason; a stale
+cleanup snapshot in progress alone cannot trigger recovery. Existing persisted
+cleanup pauses remain protected. See the [cleanup-only correction](community-cleanup-recovery.md).
 
 The worker details are a bounded current-process snapshot and must be captured
 before restart if needed for investigation. The durable pause and existing host
