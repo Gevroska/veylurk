@@ -13,7 +13,7 @@ fn read(input: &mut impl Read) -> Option<Value> {
     input.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
 }
-fn write(output: &mut impl Write, value: &Value) {
+fn write(output: &mut (impl Write + ?Sized), value: &Value) {
     let body = serde_json::to_vec(value).unwrap();
     output
         .write_all(&(body.len() as u32).to_le_bytes())
@@ -127,6 +127,79 @@ fn cleanup_after_success(output: &mut impl Write, mode: &str) {
             output,
             &json!({"kind":"Paused","code":"browser_process_failed"}),
         );
+    }
+    write(
+        output,
+        &json!({"kind":"Stopped","cleanup_confirmed":false,"diagnostics":report}),
+    );
+}
+
+fn cleanup_only_frames(output: &mut impl Write, mode: &str) {
+    let source = [
+        "authentication_denied",
+        "integrity_denied",
+        "challenge_denied",
+        "rate_limited",
+        "source_errors",
+    ]
+    .into_iter()
+    .find(|code| mode.contains(code));
+    let source_barrier = |output: &mut dyn Write| {
+        if let Some(code) = source {
+            // A generic pausing barrier is intentionally sent without a primary
+            // diagnostic and may be dropped from the bounded status queue.
+            write(output, &json!({"kind":"Paused","code":code}));
+        }
+    };
+    if mode.contains("before") {
+        source_barrier(output);
+    }
+    let mut report = fault_diagnostics(None);
+    report["cleanup_diagnostics"] = json!({
+        "no_browser_cleanup_required":false,"controller_epoch":7,
+        "expected_browser_pid":100,"observed_exit_pid":null,"observed_exit_kind":null,
+        "normal_exit_observed":false,"close_hresult":0,"first_detach_failure":null,
+        "unsubscribe_hresult":0,"elapsed_ms":5050,"confirmed":false
+    });
+    report["host_termination"] = json!({
+        "reason":"cleanup_unconfirmed","observed_at_unix_ms":12,"controller_epoch":7,"job_id":null
+    });
+    for operation in ["close", "detach", "unsubscribe"] {
+        if mode.contains(operation) {
+            let cleanup = &mut report["cleanup_diagnostics"];
+            cleanup["observed_exit_pid"] = json!(100);
+            cleanup["observed_exit_kind"] = json!(0);
+            cleanup["normal_exit_observed"] = json!(true);
+            match operation {
+                "close" => cleanup["close_hresult"] = json!(-7),
+                "detach" => {
+                    cleanup["first_detach_failure"] =
+                        json!({"operation":"network_disable_failed","hresult":-8});
+                }
+                _ => cleanup["unsubscribe_hresult"] = json!(-9),
+            }
+        }
+    }
+    if !mode.contains("terminal_only") {
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":1,"diagnostics":report}),
+        );
+        write(
+            output,
+            &json!({"kind":"Paused","code":"controller_cleanup_unconfirmed"}),
+        );
+        write(
+            output,
+            &json!({"kind":"Pulse","native_progress":2,"diagnostics":fault_diagnostics(None)}),
+        );
+    }
+    if mode.contains("after") {
+        source_barrier(output);
+    }
+    if mode.contains("hang") {
+        std::thread::sleep(Duration::from_secs(30));
+        return;
     }
     write(
         output,
@@ -328,6 +401,10 @@ fn main() {
                 if mode.starts_with("success_then_failed_cleanup")
                     || mode.starts_with("success_then_cleanup_")
                 {
+                    if mode.starts_with("success_then_cleanup_only_") {
+                        cleanup_only_frames(&mut output, &mode);
+                        return;
+                    }
                     cleanup_after_success(&mut output, &mode);
                     return;
                 }
@@ -345,6 +422,17 @@ fn main() {
                     &mut output,
                     &json!({"kind":"Stopped","cleanup_confirmed":true,"diagnostics":fault_diagnostics(None)}),
                 );
+                return;
+            }
+            "Sample" if mode == "cleanup_completed_exit0" => {
+                write(
+                    &mut output,
+                    &json!({"kind":"Completed","ticket":frame["ticket"],
+                    "job_id":frame["job_id"],"channel":frame["channel"],"outcome":{
+                        "kind":"Failure","code":"cleanup_unconfirmed","pauses_community":false
+                    }}),
+                );
+                cleanup_only_frames(&mut output, "terminal_only");
                 return;
             }
             "Sample" if mode == "wrong_ticket" => {

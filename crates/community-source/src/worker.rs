@@ -303,6 +303,7 @@ const FIXED_STRINGS: &[&str] = &[
     "challenge",
     "challenge_denied",
     "chatbots",
+    "cleanup_unconfirmed",
     "circuits_completed_with_gaps",
     "circuits_completed_with_samples",
     "circuits_must_be_1_to_3",

@@ -207,6 +207,273 @@ fn browser_fault(contained: bool) -> FaultReport {
     report
 }
 
+fn cleanup_only_fault(contained: bool) -> FaultReport {
+    let mut report = worker_fault(contained);
+    let worker = report.worker.as_mut().unwrap();
+    worker.failure = Some(community_source::host::WorkerFailure::CleanupUnconfirmed);
+    worker.exit_code = contained.then_some(0);
+    report.cleanup_diagnostics = Some(CleanupDiagnostics {
+        controller_epoch: 7,
+        expected_browser_pid: Some(100),
+        close_hresult: Some(0),
+        unsubscribe_hresult: Some(0),
+        elapsed_ms: 5050,
+        ..Default::default()
+    });
+    report.host_termination = Some(community_source::host::HostTermination {
+        reason: community_source::host::HostTerminationReason::CleanupUnconfirmed,
+        observed_at_unix_ms: 12,
+        controller_epoch: 7,
+        job_id: Some(1),
+    });
+    report
+}
+
+#[tokio::test]
+async fn cleanup_only_retirement_recovers_after_exact_containment_and_preserves_success_and_fences()
+{
+    for delivery in [
+        "status_first",
+        "diagnostic_first",
+        "terminal_only",
+        "pending_failure",
+    ] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        runner.next_start = Instant::now() + START_GAP;
+        if delivery != "pending_failure" {
+            runner
+                .event(HostEvent::SampleCompleted {
+                    job_id: 1,
+                    channel: "example".into(),
+                    outcome: Ok(source_sample()),
+                })
+                .await
+                .unwrap();
+        }
+        if delivery == "status_first" {
+            runner
+                .pause_event("controller_cleanup_unconfirmed")
+                .await
+                .unwrap();
+        }
+        if delivery != "terminal_only" {
+            runner
+                .record_fault(cleanup_only_fault(false))
+                .await
+                .unwrap();
+            if delivery == "diagnostic_first" {
+                runner
+                    .pause_event("controller_cleanup_unconfirmed")
+                    .await
+                    .unwrap();
+            }
+            assert!(runner.recovery_retry_at.is_none());
+            assert_eq!(runner.quarantine_ticket, Some(runner.host_generation));
+            assert_eq!(
+                store.community_pause().await.unwrap(),
+                Some(CommunityPauseReason::CleanupUnconfirmed)
+            );
+            runner.step().await.unwrap();
+            assert_eq!(runner.host_start_attempts, 0);
+        }
+        if delivery == "pending_failure" {
+            runner
+                .event(HostEvent::SampleCompleted {
+                    job_id: 1,
+                    channel: "example".into(),
+                    outcome: Err(community_source::host::SourceFailure {
+                        code: "cleanup_unconfirmed",
+                        pauses_community: true,
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+        let global_fence = runner.next_start;
+        let channel_fence = runner.schedule["example"].retry_not_before;
+        tokio::time::pause();
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: cleanup_only_fault(true),
+            })
+            .await
+            .unwrap();
+        assert!(!runner.paused && runner.replacement_safe);
+        assert_eq!(
+            runner.recovery_retry_at.unwrap() - Instant::now(),
+            Duration::from_secs(5)
+        );
+        assert!(runner.pending.is_none() && runner.run_id.is_none());
+        assert_eq!(runner.next_start, global_fence);
+        assert_eq!(runner.schedule["example"].retry_not_before, channel_fence);
+        runner.step().await.unwrap();
+        assert_eq!(runner.host_start_attempts, 0);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        runner.step().await.unwrap();
+        assert_eq!(runner.host_start_attempts, 1);
+        tokio::time::resume();
+        assert_eq!(store.community_pause().await.unwrap(), None);
+        let stats = store.community_stats().await.unwrap();
+        assert_eq!(
+            (
+                stats.successful_count,
+                stats.failed_count,
+                stats.pending_count
+            ),
+            if delivery == "pending_failure" {
+                (0, 1, 0)
+            } else {
+                (1, 0, 0)
+            }
+        );
+        let reason: String = store
+            .call_read(crate::diagnostics::Operation::Query, |conn| {
+                Ok(conn.query_row(
+                    "SELECT end_reason FROM community_runs WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(reason, "host_failure");
+        let status = runner.service.status.read().await;
+        assert_eq!(status.cleanup_confirmed, Some(false));
+        assert!(status.primary_failure.is_none());
+        let cleanup = status.cleanup_diagnostics.as_ref().unwrap();
+        assert!(!cleanup.confirmed && !cleanup.browser_process_failed());
+        assert!(cleanup.observed_exit_pid.is_none() && cleanup.observed_exit_kind.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cleanup_only_retirement_never_clears_received_source_or_legacy_pause() {
+    for code in [
+        "authentication_denied",
+        "integrity_denied",
+        "challenge_denied",
+        "rate_limited",
+        "source_errors",
+    ] {
+        for order in ["before", "after"] {
+            let (_directory, store, mut runner) = pending_fixture().await;
+            runner.settings.enabled = true;
+            if order == "before" {
+                runner.pause_source(code).await.unwrap();
+            }
+            runner
+                .record_fault(cleanup_only_fault(false))
+                .await
+                .unwrap();
+            if order == "after" {
+                runner
+                    .record_fault(FaultReport {
+                        source_barrier: Some(community_source::host::SourceBarrier { code }),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+            let barrier = store.community_pause().await.unwrap().unwrap();
+            runner
+                .event(HostEvent::Stopped {
+                    cleanup_confirmed: false,
+                    diagnostics: cleanup_only_fault(true),
+                })
+                .await
+                .unwrap();
+            assert!(
+                runner.paused
+                    && runner.recovery_retry_at.is_none()
+                    && runner.quarantine_ticket.is_none()
+            );
+            assert_eq!(store.community_pause().await.unwrap(), Some(barrier));
+            assert_ne!(barrier, CommunityPauseReason::CleanupUnconfirmed);
+            assert_eq!(store.community_stats().await.unwrap().failed_count, 1);
+        }
+    }
+    for legacy in [
+        CommunityPauseReason::CleanupUnconfirmed,
+        CommunityPauseReason::SourceDenied,
+    ] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        runner.paused = true;
+        runner.persisted_pause = Some(legacy);
+        store.set_community_pause(Some(legacy)).await.unwrap();
+        runner
+            .record_fault(cleanup_only_fault(false))
+            .await
+            .unwrap();
+        runner
+            .pause_event("controller_cleanup_unconfirmed")
+            .await
+            .unwrap();
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: cleanup_only_fault(true),
+            })
+            .await
+            .unwrap();
+        assert!(
+            runner.paused
+                && runner.recovery_retry_at.is_none()
+                && runner.quarantine_ticket.is_none()
+        );
+        assert_eq!(store.community_pause().await.unwrap(), Some(legacy));
+    }
+}
+
+#[tokio::test]
+async fn owner_controls_cancel_cleanup_only_recovery_before_late_physical_proof() {
+    for command in ["disable", "login", "shutdown"] {
+        let (_directory, store, mut runner) = pending_fixture().await;
+        runner.settings.enabled = true;
+        runner
+            .record_fault(cleanup_only_fault(false))
+            .await
+            .unwrap();
+        match command {
+            "disable" => {
+                runner
+                    .control(Command::Settings(CommunitySettingsUpdate {
+                        enabled: false,
+                        target_interval_seconds: 300,
+                        cadence_mode: None,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            "login" => {
+                runner.control(Command::Login).await.unwrap();
+            }
+            _ => {
+                let (_, shutdown) = watch::channel(true);
+                runner.shutdown = Some(shutdown);
+                runner.step().await.unwrap();
+            }
+        }
+        let starts = runner.host_start_attempts;
+        runner
+            .event(HostEvent::Stopped {
+                cleanup_confirmed: false,
+                diagnostics: cleanup_only_fault(true),
+            })
+            .await
+            .unwrap();
+        runner.step().await.unwrap();
+        assert!(runner.quarantine_ticket.is_none() && runner.recovery_retry_at.is_none());
+        assert_eq!(runner.host_start_attempts, starts);
+        assert_eq!(
+            store.community_pause().await.unwrap(),
+            Some(CommunityPauseReason::CleanupUnconfirmed)
+        );
+    }
+}
+
 #[tokio::test]
 async fn positive_receipt_then_a_known_failed_browser_exit_keeps_coverage_and_source_barriers_honest(
 ) {
@@ -1575,6 +1842,18 @@ async fn cleanup_codes_and_terminal_cancellation_are_never_source_denials() {
             })
             .await
             .unwrap();
+        if code != "operator_cancelled" {
+            // A live cleanup status carries infrastructure intent, but cannot
+            // grant recovery without this parent's exact containment evidence.
+            assert_eq!(store.community_pause().await.unwrap(), None);
+            runner
+                .event(HostEvent::Stopped {
+                    cleanup_confirmed: false,
+                    diagnostics: FaultReport::default(),
+                })
+                .await
+                .unwrap();
+        }
         assert_eq!(
             store.community_pause().await.unwrap(),
             Some(CommunityPauseReason::CleanupUnconfirmed),

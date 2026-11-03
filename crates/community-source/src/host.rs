@@ -181,6 +181,8 @@ pub fn is_worker_failure(code: &str) -> bool {
     matches!(
         code,
         "worker_failed"
+            | "cleanup_unconfirmed"
+            | "controller_cleanup_unconfirmed"
             | "browser_process_failed"
             | "worker_start_failed"
             | "worker_protocol_failure"
@@ -232,6 +234,9 @@ pub enum WorkerFailure {
     /// A validated native ProcessFailed observation requires whole-host
     /// retirement before this browser profile may be used again.
     BrowserProcess,
+    /// A fresh native retirement explicitly failed its cleanup contract. This
+    /// parent-authored cause does not imply a BrowserProcessExited observation.
+    CleanupUnconfirmed,
     Start,
     UnexpectedExit,
     Protocol,
@@ -545,6 +550,17 @@ impl Control {
         }
         if report.worker.is_none() {
             report.worker = admission.diagnostics.worker.clone();
+        }
+        if report.cleanup_diagnostics.is_none()
+            && admission
+                .diagnostics
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.failure == Some(WorkerFailure::CleanupUnconfirmed))
+        {
+            // A parent-classified retirement has ended this worker's admission.
+            // Empty progress frames cannot erase its numeric cleanup evidence.
+            report.cleanup_diagnostics = admission.diagnostics.cleanup_diagnostics.clone();
         }
         admission.diagnostics = report;
     }

@@ -719,7 +719,7 @@ test("Community shows automatic crash recovery without requesting manual restart
   text = app.get("community-status").textContent;
   assert.match(text, /Automatic recovery completed; Community collection resumed/);
   assert.match(text, /Consecutive browser failures0/);
-  assert.match(text, /Previous browser shutdownNot confirmed after the abnormal exit/);
+  assert.match(text, /Previous browser shutdownNot confirmed for the previous worker/);
   assert.equal(app.calls.some((call) => call.target.pathname === "/api/community/resume"), false);
 });
 
@@ -754,6 +754,20 @@ test("Community explains an embedded browser failure with automatic host recover
   assert.match(text, /An embedded browser process failed/);
   assert.match(text, /Automatic browser restart scheduled/);
   assert.doesNotMatch(text, /Restart Veylurk|choose Resume/);
+});
+
+test("Community recovers unconfirmed cleanup without inventing an abnormal exit", async () => {
+  const failure = { failure: "cleanup_unconfirmed", process_id: 41, exit_code: 0, containment_confirmed: true, worker_tree_exited: true };
+  const status = communityState({ worker: failure, cleanup_confirmed: false,
+    worker_recovery: { state: "backoff", attempts: 1, cleanup_confirmed: false, last_fault: { worker: failure } } });
+  const app = createApp((target) => target.pathname === "/api/community/status" ? status : undefined);
+  await settle();
+  const text = app.get("community-status").textContent;
+  assert.match(text, /previous browser shutdown could not be confirmed/);
+  assert.match(text, /Previous browser shutdownNot confirmed for the previous worker/);
+  assert.match(text, /Browser exit code0x00000000/);
+  assert.match(text, /Automatic browser restart scheduled/);
+  assert.doesNotMatch(text, /abnormal exit|exited unexpectedly|Restart Veylurk|choose Resume/);
 });
 
 test("Community explains a proved pre-process launch failure without inventing a browser shutdown", async () => {

@@ -479,3 +479,12 @@ either fault. Main/IRC continuity, failed-sample uniqueness, run boundaries and
 receipt provenance passed. All eight immutable history prefixes, saved encrypted
 credentials, 28 channel flags and original collection settings were preserved.
 Production port 8795 was unchanged. See the [plan and verified results](community-autorecovery.md).
+
+## Cleanup-only retirement recovery
+
+The November 3 production inspection confirmed that Community was paused after
+a missing browser-exit notification, despite a later worker exit 0 and exact
+empty-Job confirmation. The crash/browser-failure recovery path did not classify
+this cleanup-only retirement. A correction is in progress in the test version
+only; production inspection and subsequent preservation checks are read-only.
+See the [diagnosis and acceptance plan](community-cleanup-recovery.md).

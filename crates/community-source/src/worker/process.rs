@@ -426,22 +426,23 @@ fn supervise_owned(
     let mut shutdown_started = None;
     let mut last_progress = (0, Instant::now());
     let mut process_exited_at = None;
-    let mut browser_process_failed = false;
+    let mut native_failure = None;
     while failure.is_none() {
         // FIFO pipe delivery is consumed before examining process exit. A full
         // valid receipt remains completed even if the worker then crashes.
         match inbound.recv_timeout(POLL) {
             Ok(Inbound::Frame(frame)) => {
-                match accept_frame(&bridge, frame, &mut last_progress, &mut terminal) {
-                    Ok(observed_browser_failure) => {
-                        if observed_browser_failure && !browser_process_failed {
-                            browser_process_failed = true;
+                match accept_frame(
+                    &bridge,
+                    frame,
+                    &mut last_progress,
+                    &mut terminal,
+                    &mut worker_diagnostics,
+                ) {
+                    Ok(observed_failure) => {
+                        if let Some(observed_failure) = observed_failure {
+                            native_failure = Some(observed_failure);
                             shutdown_started.get_or_insert_with(Instant::now);
-                            worker_diagnostics.failure = Some(WorkerFailure::BrowserProcess);
-                            control.stop_accepting();
-                            let mut report = control.fault_report();
-                            report.worker = Some(worker_diagnostics.clone());
-                            control.record_fault(report);
                         }
                     }
                     Err(()) => {
@@ -517,7 +518,7 @@ fn supervise_owned(
                 continue;
             }
         }
-        if terminal.is_some() || shutdown || browser_process_failed {
+        if terminal.is_some() || shutdown || native_failure.is_some() {
             continue;
         }
         if pending_command.is_none() {
@@ -578,11 +579,7 @@ fn supervise_owned(
     if failure.is_none() && exit_code != Some(0) {
         failure = Some(WorkerFailure::UnexpectedExit);
     }
-    worker_diagnostics.failure = if browser_process_failed {
-        Some(WorkerFailure::BrowserProcess)
-    } else {
-        failure
-    };
+    worker_diagnostics.failure = native_failure.or(failure);
     failure = worker_diagnostics.failure;
     if !contained && !control.shutdown.load(Ordering::Acquire) {
         // Keep the exact Job and process handles while cleanup is unknown.
@@ -649,8 +646,9 @@ fn accept_frame(
     frame: WorkerFrame,
     progress: &mut (u64, Instant),
     terminal: &mut Option<(bool, FaultReport)>,
-) -> Result<bool, ()> {
-    let mut browser_process_failed = false;
+    worker: &mut WorkerDiagnostics,
+) -> Result<Option<WorkerFailure>, ()> {
+    let mut observed_failure = None;
     match frame {
         WorkerFrame::Pulse {
             native_progress,
@@ -663,20 +661,21 @@ fn accept_frame(
                 *progress = (native_progress, Instant::now());
             }
             // Only this supervisor owns process identity and containment proof.
-            browser_process_failed = reported_browser_failure(&diagnostics);
-            if browser_process_failed {
-                bridge.control.stop_accepting();
-            }
+            observed_failure =
+                reported_browser_failure(&diagnostics).then_some(WorkerFailure::BrowserProcess);
             diagnostics.worker = None;
             bridge.control.record_fault(diagnostics);
+            if let Some(failure) = observed_failure {
+                observe_native_failure(bridge, worker, failure);
+            }
         }
         WorkerFrame::Ready if terminal.is_none() => bridge.emit(Status::Ready),
         WorkerFrame::LoginShown if terminal.is_none() => bridge.emit(Status::LoginShown),
         WorkerFrame::LoginFailed if terminal.is_none() => bridge.emit(Status::LoginFailed),
         WorkerFrame::Paused { code } if terminal.is_none() => {
-            browser_process_failed = code == "browser_process_failed";
-            if browser_process_failed {
-                bridge.control.stop_accepting();
+            observed_failure = native_failure_code(code);
+            if let Some(failure) = observed_failure {
+                observe_native_failure(bridge, worker, failure);
             }
             bridge.emit(Status::Paused { code });
         }
@@ -693,12 +692,12 @@ fn accept_frame(
                 return Err(());
             }
             let outcome = outcome.into_source().map_err(|_| ())?;
-            browser_process_failed = outcome
+            observed_failure = outcome
                 .as_ref()
                 .err()
-                .is_some_and(|failure| failure.code == "browser_process_failed");
-            if browser_process_failed {
-                bridge.control.stop_accepting();
+                .and_then(|failure| native_failure_code(failure.code));
+            if let Some(failure) = observed_failure {
+                observe_native_failure(bridge, worker, failure);
             }
             if !bridge.control.complete(ticket, outcome) {
                 return Err(());
@@ -709,16 +708,56 @@ fn accept_frame(
             mut diagnostics,
         } if terminal.is_none() => {
             bridge.control.stop_accepting();
-            browser_process_failed = reported_browser_failure(&diagnostics);
+            observed_failure = if reported_browser_failure(&diagnostics) {
+                Some(WorkerFailure::BrowserProcess)
+            } else if !cleanup_confirmed
+                && diagnostics
+                    .host_termination
+                    .as_ref()
+                    .is_some_and(|termination| {
+                        termination.reason == HostTerminationReason::CleanupUnconfirmed
+                    })
+            {
+                Some(WorkerFailure::CleanupUnconfirmed)
+            } else {
+                None
+            };
             diagnostics.worker = None;
             // Preserve a completely received final source/cleanup snapshot even
             // if the worker then crashes in its remaining native teardown.
             bridge.control.record_fault(diagnostics.clone());
+            if let Some(failure) = observed_failure {
+                observe_native_failure(bridge, worker, failure);
+            }
             *terminal = Some((cleanup_confirmed, diagnostics));
         }
         _ => return Err(()),
     }
-    Ok(browser_process_failed)
+    // Browser-process proof takes precedence over a later generic cleanup code.
+    Ok(observed_failure.map(|_| worker.failure.unwrap()))
+}
+
+fn native_failure_code(code: &str) -> Option<WorkerFailure> {
+    match code {
+        "browser_process_failed" => Some(WorkerFailure::BrowserProcess),
+        "cleanup_unconfirmed" | "controller_cleanup_unconfirmed" => {
+            Some(WorkerFailure::CleanupUnconfirmed)
+        }
+        _ => None,
+    }
+}
+
+fn observe_native_failure(bridge: &Bridge, worker: &mut WorkerDiagnostics, failure: WorkerFailure) {
+    bridge.control.stop_accepting();
+    if worker.failure != Some(WorkerFailure::BrowserProcess) {
+        worker.failure = Some(failure);
+    }
+    // Publish the parent-authored retirement cause before forwarding Paused or
+    // Completed. Neither child diagnostics nor a stale cleanup pulse can grant
+    // process identity, containment, or automatic replacement.
+    let mut report = bridge.control.fault_report();
+    report.worker = Some(worker.clone());
+    bridge.control.record_fault(report);
 }
 
 fn reported_browser_failure(report: &FaultReport) -> bool {
@@ -740,6 +779,7 @@ fn publish_worker_failure(bridge: &Bridge, diagnostics: WorkerDiagnostics, termi
     let code = match diagnostics.failure {
         Some(WorkerFailure::Start | WorkerFailure::NotCreated) => "worker_start_failed",
         Some(WorkerFailure::BrowserProcess) => "browser_process_failed",
+        Some(WorkerFailure::CleanupUnconfirmed) => "cleanup_unconfirmed",
         Some(WorkerFailure::Protocol) => "worker_protocol_failure",
         Some(WorkerFailure::Stalled) => "worker_stalled",
         Some(WorkerFailure::ShutdownTimeout) => "worker_shutdown_timeout",
@@ -1088,7 +1128,11 @@ mod tests {
 
     #[test]
     fn temporarily_unknown_containment_keeps_exact_handles_and_completes_only_once() {
-        for failure in [WorkerFailure::UnexpectedExit, WorkerFailure::BrowserProcess] {
+        for failure in [
+            WorkerFailure::UnexpectedExit,
+            WorkerFailure::BrowserProcess,
+            WorkerFailure::CleanupUnconfirmed,
+        ] {
             let (handle, bridge) = HostHandle::channel();
             handle.try_sample(46, "room").unwrap();
             let mut worker = fixture("unexpected_exit");
@@ -1135,7 +1179,11 @@ mod tests {
 
     #[test]
     fn shutdown_cancels_quarantine_without_fabricating_late_containment() {
-        for failure in [WorkerFailure::UnexpectedExit, WorkerFailure::BrowserProcess] {
+        for failure in [
+            WorkerFailure::UnexpectedExit,
+            WorkerFailure::BrowserProcess,
+            WorkerFailure::CleanupUnconfirmed,
+        ] {
             let (handle, bridge) = HostHandle::channel();
             let mut worker = fixture("unexpected_exit");
             let mut diagnostics = WorkerDiagnostics {
@@ -1385,6 +1433,242 @@ mod tests {
             assert_eq!(worker.exit_code, Some(0));
             assert!(worker.worker_tree_exited && worker.containment_confirmed);
             assert!(handle.try_event().is_err());
+        }
+    }
+
+    #[test]
+    fn successful_receipt_then_fresh_cleanup_failure_keeps_exit_zero_and_missing_exit_evidence() {
+        for suffix in [
+            "paused_exit0",
+            "terminal_only_exit0",
+            "close_exit0",
+            "detach_exit0",
+            "unsubscribe_exit0",
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            handle.try_sample(60, "room").unwrap();
+            for _ in 0..16 {
+                bridge.emit(Status::Ready);
+            }
+            let mode = format!("success_then_cleanup_only_{suffix}");
+            supervise_owned(options(), bridge, Ok(fixture(&mode)));
+            assert!(matches!(
+                handle.try_event(),
+                Ok(HostEvent::SampleCompleted {
+                    job_id: 60,
+                    outcome: Ok(_),
+                    ..
+                })
+            ));
+            let (cleanup, report) = terminal(&handle);
+            assert!(!cleanup, "{suffix}");
+            assert!(report.primary_failure.is_none() && report.source_barrier.is_none());
+            let cleanup = report.cleanup_diagnostics.unwrap();
+            assert!(!cleanup.confirmed && !cleanup.browser_process_failed());
+            assert_eq!(cleanup.expected_browser_pid, Some(100));
+            assert_eq!(cleanup.elapsed_ms, 5050);
+            if !cleanup.normal_exit_observed {
+                assert!(
+                    cleanup.observed_exit_pid.is_none() && cleanup.observed_exit_kind.is_none()
+                );
+                assert_eq!(
+                    (cleanup.close_hresult, cleanup.unsubscribe_hresult),
+                    (Some(0), Some(0))
+                );
+                assert!(cleanup.first_detach_failure.is_none());
+            }
+            let worker = report.worker.unwrap();
+            assert_eq!(
+                worker.failure,
+                Some(WorkerFailure::CleanupUnconfirmed),
+                "{suffix}"
+            );
+            assert_eq!(worker.exit_code, Some(0));
+            assert!(worker.worker_tree_exited && worker.containment_confirmed);
+            assert!(handle.try_event().is_err());
+        }
+    }
+
+    #[test]
+    fn every_received_source_barrier_survives_cleanup_ordering_and_a_full_status_queue() {
+        for code in [
+            "authentication_denied",
+            "integrity_denied",
+            "challenge_denied",
+            "rate_limited",
+            "source_errors",
+        ] {
+            for order in ["before", "after"] {
+                let (handle, bridge) = HostHandle::channel();
+                handle.try_sample(61, "room").unwrap();
+                for _ in 0..16 {
+                    bridge.emit(Status::Ready);
+                }
+                let mode = format!("success_then_cleanup_only_{code}_{order}_exit0");
+                supervise_owned(options(), bridge, Ok(fixture(&mode)));
+                assert!(matches!(
+                    handle.try_event(),
+                    Ok(HostEvent::SampleCompleted {
+                        job_id: 61,
+                        outcome: Ok(_),
+                        ..
+                    })
+                ));
+                let (cleanup, report) = terminal(&handle);
+                assert!(!cleanup);
+                assert_eq!(report.source_barrier.unwrap().code, code, "{order}");
+                assert_eq!(
+                    report.worker.unwrap().failure,
+                    Some(WorkerFailure::CleanupUnconfirmed)
+                );
+                assert!(handle.try_event().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_completion_and_bounded_stuck_retirement_publish_parent_failure_before_terminal() {
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(62, "room").unwrap();
+        supervise_owned(options(), bridge, Ok(fixture("cleanup_completed_exit0")));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                job_id: 62,
+                outcome: Err(SourceFailure {
+                    code: "cleanup_unconfirmed",
+                    pauses_community: false
+                }),
+                ..
+            })
+        ));
+        let (_, report) = terminal(&handle);
+        assert_eq!(
+            report.worker.unwrap().failure,
+            Some(WorkerFailure::CleanupUnconfirmed)
+        );
+        assert!(handle.try_event().is_err());
+
+        let (handle, bridge) = HostHandle::channel();
+        handle.try_sample(63, "room").unwrap();
+        let started = Instant::now();
+        let supervisor = std::thread::spawn(move || {
+            supervise_owned(
+                options(),
+                bridge,
+                Ok(fixture("success_then_cleanup_only_hang")),
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let report = handle.fault_report();
+            if report
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.failure == Some(WorkerFailure::CleanupUnconfirmed))
+            {
+                assert!(!report.worker.as_ref().unwrap().containment_confirmed);
+                assert!(report.worker.as_ref().unwrap().exit_code.is_none());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cleanup failure was not published before terminal"
+            );
+            std::thread::sleep(POLL);
+        }
+        supervisor.join().unwrap();
+        assert!(started.elapsed() < SHUTDOWN_LIMIT + TREE_EXIT_LIMIT + Duration::from_secs(3));
+        assert!(matches!(
+            handle.try_event(),
+            Ok(HostEvent::SampleCompleted {
+                job_id: 63,
+                outcome: Ok(_),
+                ..
+            })
+        ));
+        let (cleanup, report) = terminal(&handle);
+        assert!(!cleanup);
+        let diagnostic = report.cleanup_diagnostics.unwrap();
+        assert_eq!(
+            diagnostic.elapsed_ms, 5050,
+            "empty progress must not erase cleanup evidence"
+        );
+        assert!(diagnostic.observed_exit_pid.is_none() && diagnostic.observed_exit_kind.is_none());
+        let worker = report.worker.unwrap();
+        assert_eq!(worker.failure, Some(WorkerFailure::CleanupUnconfirmed));
+        assert!(worker.worker_tree_exited && worker.containment_confirmed);
+        assert!(handle.try_event().is_err());
+    }
+
+    #[test]
+    fn stale_cleanup_progress_and_unrelated_false_terminal_do_not_create_a_retirement_failure() {
+        for reason in [
+            None,
+            Some(HostTerminationReason::ShutdownRequested),
+            Some(HostTerminationReason::NativeHostInterrupted),
+        ] {
+            let (handle, bridge) = HostHandle::channel();
+            let mut progress = (0, Instant::now());
+            let mut terminal = None;
+            let mut worker = WorkerDiagnostics {
+                process_id: Some(100),
+                started_at_unix_ms: Some(10),
+                ..Default::default()
+            };
+            let stale = FaultReport {
+                cleanup_diagnostics: Some(crate::host::CleanupDiagnostics {
+                    expected_browser_pid: Some(200),
+                    elapsed_ms: 5050,
+                    ..Default::default()
+                }),
+                host_termination: Some(crate::host::HostTermination {
+                    reason: HostTerminationReason::CleanupUnconfirmed,
+                    observed_at_unix_ms: 1,
+                    controller_epoch: 1,
+                    job_id: None,
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                accept_frame(
+                    &bridge,
+                    WorkerFrame::Pulse {
+                        native_progress: 1,
+                        diagnostics: stale
+                    },
+                    &mut progress,
+                    &mut terminal,
+                    &mut worker
+                )
+                .unwrap(),
+                None
+            );
+            let report = FaultReport {
+                host_termination: reason.map(|reason| crate::host::HostTermination {
+                    reason,
+                    observed_at_unix_ms: 2,
+                    controller_epoch: 2,
+                    job_id: None,
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                accept_frame(
+                    &bridge,
+                    WorkerFrame::Stopped {
+                        cleanup_confirmed: false,
+                        diagnostics: report
+                    },
+                    &mut progress,
+                    &mut terminal,
+                    &mut worker
+                )
+                .unwrap(),
+                None
+            );
+            assert!(worker.failure.is_none());
+            assert!(handle.fault_report().worker.is_none());
         }
     }
 
@@ -1733,6 +2017,7 @@ mod tests {
         let (handle, bridge) = HostHandle::channel();
         let mut progress = (0, Instant::now());
         let mut terminal = None;
+        let mut worker = WorkerDiagnostics::default();
         let final_report = FaultReport {
             cleanup_diagnostics: Some(crate::host::CleanupDiagnostics {
                 close_hresult: Some(-7),
@@ -1747,7 +2032,8 @@ mod tests {
                 diagnostics: final_report
             },
             &mut progress,
-            &mut terminal
+            &mut terminal,
+            &mut worker
         )
         .is_ok());
         assert!(accept_frame(
@@ -1757,7 +2043,8 @@ mod tests {
                 diagnostics: FaultReport::default()
             },
             &mut progress,
-            &mut terminal
+            &mut terminal,
+            &mut worker
         )
         .is_err());
         assert_eq!(

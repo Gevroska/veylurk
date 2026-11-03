@@ -753,6 +753,7 @@
         not_created: "The browser process could not start; no process was created.",
         unexpected_exit: "The browser process exited unexpectedly.",
         browser_process: "An embedded browser process failed.",
+        cleanup_unconfirmed: "The previous browser shutdown could not be confirmed.",
         protocol: "Communication with the browser process failed.",
         stalled: "The browser process stopped responding.",
         shutdown_timeout: "The browser process did not close in time.",
@@ -774,7 +775,7 @@
       detail(summary, "Community recovery", recoveryExplanation);
       detail(summary, "Consecutive browser failures", count(recovery.attempts));
       detail(summary, "Next automatic restart", typeof recovery.next_retry_at_utc === "string" && Number.isFinite(Date.parse(recovery.next_retry_at_utc)) ? timestamp(recovery.next_retry_at_utc) : "Not scheduled");
-      if (recovery.cleanup_confirmed === false && recovery.last_fault?.worker?.failure !== "not_created") detail(summary, "Previous browser shutdown", "Not confirmed after the abnormal exit.");
+      if (recovery.cleanup_confirmed === false && recovery.last_fault?.worker?.failure !== "not_created") detail(summary, "Previous browser shutdown", "Not confirmed for the previous worker.");
       const previous = recovery.last_fault?.worker;
       const exitCode = previous?.exit_code;
       if ((!data.worker?.failure || data.worker.process_id !== previous?.process_id) && Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 0xffffffff) {

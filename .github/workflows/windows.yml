@@ -195,7 +195,7 @@ jobs:
           Get-ChildItem -LiteralPath scripts -Filter '*Veylurk*.ps1' -File | Copy-Item -Destination app-package -ErrorAction Stop
           Copy-Item -LiteralPath scripts/Setup-Twitch.ps1 -Destination app-package -ErrorAction Stop
           New-Item -ItemType Directory -Path app-package/docs -ErrorAction Stop | Out-Null
-          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md, docs/native-worker-crash.md, docs/community-autorecovery.md, docs/timeline.md, docs/remaining-work.md, docs/community-cadence.md, docs/community-integration-plan.md, docs/community-presence-model.md, docs/community-ram-optimization.md -Destination app-package/docs -ErrorAction Stop
+          Copy-Item -LiteralPath docs/windows-operation.md, docs/performance.md, docs/measurement.md, docs/diagnostics.md, docs/native-worker-crash.md, docs/community-autorecovery.md, docs/community-cleanup-recovery.md, docs/timeline.md, docs/remaining-work.md, docs/community-cadence.md, docs/community-integration-plan.md, docs/community-presence-model.md, docs/community-ram-optimization.md -Destination app-package/docs -ErrorAction Stop
       - name: Verify packaged background shutdown and offline backup with actual SQLite
         id: app_backup
         if: always() && !cancelled() && steps.app_build.outcome == 'success' && steps.package.outcome == 'success'

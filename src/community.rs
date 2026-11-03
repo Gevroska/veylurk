@@ -1290,7 +1290,8 @@ impl Coordinator {
     async fn pause_event(&mut self, code: &'static str) -> Result<(), StoreError> {
         if community_source::host::is_worker_failure(code) {
             // Await this generation's terminal physical proof. A worker failure
-            // by itself never grants replacement or creates a source denial.
+            // (including a fresh cleanup-only status) never grants replacement
+            // or creates a source denial without that parent's containment proof.
             let allowed = (!self.paused || self.worker_fault_pending)
                 && (self.persisted_pause.is_none()
                     || self.quarantine_ticket == Some(self.host_generation))
